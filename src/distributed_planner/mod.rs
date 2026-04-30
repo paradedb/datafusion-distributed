@@ -11,7 +11,10 @@ mod task_estimator;
 pub use boundary_factory::{BoundaryFactory, DefaultBoundaryFactory};
 pub use distribute_plan::{distribute_plan, distribute_plan_with_factory};
 pub use distributed_config::DistributedConfig;
-pub use network_boundary::{NetworkBoundary, NetworkBoundaryExt};
+pub use network_boundary::{
+    NetworkBoundary, NetworkBoundaryExt, NetworkBoundaryExtractor,
+    register_network_boundary_extractor,
+};
 pub use plan_annotator::{annotate_plan, AnnotatedPlan, PlanOrNetworkBoundary};
 pub use session_state_builder_ext::SessionStateBuilderExt;
 pub(crate) use task_estimator::set_distributed_task_estimator;

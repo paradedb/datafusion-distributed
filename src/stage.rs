@@ -121,6 +121,31 @@ impl Stage {
             tasks: vec![ExecutionTask { url: None }; n_tasks],
         }
     }
+
+    /// Creates a `Stage` for an alternate-transport [`NetworkBoundary`] that
+    /// does not need the upstream plan or task-URL list (for example, an
+    /// in-process `shm_mq` mesh where the wiring is established at DSM
+    /// init time and the consumer-task addressing is implicit). The stage
+    /// is identified by `query_id` + `num` and carries `n_tasks` empty
+    /// task slots so `tasks.len()` still reflects the participant count.
+    pub fn new_unaddressed(query_id: Uuid, num: usize, n_tasks: usize) -> Self {
+        Self {
+            query_id,
+            num,
+            plan: None,
+            tasks: vec![ExecutionTask { url: None }; n_tasks],
+        }
+    }
+
+    /// Read accessor for [`Self::query_id`].
+    pub fn query_id(&self) -> Uuid {
+        self.query_id
+    }
+
+    /// Read accessor for [`Self::num`] (the stage number, 0-based bottom-up).
+    pub fn num(&self) -> usize {
+        self.num
+    }
 }
 
 use crate::{DistributedMetricsFormat, rewrite_distributed_plan_with_metrics};

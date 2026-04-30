@@ -87,6 +87,33 @@ pub async fn distribute_plan_with_factory(
     Ok(Some(plan))
 }
 
+/// Public, factory-aware variant of [`_distribute_plan`].
+///
+/// Given an already-annotated plan and a [`BoundaryFactory`], walks the
+/// tree and emits the boundary operators the factory produces. The
+/// caller is responsible for any pre-passes (e.g. inserting
+/// `RepartitionExec` markers, wrapping a multi-partition root) and
+/// post-passes (e.g. final aggregate wrapping, dynamic-filter
+/// re-application).
+///
+/// Use this instead of [`distribute_plan_with_factory`] when the
+/// caller already has its own pre/post-pass orchestration and only
+/// needs the boundary-emission step. [`distribute_plan`] /
+/// [`distribute_plan_with_factory`] also run idempotency,
+/// `insert_broadcast_execs`, and `partial_reduce_below_network_shuffles`
+/// — those are convenience for the typical Flight pipeline; an
+/// alternate-transport walker that wires its own primitives wants the
+/// raw walker only.
+pub fn distribute_annotated_plan(
+    annotated_plan: AnnotatedPlan,
+    cfg: &ConfigOptions,
+    query_id: Uuid,
+    stage_id: &mut usize,
+    factory: &dyn BoundaryFactory,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    _distribute_plan(annotated_plan, cfg, query_id, stage_id, factory)
+}
+
 /// Takes an [AnnotatedPlan] and returns a modified [ExecutionPlan] with all the network boundaries
 /// appropriately placed. This step performs the following modifications to the original
 /// [ExecutionPlan]:

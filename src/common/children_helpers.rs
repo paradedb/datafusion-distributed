@@ -3,7 +3,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use std::borrow::Borrow;
 use std::sync::Arc;
 
-pub(crate) fn require_one_child<L, T>(
+pub fn require_one_child<L, T>(
     children: L,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>
 where

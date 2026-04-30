@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// Annotation attached to a single [ExecutionPlan] that determines the kind of network boundary
 /// needed just below itself.
-pub(super) enum PlanOrNetworkBoundary {
+pub enum PlanOrNetworkBoundary {
     Plan(Arc<dyn ExecutionPlan>),
     Shuffle,
     Coalesce,
@@ -35,23 +35,23 @@ impl Debug for PlanOrNetworkBoundary {
 }
 
 impl PlanOrNetworkBoundary {
-    fn is_network_boundary(&self) -> bool {
+    pub fn is_network_boundary(&self) -> bool {
         matches!(self, Self::Shuffle | Self::Coalesce | Self::Broadcast)
     }
 }
 
 /// Wraps an [ExecutionPlan] and annotates it with information about how many distributed tasks
 /// it should run on, and whether it needs a network boundary below or not.
-pub(super) struct AnnotatedPlan {
+pub struct AnnotatedPlan {
     /// The annotated [ExecutionPlan].
-    pub(super) plan_or_nb: PlanOrNetworkBoundary,
+    pub plan_or_nb: PlanOrNetworkBoundary,
     /// The annotated children of this [ExecutionPlan]. This will always hold the same nodes as
     /// `self.plan.children()` but annotated.
-    pub(super) children: Vec<AnnotatedPlan>,
+    pub children: Vec<AnnotatedPlan>,
 
     // annotation fields
     /// How many distributed tasks this plan should run on.
-    pub(super) task_count: TaskCountAnnotation,
+    pub task_count: TaskCountAnnotation,
 }
 
 impl Debug for AnnotatedPlan {
@@ -158,7 +158,7 @@ impl Debug for AnnotatedPlan {
 /// ```
 ///
 /// ```
-pub(super) async fn annotate_plan(
+pub async fn annotate_plan(
     plan: Arc<dyn ExecutionPlan>,
     cfg: &ConfigOptions,
 ) -> Result<AnnotatedPlan, DataFusionError> {

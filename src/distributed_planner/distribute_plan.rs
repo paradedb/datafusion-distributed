@@ -1,13 +1,11 @@
 use crate::common::require_one_child;
+use crate::distributed_planner::boundary_factory::{BoundaryFactory, DefaultBoundaryFactory};
 use crate::distributed_planner::insert_broadcast::insert_broadcast_execs;
 use crate::distributed_planner::partial_reduce_below_network_shuffles::partial_reduce_below_network_shuffles;
 use crate::distributed_planner::plan_annotator::{
     AnnotatedPlan, PlanOrNetworkBoundary, annotate_plan,
 };
-use crate::{
-    DistributedConfig, NetworkBoundaryExt, NetworkBroadcastExec, NetworkCoalesceExec,
-    NetworkShuffleExec, TaskEstimator,
-};
+use crate::{DistributedConfig, NetworkBoundaryExt, TaskEstimator};
 use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::config::ConfigOptions;
@@ -20,26 +18,41 @@ use uuid::Uuid;
 /// Inspects the plan, places the appropriate network boundaries, and breaks it down into stages
 /// that can be executed in a distributed manner.
 ///
-/// It performs the following operations:
-///
-/// 1. It prepares the plan for distribution, adding some extra single-node nodes like
-///    [BroadcastExec] or [CoalescePartitionsExec] that will signal the following steps to
-///    introduce network boundaries in the appropriate places.
-///
-/// 2. Annotate the plan with [annotate_plan]: adds some annotations to each node about how
-///    many distributed tasks should be used in the stage containing them, and whether they
-///    need a network boundary below or not.
-///    For more information about this step, read [annotate_plan] docs.
-///
-/// 3. Based on the [AnnotatedPlan] returned by [annotate_plan], place all the appropriate
-///    network boundaries ([NetworkShuffleExec] and [NetworkCoalesceExec]) with the task count
-///    assignation that the annotations required. After this, the plan is already a distributed
-///    executable plan.
-///
-/// This function returns None if the plan was left undistributed.
-pub(super) async fn distribute_plan(
+/// Defaults to the upstream Arrow Flight-backed boundary operators
+/// ([`NetworkShuffleExec`](crate::NetworkShuffleExec),
+/// [`NetworkCoalesceExec`](crate::NetworkCoalesceExec),
+/// [`NetworkBroadcastExec`](crate::NetworkBroadcastExec)). Use
+/// [`distribute_plan_with_factory`] to plug in an alternate transport.
+pub async fn distribute_plan(
     original: Arc<dyn ExecutionPlan>,
     cfg: &ConfigOptions,
+) -> datafusion::common::Result<Option<Arc<dyn ExecutionPlan>>> {
+    distribute_plan_with_factory(original, cfg, &DefaultBoundaryFactory).await
+}
+
+/// Same as [`distribute_plan`], but with a caller-supplied
+/// [`BoundaryFactory`] so the produced plan uses non-default
+/// boundary operators (e.g. an in-process `shm_mq` mesh in place of
+/// Arrow Flight).
+///
+/// Steps:
+///
+/// 1. Idempotency: if the plan already contains a network boundary,
+///    returns `None`.
+/// 2. Adds a [`CoalescePartitionsExec`] on top if necessary so the
+///    annotator can place a coalesce boundary below it.
+/// 3. Inserts `BroadcastExec` nodes in CollectLeft joins so the
+///    annotator can inject broadcast boundaries above.
+/// 4. Annotates the plan with task counts + boundary kinds via
+///    [`annotate_plan`].
+/// 5. Walks the annotated plan; on each boundary annotation, the
+///    `factory` constructs the concrete boundary node.
+/// 6. Inserts `PartialReduce` aggregation nodes above hash repartitions
+///    to reduce shuffle data volume.
+pub async fn distribute_plan_with_factory(
+    original: Arc<dyn ExecutionPlan>,
+    cfg: &ConfigOptions,
+    factory: &dyn BoundaryFactory,
 ) -> datafusion::common::Result<Option<Arc<dyn ExecutionPlan>>> {
     // Keep this function idempotent.
     if original.exists(|plan| Ok(plan.is_network_boundary()))? {
@@ -63,7 +76,7 @@ pub(super) async fn distribute_plan(
 
     // Based on the annotations, place the actual network boundaries with the appropriate dimensions.
     let mut stage_id = 1;
-    let plan = _distribute_plan(annotated, cfg, Uuid::new_v4(), &mut stage_id)?;
+    let plan = _distribute_plan(annotated, cfg, Uuid::new_v4(), &mut stage_id, factory)?;
     if stage_id == 1 {
         return Ok(None);
     }
@@ -86,6 +99,7 @@ fn _distribute_plan(
     cfg: &ConfigOptions,
     query_id: Uuid,
     stage_id: &mut usize,
+    factory: &dyn BoundaryFactory,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let d_cfg = DistributedConfig::from_config_options(cfg)?;
     let children = annotated_plan.children;
@@ -93,7 +107,7 @@ fn _distribute_plan(
     let max_child_task_count = children.iter().map(|v| v.task_count.as_usize()).max();
     let new_children = children
         .into_iter()
-        .map(|child| _distribute_plan(child, cfg, query_id, stage_id))
+        .map(|child| _distribute_plan(child, cfg, query_id, stage_id, factory))
         .collect::<Result<Vec<_>, _>>()?;
     match annotated_plan.plan_or_nb {
         // This is a leaf node. It needs to be scaled up in order to account for it running in
@@ -108,20 +122,20 @@ fn _distribute_plan(
         }
         // This is a normal intermediate plan, just pass it through with the mapped children.
         PlanOrNetworkBoundary::Plan(plan) => plan.with_new_children(new_children),
-        // This is a shuffle, so inject a NetworkShuffleExec here in the plan.
+        // This is a shuffle: ask the factory for a shuffle boundary.
         PlanOrNetworkBoundary::Shuffle => {
             // It would need a network boundary, but on both sides of the boundary there is just 1 task,
             // so we are fine with not introducing any network boundary.
             if task_count == 1 && max_child_task_count == Some(1) {
                 return require_one_child(new_children);
             }
-            let node = Arc::new(NetworkShuffleExec::try_new(
+            let node = factory.shuffle(
                 require_one_child(new_children)?,
                 query_id,
                 *stage_id,
                 task_count,
                 max_child_task_count.unwrap_or(1),
-            )?);
+            )?;
             stage_id.add_assign(1);
             Ok(node)
         }
@@ -133,13 +147,13 @@ fn _distribute_plan(
             if task_count == 1 && max_child_task_count == Some(1) {
                 return require_one_child(new_children);
             }
-            let node = Arc::new(NetworkCoalesceExec::try_new(
+            let node = factory.coalesce(
                 require_one_child(new_children)?,
                 query_id,
                 *stage_id,
                 task_count,
                 max_child_task_count.unwrap_or(1),
-            )?);
+            )?;
             stage_id.add_assign(1);
             Ok(node)
         }
@@ -151,13 +165,13 @@ fn _distribute_plan(
             if task_count == 1 && max_child_task_count == Some(1) {
                 return require_one_child(new_children);
             }
-            let node = Arc::new(NetworkBroadcastExec::try_new(
+            let node = factory.broadcast(
                 require_one_child(new_children)?,
                 query_id,
                 *stage_id,
                 task_count,
                 max_child_task_count.unwrap_or(1),
-            )?);
+            )?;
             stage_id.add_assign(1);
             Ok(node)
         }

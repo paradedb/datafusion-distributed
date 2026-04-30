@@ -21,9 +21,11 @@ mod work_unit_feed;
 pub use arrow_ipc::CompressionType;
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
-    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
-    TaskCountAnnotation, TaskEstimation, TaskEstimator,
+    AnnotatedPlan, BoundaryFactory, DefaultBoundaryFactory, DistributedConfig, NetworkBoundary,
+    NetworkBoundaryExt, PlanOrNetworkBoundary, SessionStateBuilderExt, TaskCountAnnotation,
+    TaskEstimation, TaskEstimator, annotate_plan, distribute_plan, distribute_plan_with_factory,
 };
+pub use common::require_one_child;
 pub use execution_plans::{
     BroadcastExec, DistributedExec, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,
     PartitionIsolatorExec,

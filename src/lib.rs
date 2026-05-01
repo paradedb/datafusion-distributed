@@ -24,8 +24,9 @@ pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
     AnnotatedPlan, BoundaryFactory, DefaultBoundaryFactory, DistributedConfig, NetworkBoundary,
     NetworkBoundaryExt, NetworkBoundaryExtractor, PlanOrNetworkBoundary, SessionStateBuilderExt,
-    TaskCountAnnotation, TaskEstimation, TaskEstimator, annotate_plan, distribute_annotated_plan,
-    distribute_plan, distribute_plan_with_factory, register_network_boundary_extractor,
+    TaskCountAnnotation, TaskEstimation, TaskEstimator, annotate_plan, annotate_plan_sync,
+    distribute_annotated_plan, distribute_plan, distribute_plan_with_factory,
+    register_network_boundary_extractor,
 };
 pub use execution_plans::{
     BroadcastExec, DistributedExec, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,

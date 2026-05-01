@@ -17,7 +17,7 @@ pub use network_boundary::{
     NetworkBoundary, NetworkBoundaryExt, NetworkBoundaryExtractor,
     register_network_boundary_extractor,
 };
-pub use plan_annotator::{AnnotatedPlan, PlanOrNetworkBoundary, annotate_plan};
+pub use plan_annotator::{AnnotatedPlan, PlanOrNetworkBoundary, annotate_plan, annotate_plan_sync};
 pub use session_state_builder_ext::SessionStateBuilderExt;
 pub(crate) use task_estimator::set_distributed_task_estimator;
 pub use task_estimator::{TaskCountAnnotation, TaskEstimation, TaskEstimator};

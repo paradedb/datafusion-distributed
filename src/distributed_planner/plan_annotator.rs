@@ -402,6 +402,99 @@ async fn _annotate_plan(
     }
 }
 
+/// Synchronous, config-free variant of [`annotate_plan`] for callers whose
+/// plan-time path is not async and that bring their own task-count policy.
+///
+/// Tailored for non-Flight consumers (custom transports plugging in via
+/// [`BoundaryFactory`](crate::BoundaryFactory)) that don't have a
+/// [`SessionContext`](datafusion::execution::context::SessionContext) /
+/// [`DistributedConfig`](crate::DistributedConfig) wired up at plan time —
+/// e.g. embedded planners or executor-driven hosts that decide task count
+/// out of band.
+///
+/// Differences from [`annotate_plan`]:
+///
+/// - **Synchronous.** No `try_join_all` over child futures.
+/// - **Takes `max_tasks: usize` directly** instead of looking it up via
+///   `DistributedConfig` / `WorkerResolver`.
+/// - **Skips [`TaskEstimator`](crate::TaskEstimator).** Every node is
+///   annotated `Desired(max_tasks)`; the caller is responsible for any
+///   per-node task-count policy.
+/// - **Skips [`ChildrenIsolatorUnionExec`](crate::execution_plans::ChildrenIsolatorUnionExec)
+///   injection.** Multi-way unions are passed through as plain
+///   [`UnionExec`].
+/// - **Skips [`cardinality_effect()`](datafusion::physical_plan::ExecutionPlan::cardinality_effect)
+///   propagation.** The post-boundary task count is inherited as-is rather
+///   than scaled by the cardinality factor.
+/// - **Skips [`BroadcastExec`](crate::BroadcastExec) recognition.** Emits
+///   [`Coalesce`](PlanOrNetworkBoundary::Coalesce) annotations even when
+///   the parent is `CoalescePartitionsExec` / `SortPreservingMergeExec`
+///   above a `BroadcastExec`. Callers that don't emit `BroadcastExec` from
+///   their own pre-pass don't need the discrimination.
+///
+/// Same cut triggers as [`annotate_plan`]:
+///
+/// - [`RepartitionExec`] with `Partitioning::Hash` →
+///   [`Shuffle`](PlanOrNetworkBoundary::Shuffle) annotation above.
+/// - Non-leaf node whose parent is [`CoalescePartitionsExec`] or
+///   [`SortPreservingMergeExec`] →
+///   [`Coalesce`](PlanOrNetworkBoundary::Coalesce) annotation above.
+///
+/// Pair with [`distribute_annotated_plan`](super::distribute_plan::distribute_annotated_plan)
+/// to drive a [`BoundaryFactory`](crate::BoundaryFactory) without taking on
+/// the full async / `DistributedConfig` machinery.
+pub fn annotate_plan_sync(
+    plan: Arc<dyn ExecutionPlan>,
+    max_tasks: usize,
+) -> Result<AnnotatedPlan, DataFusionError> {
+    _annotate_plan_sync(plan, None, max_tasks)
+}
+
+fn _annotate_plan_sync(
+    plan: Arc<dyn ExecutionPlan>,
+    parent: Option<&Arc<dyn ExecutionPlan>>,
+    max_tasks: usize,
+) -> Result<AnnotatedPlan, DataFusionError> {
+    let task_count = Desired(max_tasks);
+    let annotated_children: Vec<AnnotatedPlan> = plan
+        .children()
+        .into_iter()
+        .map(|child| _annotate_plan_sync(Arc::clone(child), Some(&plan), max_tasks))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut annotation = AnnotatedPlan {
+        plan_or_nb: PlanOrNetworkBoundary::Plan(Arc::clone(&plan)),
+        children: annotated_children,
+        task_count: task_count.clone(),
+    };
+
+    if let Some(r_exec) = plan.as_any().downcast_ref::<RepartitionExec>()
+        && matches!(r_exec.partitioning(), Partitioning::Hash(_, _))
+    {
+        annotation = AnnotatedPlan {
+            plan_or_nb: PlanOrNetworkBoundary::Shuffle,
+            children: vec![annotation],
+            task_count,
+        };
+    } else if let Some(parent) = parent
+        // If this node is a leaf node, putting a network boundary above is a bit wasteful, so
+        // we don't want to do it.
+        && !plan.children().is_empty()
+        // If the parent is trying to coalesce all partitions into one, we need to introduce
+        // a network coalesce right below it (or in other words, above the current node)
+        && (parent.as_any().is::<CoalescePartitionsExec>()
+            || parent.as_any().is::<SortPreservingMergeExec>())
+    {
+        annotation = AnnotatedPlan {
+            plan_or_nb: PlanOrNetworkBoundary::Coalesce,
+            children: vec![annotation],
+            task_count,
+        };
+    }
+
+    Ok(annotation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +561,41 @@ mod tests {
                         AggregateExec: task_count=Desired(3)
                           DataSourceExec: task_count=Desired(3)
         ")
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_sync() {
+        // Same query as `test_aggregation`, but driven through the sync
+        // variant. Same Shuffle/Coalesce placement, but task counts are
+        // flat `Desired(N)` everywhere because the sync variant skips
+        // TaskEstimator + cardinality propagation + Maximum-collapse.
+        let query = r#"
+        SELECT count(*), "RainToday" FROM weather GROUP BY "RainToday" ORDER BY count(*)
+        "#;
+        let annotated = sql_to_annotated_sync(query, 3).await;
+        assert_snapshot!(annotated, @r"
+        ProjectionExec: task_count=Desired(3)
+          SortPreservingMergeExec: task_count=Desired(3)
+            [NetworkBoundary] Coalesce: task_count=Desired(3)
+              SortExec: task_count=Desired(3)
+                ProjectionExec: task_count=Desired(3)
+                  AggregateExec: task_count=Desired(3)
+                    [NetworkBoundary] Shuffle: task_count=Desired(3)
+                      RepartitionExec: task_count=Desired(3)
+                        AggregateExec: task_count=Desired(3)
+                          DataSourceExec: task_count=Desired(3)
+        ")
+    }
+
+    #[tokio::test]
+    async fn test_select_all_sync() {
+        // No cut triggers — DataSourceExec only. Sync variant returns a
+        // flat `Plan` annotation with no boundaries.
+        let query = r#"
+        SELECT * FROM weather
+        "#;
+        let annotated = sql_to_annotated_sync(query, 4).await;
+        assert_snapshot!(annotated, @"DataSourceExec: task_count=Desired(4)")
     }
 
     #[tokio::test]
@@ -924,6 +1052,23 @@ mod tests {
 
     async fn sql_to_annotated(query: &str) -> String {
         annotate_test_plan(query, TestPlanOptions::default(), |b| b).await
+    }
+
+    /// Build the physical plan with the same SQL pipeline as
+    /// [`sql_to_annotated`], then drive [`annotate_plan_sync`] over it
+    /// instead of the async [`annotate_plan`]. The returned snapshot is
+    /// compared against the async version's output to make sure the sync
+    /// variant produces the same network-boundary placement (modulo flat
+    /// task counts and skipped Broadcast / IsolatorUnion / cardinality
+    /// scaling).
+    async fn sql_to_annotated_sync(query: &str, max_tasks: usize) -> String {
+        let builder = base_session_builder(3, 3, false);
+        let (ctx, query) = context_with_query(builder, query).await;
+        let df = ctx.sql(&query).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let annotated =
+            annotate_plan_sync(plan, max_tasks).expect("failed to annotate plan synchronously");
+        format!("{annotated:?}")
     }
 
     async fn sql_to_annotated_broadcast(

@@ -8,7 +8,9 @@ mod plan_annotator;
 mod session_state_builder_ext;
 mod task_estimator;
 
-pub use boundary_factory::{BoundaryFactory, DefaultBoundaryFactory};
+pub use boundary_factory::{
+    BoundaryFactory, BoundaryKind, DefaultBoundaryFactory, PooledBoundaryFactory,
+};
 pub use distribute_plan::{
     distribute_annotated_plan, distribute_plan, distribute_plan_with_factory,
 };

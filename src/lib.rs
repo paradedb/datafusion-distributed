@@ -19,6 +19,7 @@ pub mod test_utils;
 mod work_unit_feed;
 
 pub use arrow_ipc::CompressionType;
+pub use common::require_one_child;
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
     AnnotatedPlan, BoundaryFactory, DefaultBoundaryFactory, DistributedConfig, NetworkBoundary,
@@ -26,7 +27,6 @@ pub use distributed_planner::{
     TaskCountAnnotation, TaskEstimation, TaskEstimator, annotate_plan, distribute_annotated_plan,
     distribute_plan, distribute_plan_with_factory, register_network_boundary_extractor,
 };
-pub use common::require_one_child;
 pub use execution_plans::{
     BroadcastExec, DistributedExec, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,
     PartitionIsolatorExec,

@@ -3,9 +3,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use std::borrow::Borrow;
 use std::sync::Arc;
 
-pub fn require_one_child<L, T>(
-    children: L,
-) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>
+pub fn require_one_child<L, T>(children: L) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>
 where
     L: AsRef<[T]>,
     T: Borrow<Arc<dyn ExecutionPlan>>,

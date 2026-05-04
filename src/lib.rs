@@ -37,9 +37,11 @@ pub use metrics::{
 pub use networking::{
     BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, WorkerResolver,
     create_worker_client, get_distributed_channel_resolver, get_distributed_worker_resolver,
+    get_distributed_worker_transport,
 };
 pub use stage::{
-    DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
+    DistributedTaskContext, LocalStage, RemoteStage, Stage, display_plan_ascii,
+    display_plan_graphviz, explain_analyze,
 };
 pub use work_unit_feed::{
     DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
@@ -48,8 +50,9 @@ pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
 pub use worker::{
-    DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt, TaskData,
-    Worker, WorkerQueryContext, WorkerSessionBuilder,
+    DefaultSessionBuilder, FlightWorkerTransport, MappedWorkerSessionBuilder,
+    MappedWorkerSessionBuilderExt, TaskData, Worker, WorkerConnection, WorkerPartitionStream,
+    WorkerQueryContext, WorkerSessionBuilder, WorkerTransport,
 };
 
 pub use observability::{

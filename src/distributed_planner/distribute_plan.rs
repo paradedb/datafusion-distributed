@@ -63,7 +63,7 @@ pub(super) async fn distribute_plan(
 
     // Based on the annotations, place the actual network boundaries with the appropriate dimensions.
     let mut stage_id = 1;
-    let plan = _distribute_plan(annotated, cfg, Uuid::new_v4(), &mut stage_id)?;
+    let plan = _distribute_plan(annotated, cfg, Uuid::new_v4(), &mut stage_id, false)?;
     if stage_id == 1 {
         return Ok(None);
     }
@@ -86,14 +86,70 @@ fn _distribute_plan(
     cfg: &ConfigOptions,
     query_id: Uuid,
     stage_id: &mut usize,
+    has_boundary_ancestor: bool,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let d_cfg = DistributedConfig::from_config_options(cfg)?;
+    // In-process mode: a custom WorkerTransport is registered, meaning the
+    // entire pipeline is running inside one process with a single consumer
+    // task (the leader) and N producer tasks (the PG parallel workers).
+    //
+    // Two stage shapes need different `(consumer_task_count, input_task_count)`:
+    //
+    // - **Outer boundary** (worker → leader): the OUTERMOST `NetworkBoundary`
+    //   straddles the PG worker / leader split. Its producers ARE separate
+    //   processes (PG workers each holding a 1/N slice via `parallel_state`).
+    //   So `consumer_task_count = 1` (single in-process leader), and
+    //   `input_task_count = N` (N real remote producers via shm_mq).
+    //
+    // - **Nested boundaries** (inside one PG worker's producer fragment):
+    //   when `HashJoinExec(Partitioned)` or similar is chosen, the planner
+    //   inserts shuffles on each side. These are *all* in-process within
+    //   the same PG worker — there is exactly ONE local producer per nested
+    //   boundary (the inner `RepartitionExec`). For these, both
+    //   `consumer_task_count = 1` AND `input_task_count = 1`. Otherwise
+    //   `NetworkShuffleExec.execute` would open `input_task_count`
+    //   connections via `WorkerTransport` and `select_all`-merge them; the
+    //   in-process `LocalExecWorkerTransport` would then re-execute the
+    //   same `RepartitionExec` for each call and panic on the second call
+    //   ("partition not used yet" — `RepartitionExec.execute(p)` is
+    //   single-shot per partition).
+    //
+    // We distinguish "outer" from "nested" by threading
+    // `has_boundary_ancestor` down the recursion: a boundary is OUTER if no
+    // ancestor in the annotation tree is also a boundary, NESTED otherwise.
+    let in_process = cfg
+        .extensions
+        .get::<DistributedConfig>()
+        .map(|c| c.__private_worker_transport.0.is_some())
+        .unwrap_or(false);
+    let nested_in_process = in_process && has_boundary_ancestor;
     let children = annotated_plan.children;
     let task_count = annotated_plan.task_count.as_usize();
     let max_child_task_count = children.iter().map(|v| v.task_count.as_usize()).max();
+    // Track which annotations are *real* boundaries that produce a
+    // `Network*Exec` in the final plan. In in-process mode the `Coalesce`
+    // arm is elided to its child, so a `Coalesce` annotation is a
+    // pass-through and should NOT mark its descendants as nested. (Without
+    // this carve-out, the OUTER `Shuffle` — which is annotated as a child
+    // of the implicit `Coalesce` wrapping the top-level `CoalescePartitionsExec`
+    // — would be mis-clamped to nested and elided too.)
+    let this_is_real_boundary = match &annotated_plan.plan_or_nb {
+        PlanOrNetworkBoundary::Shuffle | PlanOrNetworkBoundary::Broadcast => true,
+        PlanOrNetworkBoundary::Coalesce => !in_process,
+        PlanOrNetworkBoundary::Plan(_) => false,
+    };
+    let children_have_boundary_ancestor = has_boundary_ancestor || this_is_real_boundary;
     let new_children = children
         .into_iter()
-        .map(|child| _distribute_plan(child, cfg, query_id, stage_id))
+        .map(|child| {
+            _distribute_plan(
+                child,
+                cfg,
+                query_id,
+                stage_id,
+                children_have_boundary_ancestor,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     match annotated_plan.plan_or_nb {
         // This is a leaf node. It needs to be scaled up in order to account for it running in
@@ -110,17 +166,23 @@ fn _distribute_plan(
         PlanOrNetworkBoundary::Plan(plan) => plan.with_new_children(new_children),
         // This is a shuffle, so inject a NetworkShuffleExec here in the plan.
         PlanOrNetworkBoundary::Shuffle => {
+            let consumer_task_count = if in_process { 1 } else { task_count };
+            let input_task_count = if nested_in_process {
+                1
+            } else {
+                max_child_task_count.unwrap_or(1)
+            };
             // It would need a network boundary, but on both sides of the boundary there is just 1 task,
             // so we are fine with not introducing any network boundary.
-            if task_count == 1 && max_child_task_count == Some(1) {
+            if consumer_task_count == 1 && input_task_count == 1 {
                 return require_one_child(new_children);
             }
             let node = Arc::new(NetworkShuffleExec::try_new(
                 require_one_child(new_children)?,
                 query_id,
                 *stage_id,
-                task_count,
-                max_child_task_count.unwrap_or(1),
+                consumer_task_count,
+                input_task_count,
             )?);
             stage_id.add_assign(1);
             Ok(node)
@@ -128,6 +190,12 @@ fn _distribute_plan(
         // DataFusion is trying to coalesce multiple partitions into one, so we should do the
         // same with tasks.
         PlanOrNetworkBoundary::Coalesce => {
+            // In-process mode: skip the network coalesce. The surrounding
+            // CoalescePartitionsExec will fan in the partitions locally,
+            // which is what we want for a single-consumer leader.
+            if in_process {
+                return require_one_child(new_children);
+            }
             // It would need a network boundary, but on both sides of the boundary there is just 1 task,
             // so we are fine with not introducing any network boundary.
             if task_count == 1 && max_child_task_count == Some(1) {
@@ -146,17 +214,32 @@ fn _distribute_plan(
         // This is a CollectLeft HashJoinExec with the build side marked as being broadcast. we
         // need to insert a NetworkBroadcastExec and scale up the BroadcastExec consumer_tasks.
         PlanOrNetworkBoundary::Broadcast => {
+            // Same outer-vs-nested logic as Shuffle. Outer broadcast (worker
+            // → leader for the whole HashJoin's build side) needs
+            // input_task_count = N because each PG worker runs the
+            // broadcast subtree locally and contributes a stream. Nested
+            // broadcast (inside one worker's producer fragment) has only
+            // ONE local producer of the broadcast subtree, so
+            // input_task_count = 1.
+            let consumer_tc = if in_process { 1 } else { task_count };
+            let input_tc = if nested_in_process {
+                1
+            } else if in_process {
+                1
+            } else {
+                max_child_task_count.unwrap_or(1)
+            };
             // It would need a network boundary, but on both sides of the boundary there is just 1 task,
             // so we are fine with not introducing any network boundary.
-            if task_count == 1 && max_child_task_count == Some(1) {
+            if consumer_tc == 1 && input_tc == 1 && !in_process {
                 return require_one_child(new_children);
             }
             let node = Arc::new(NetworkBroadcastExec::try_new(
                 require_one_child(new_children)?,
                 query_id,
                 *stage_id,
-                task_count,
-                max_child_task_count.unwrap_or(1),
+                consumer_tc,
+                input_tc,
             )?);
             stage_id.add_assign(1);
             Ok(node)

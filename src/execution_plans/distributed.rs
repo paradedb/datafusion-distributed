@@ -168,6 +168,52 @@ impl DistributedExec {
     /// 4. Spawn a background task per worker that waits for the worker to finish and collects
     ///    its metrics into [DistributedExec::task_metrics] via the coordinator channel.
     fn prepare_plan(&self, ctx: &Arc<TaskContext>) -> Result<PreparedPlan> {
+        // Fast path for in-process consumers. When the user has registered a
+        // custom `WorkerTransport` (e.g. an `shm_mq` mesh inside a single
+        // process), the gRPC coordinator-channel that ships serialized
+        // subplans to remote URLs is unnecessary: the data path is already
+        // covered by `WorkerTransport::open` and workers obtain their plan
+        // through whatever side channel the embedder sets up (e.g. a logical
+        // plan stashed in DSM). Skipping the spawner avoids two failure
+        // modes that would otherwise block in-process integrations:
+        //   1. The DistributedCodec encoding the worker subplan (custom
+        //      physical execs need a codec just to satisfy this step).
+        //   2. The gRPC plan-send tasks attempting to dial the resolver-
+        //      provided URLs (which won't be reachable in-process).
+        //
+        // We still walk the plan to clear `input_stage.plan = None` on every
+        // network boundary so post-prepare traversal stops at boundaries —
+        // the same invariant the gRPC path establishes. `tasks` are left
+        // with `url: None` (mirroring `Stage::new_unaddressed`); custom
+        // `WorkerTransport` impls already key off `target_task` indices and
+        // ignore the URL.
+        let in_process = ctx
+            .session_config()
+            .options()
+            .extensions
+            .get::<DistributedConfig>()
+            .map(|c| c.__private_worker_transport.0.is_some())
+            .unwrap_or(false);
+        if in_process {
+            let join_set = JoinSet::new();
+            let prepared = Arc::clone(&self.plan).transform_up(|plan| {
+                let Some(plan) = plan.as_network_boundary() else {
+                    return Ok(Transformed::no(plan));
+                };
+                let stage = plan.input_stage();
+                Ok(Transformed::yes(plan.with_input_stage(Stage {
+                    query_id: stage.query_id,
+                    num: stage.num,
+                    plan: None,
+                    tasks: stage.tasks.clone(),
+                })?))
+            })?;
+            return Ok(PreparedPlan {
+                plan: prepared.data,
+                join_set,
+            });
+        }
+
         let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
         let codec = DistributedCodec::new_combined_with_user(ctx.session_config());
 

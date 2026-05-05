@@ -146,6 +146,17 @@ impl Stage {
     pub fn num(&self) -> usize {
         self.num
     }
+
+    /// Read accessor for the optional input subplan. Alternate-transport
+    /// `WorkerTransport` impls may need to inspect or execute it locally.
+    /// `DistributedExec::prepare_plan` clears this to `None` after wiring
+    /// gRPC, so addressed boundaries return `None`. Embedded executors that
+    /// bypass `prepare_plan` (e.g. workers that re-plan from a logical plan
+    /// in shared memory) keep it `Some(...)`, allowing a custom transport
+    /// to `execute()` the input subtree directly.
+    pub fn plan(&self) -> Option<&std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.plan.as_ref()
+    }
 }
 
 use crate::{DistributedMetricsFormat, rewrite_distributed_plan_with_metrics};

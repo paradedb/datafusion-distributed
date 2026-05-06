@@ -120,7 +120,7 @@ fn _distribute_plan(
     let in_process = cfg
         .extensions
         .get::<DistributedConfig>()
-        .map(|c| c.__private_worker_transport.0.is_some())
+        .map(|c| c.is_in_process())
         .unwrap_or(false);
     let nested_in_process = in_process && has_boundary_ancestor;
     let children = annotated_plan.children;
@@ -223,8 +223,6 @@ fn _distribute_plan(
             // input_task_count = 1.
             let consumer_tc = if in_process { 1 } else { task_count };
             let input_tc = if nested_in_process {
-                1
-            } else if in_process {
                 1
             } else {
                 max_child_task_count.unwrap_or(1)

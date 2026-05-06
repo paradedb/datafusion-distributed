@@ -154,7 +154,7 @@ impl Stage {
     /// bypass `prepare_plan` (e.g. workers that re-plan from a logical plan
     /// in shared memory) keep it `Some(...)`, allowing a custom transport
     /// to `execute()` the input subtree directly.
-    pub fn plan(&self) -> Option<&std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    pub fn plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         self.plan.as_ref()
     }
 }

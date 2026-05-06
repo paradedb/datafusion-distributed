@@ -22,9 +22,11 @@ pub type WorkerPartitionStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> 
 /// One connection handles every partition in the `target_partition_range` requested at open time,
 /// so the implementation can reuse a single underlying network/IPC stream and fan messages out to
 /// per-partition queues. Each partition can be streamed exactly once.
-pub trait WorkerConnection {
+pub trait WorkerConnection: Send + Sync {
     /// Returns the stream of record batches for `partition`. Calling this twice for the same
-    /// partition is an error.
+    /// partition MUST return `Err(DataFusionError::Internal(...))`. Operators above (e.g.
+    /// `NetworkShuffleExec`) do not retry, but pinning this contract lets future work assume
+    /// `stream_partition` is a single-shot consumer per partition.
     fn stream_partition(&self, partition: usize) -> Result<WorkerPartitionStream>;
 }
 
@@ -33,7 +35,12 @@ pub trait WorkerConnection {
 /// The default implementation is the Arrow-Flight gRPC transport baked into this crate. Custom
 /// transports (e.g. shared-memory queues for an embedded execution context) plug in via
 /// [crate::DistributedExt::with_distributed_worker_transport].
-pub trait WorkerTransport {
+///
+/// `open` MUST NOT block on async I/O — it runs from a sync hot path inside `OnceLock::get_or_init`.
+/// Implementations that need an async handshake should spawn a background task and surface errors
+/// from the connection's first `stream_partition` call (the default `FlightWorkerTransport` does
+/// this via `SpawnedTask`).
+pub trait WorkerTransport: Send + Sync + 'static {
     /// Opens a connection to the worker hosting `target_task` of `input_stage` covering the
     /// partitions in `target_partitions`. The returned [WorkerConnection] takes ownership of any
     /// background resources (gRPC streams, demux tasks, cancellation tokens, ...) and is expected
@@ -45,10 +52,10 @@ pub trait WorkerTransport {
         target_task: usize,
         ctx: &Arc<TaskContext>,
         metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection + Send + Sync>>;
+    ) -> Result<Box<dyn WorkerConnection>>;
 }
 
-impl WorkerTransport for Arc<dyn WorkerTransport + Send + Sync> {
+impl WorkerTransport for Arc<dyn WorkerTransport> {
     fn open(
         &self,
         input_stage: &Stage,
@@ -56,7 +63,7 @@ impl WorkerTransport for Arc<dyn WorkerTransport + Send + Sync> {
         target_task: usize,
         ctx: &Arc<TaskContext>,
         metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
+    ) -> Result<Box<dyn WorkerConnection>> {
         self.as_ref()
             .open(input_stage, target_partitions, target_task, ctx, metrics)
     }

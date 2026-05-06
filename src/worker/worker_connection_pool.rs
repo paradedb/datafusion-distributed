@@ -52,8 +52,7 @@ pub(crate) struct LocalWorkerContext {
     pub(crate) self_url: Url,
 }
 
-type ConnectionSlot =
-    OnceLock<Result<Box<dyn WorkerConnection + Send + Sync>, Arc<DataFusionError>>>;
+type ConnectionSlot = OnceLock<Result<Box<dyn WorkerConnection>, Arc<DataFusionError>>>;
 
 /// Holds a list of lazily-opened [WorkerConnection] trait objects, one per remote task. The pool
 /// itself is transport-agnostic: at first use of a slot it consults the [WorkerTransport]
@@ -88,7 +87,7 @@ impl WorkerConnectionPool {
         target_partitions: Range<usize>,
         target_task: usize,
         ctx: &Arc<TaskContext>,
-    ) -> Result<&(dyn WorkerConnection + Send + Sync)> {
+    ) -> Result<&dyn WorkerConnection> {
         let Some(slot) = self.connections.get(target_task) else {
             return internal_err!(
                 "WorkerConnections: Task index {target_task} not found, only have {} tasks",
@@ -131,7 +130,7 @@ impl WorkerTransport for FlightWorkerTransport {
         target_task: usize,
         ctx: &Arc<TaskContext>,
         metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
+    ) -> Result<Box<dyn WorkerConnection>> {
         let connection = FlightWorkerConnection::open(
             input_stage,
             target_partitions,

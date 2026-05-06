@@ -192,7 +192,7 @@ impl DistributedExec {
             .options()
             .extensions
             .get::<DistributedConfig>()
-            .map(|c| c.__private_worker_transport.0.is_some())
+            .map(|c| c.is_in_process())
             .unwrap_or(false);
         if in_process {
             let join_set = JoinSet::new();
@@ -201,12 +201,9 @@ impl DistributedExec {
                     return Ok(Transformed::no(plan));
                 };
                 let stage = plan.input_stage();
-                Ok(Transformed::yes(plan.with_input_stage(Stage {
-                    query_id: stage.query_id,
-                    num: stage.num,
-                    plan: None,
-                    tasks: stage.tasks.clone(),
-                })?))
+                Ok(Transformed::yes(plan.with_input_stage(
+                    Stage::new_unaddressed(stage.query_id, stage.num, stage.tasks.len()),
+                )?))
             })?;
             return Ok(PreparedPlan {
                 plan: prepared.data,

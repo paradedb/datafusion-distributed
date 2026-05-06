@@ -131,6 +131,14 @@ impl DistributedConfig {
         };
         Ok(distributed_cfg)
     }
+
+    /// True iff a custom [crate::WorkerTransport] has been registered. The distributed planner
+    /// and `DistributedExec::prepare_plan` use this as the single check for "in-process": when
+    /// it's true, the gRPC dialer is bypassed and `_distribute_plan` switches to single-consumer
+    /// arithmetic.
+    pub(crate) fn is_in_process(&self) -> bool {
+        self.__private_worker_transport.0.is_some()
+    }
 }
 
 impl ConfigExtension for DistributedConfig {

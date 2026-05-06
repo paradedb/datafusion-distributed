@@ -662,10 +662,7 @@ impl DistributedExt for SessionConfig {
         set_distributed_channel_resolver(self, resolver);
     }
 
-    fn set_distributed_worker_transport<T: WorkerTransport>(
-        &mut self,
-        transport: T,
-    ) {
+    fn set_distributed_worker_transport<T: WorkerTransport>(&mut self, transport: T) {
         set_distributed_worker_transport(self, transport);
     }
 

@@ -124,7 +124,7 @@ impl Stage {
 
     /// Creates a `Stage` for an alternate-transport [`NetworkBoundary`] that
     /// does not need the upstream plan or task-URL list (for example, an
-    /// in-process `shm_mq` mesh where the wiring is established at DSM
+    /// in-process shared-memory mesh where the wiring is established at
     /// init time and the consumer-task addressing is implicit). The stage
     /// is identified by `query_id` + `num` and carries `n_tasks` empty
     /// task slots so `tasks.len()` still reflects the participant count.

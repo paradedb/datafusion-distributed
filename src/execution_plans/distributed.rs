@@ -169,13 +169,13 @@ impl DistributedExec {
     ///    its metrics into [DistributedExec::task_metrics] via the coordinator channel.
     fn prepare_plan(&self, ctx: &Arc<TaskContext>) -> Result<PreparedPlan> {
         // Fast path for in-process consumers. When the user has registered a
-        // custom `WorkerTransport` (e.g. an `shm_mq` mesh inside a single
+        // custom `WorkerTransport` (e.g. a shared-memory mesh inside a single
         // process), the gRPC coordinator-channel that ships serialized
         // subplans to remote URLs is unnecessary: the data path is already
         // covered by `WorkerTransport::open` and workers obtain their plan
-        // through whatever side channel the embedder sets up (e.g. a logical
-        // plan stashed in DSM). Skipping the spawner avoids two failure
-        // modes that would otherwise block in-process integrations:
+        // through whatever side channel the embedder sets up. Skipping the
+        // spawner avoids two failure modes that would otherwise block
+        // in-process integrations:
         //   1. The DistributedCodec encoding the worker subplan (custom
         //      physical execs need a codec just to satisfy this step).
         //   2. The gRPC plan-send tasks attempting to dial the resolver-

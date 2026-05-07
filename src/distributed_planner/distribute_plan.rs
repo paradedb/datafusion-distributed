@@ -190,13 +190,11 @@ fn _distribute_plan(
         // This is a shuffle, so inject a NetworkShuffleExec here in the plan.
         PlanOrNetworkBoundary::Shuffle => {
             // Track A — nested in-process Shuffle: when the peer-shuffle flag
-            // is on, the FIRST nested Shuffle below the OUTER Coalesce gather
+            // is on, EVERY nested Shuffle below the OUTER Coalesce gather
             // becomes a real cross-worker boundary (`consumer_tc=N, input_tc=N`)
-            // — the peer-mesh post-aggregate shuffle. Any further-nested
-            // Shuffles (e.g. join-side hash repartitions inserted by
-            // `HashJoinExec(Partitioned)`) keep the legacy in-process elision
-            // because the runtime allocates exactly one peer mesh per query.
-            let nested_peer = nested_in_process && peer_shuffle && !has_shuffle_ancestor;
+            // — the embedder is responsible for allocating one peer mesh per
+            // such stage (counted by walking the produced physical plan).
+            let nested_peer = nested_in_process && peer_shuffle;
             let consumer_task_count = if nested_peer {
                 max_child_task_count.unwrap_or(1)
             } else if in_process {

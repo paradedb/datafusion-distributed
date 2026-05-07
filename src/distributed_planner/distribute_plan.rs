@@ -122,20 +122,33 @@ fn _distribute_plan(
         .get::<DistributedConfig>()
         .map(|c| c.is_in_process())
         .unwrap_or(false);
+    // Track A — peer-mesh shuffle gate. When the embedder (ParadeDB pg_search)
+    // sets `in_process_peer_shuffle = true`, in-process mode emits a two-
+    // boundary plan: the OUTER `Coalesce` arm produces a worker→leader gather
+    // (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`) and the NESTED
+    // `Shuffle` arm produces a peer-mesh shuffle
+    // (`NetworkShuffleExec(consumer_tc=N, input_tc=N)`). When false,
+    // `_distribute_plan` keeps the legacy single-boundary path.
+    let peer_shuffle = in_process
+        && cfg
+            .extensions
+            .get::<DistributedConfig>()
+            .map(|c| c.in_process_peer_shuffle)
+            .unwrap_or(false);
     let nested_in_process = in_process && has_boundary_ancestor;
     let children = annotated_plan.children;
     let task_count = annotated_plan.task_count.as_usize();
     let max_child_task_count = children.iter().map(|v| v.task_count.as_usize()).max();
+    let multi_task_below = max_child_task_count.unwrap_or(1) > 1;
     // Track which annotations are *real* boundaries that produce a
     // `Network*Exec` in the final plan. In in-process mode the `Coalesce`
-    // arm is elided to its child, so a `Coalesce` annotation is a
-    // pass-through and should NOT mark its descendants as nested. (Without
-    // this carve-out, the OUTER `Shuffle` — which is annotated as a child
-    // of the implicit `Coalesce` wrapping the top-level `CoalescePartitionsExec`
-    // — would be mis-clamped to nested and elided too.)
+    // arm is normally elided to its child, so a `Coalesce` annotation is a
+    // pass-through and should NOT mark its descendants as nested. With
+    // `peer_shuffle` on, the `Coalesce` arm DOES emit a real boundary (the
+    // worker→leader gather), so its descendants are nested.
     let this_is_real_boundary = match &annotated_plan.plan_or_nb {
         PlanOrNetworkBoundary::Shuffle | PlanOrNetworkBoundary::Broadcast => true,
-        PlanOrNetworkBoundary::Coalesce => !in_process,
+        PlanOrNetworkBoundary::Coalesce => !in_process || (peer_shuffle && multi_task_below),
         PlanOrNetworkBoundary::Plan(_) => false,
     };
     let children_have_boundary_ancestor = has_boundary_ancestor || this_is_real_boundary;
@@ -166,8 +179,21 @@ fn _distribute_plan(
         PlanOrNetworkBoundary::Plan(plan) => plan.with_new_children(new_children),
         // This is a shuffle, so inject a NetworkShuffleExec here in the plan.
         PlanOrNetworkBoundary::Shuffle => {
-            let consumer_task_count = if in_process { 1 } else { task_count };
-            let input_task_count = if nested_in_process {
+            // Track A — nested in-process Shuffle: when the peer-shuffle flag
+            // is on, a nested Shuffle becomes a real cross-worker boundary
+            // (`consumer_tc=N, input_tc=N`) instead of eliding to (1, 1).
+            // The outer worker→leader gather is now the Coalesce arm's job.
+            let nested_peer = nested_in_process && peer_shuffle;
+            let consumer_task_count = if nested_peer {
+                max_child_task_count.unwrap_or(1)
+            } else if in_process {
+                1
+            } else {
+                task_count
+            };
+            let input_task_count = if nested_peer {
+                max_child_task_count.unwrap_or(1)
+            } else if nested_in_process {
                 1
             } else {
                 max_child_task_count.unwrap_or(1)
@@ -190,9 +216,26 @@ fn _distribute_plan(
         // DataFusion is trying to coalesce multiple partitions into one, so we should do the
         // same with tasks.
         PlanOrNetworkBoundary::Coalesce => {
-            // In-process mode: skip the network coalesce. The surrounding
-            // CoalescePartitionsExec will fan in the partitions locally,
-            // which is what we want for a single-consumer leader.
+            // Track A — in-process peer-shuffle path: emit a worker→leader
+            // gather as `NetworkShuffleExec(consumer_tc=1, input_tc=N)`.
+            // This positions the gather as the OUTER boundary, with the
+            // descendant `Shuffle` becoming a nested peer-mesh boundary.
+            if peer_shuffle && in_process && multi_task_below {
+                let input_task_count = max_child_task_count.unwrap_or(1);
+                let node = Arc::new(NetworkShuffleExec::try_new(
+                    require_one_child(new_children)?,
+                    query_id,
+                    *stage_id,
+                    1,
+                    input_task_count,
+                )?);
+                stage_id.add_assign(1);
+                return Ok(node);
+            }
+            // In-process mode (single-boundary): skip the network coalesce.
+            // The surrounding CoalescePartitionsExec will fan in the
+            // partitions locally, which is what we want for a single-
+            // consumer leader.
             if in_process {
                 return require_one_child(new_children);
             }
@@ -976,6 +1019,78 @@ mod tests {
         f: impl FnOnce(SessionStateBuilder) -> SessionStateBuilder,
     ) -> String {
         explain_test_plan(query, TestPlanOptions::default(), true, f).await
+    }
+
+    /// No-op `WorkerTransport` used by the in-process peer-shuffle snapshot
+    /// test. The test only inspects the produced plan tree's *shape* — it
+    /// never executes the plan — so the transport's `open` is never called.
+    #[derive(Debug)]
+    struct NoopTransport;
+
+    impl crate::WorkerTransport for NoopTransport {
+        fn open(
+            &self,
+            _input_stage: &crate::Stage,
+            _target_partitions: std::ops::Range<usize>,
+            _target_task: usize,
+            _ctx: &std::sync::Arc<datafusion::execution::TaskContext>,
+            _metrics: &datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet,
+        ) -> datafusion::common::Result<Box<dyn crate::WorkerConnection>> {
+            unreachable!("NoopTransport::open called in a snapshot-only test")
+        }
+    }
+
+    /// Track A + Track B: with `in_process_peer_shuffle = true` the planner
+    /// must emit a TWO-boundary plan for an aggregate-on-join shape:
+    /// 1. an OUTER `NetworkShuffleExec` emitted by the `Coalesce` arm (the
+    ///    worker→leader gather; `consumer_tc=1`).
+    /// 2. a NESTED `NetworkShuffleExec` emitted by the `Shuffle` arm with
+    ///    the `nested_peer` branch active (the peer-mesh shuffle;
+    ///    `consumer_tc=task_count, input_tc=max_child`).
+    ///
+    /// Only the count is asserted: the per-stage task counts depend on the
+    /// annotator's cardinality factor and aren't a stable shape invariant.
+    /// `test_in_process_single_boundary_default` below pins the count to
+    /// 1 in default-off mode for direct comparison.
+    #[tokio::test]
+    async fn test_in_process_peer_shuffle_two_boundary() {
+        let query = r#"
+        SELECT count(*), "RainToday" FROM weather GROUP BY "RainToday"
+        "#;
+        let plan = sql_to_explain(query, |b| {
+            b.with_distributed_worker_resolver(InMemoryWorkerResolver::new(3))
+                .with_distributed_worker_transport(NoopTransport)
+                .with_distributed_in_process_peer_shuffle(true)
+                .expect("with_distributed_in_process_peer_shuffle")
+        })
+        .await;
+
+        let shuffle_count = plan.matches("NetworkShuffleExec").count();
+        assert_eq!(
+            shuffle_count, 2,
+            "expected 2 NetworkShuffleExecs (gather + peer mesh); plan was:\n{plan}"
+        );
+    }
+
+    /// With `in_process_peer_shuffle = false` (default) the same query must
+    /// produce a SINGLE-boundary plan — the legacy single-shuffle path is
+    /// unchanged.
+    #[tokio::test]
+    async fn test_in_process_single_boundary_default() {
+        let query = r#"
+        SELECT count(*), "RainToday" FROM weather GROUP BY "RainToday"
+        "#;
+        let plan = sql_to_explain(query, |b| {
+            b.with_distributed_worker_resolver(InMemoryWorkerResolver::new(3))
+                .with_distributed_worker_transport(NoopTransport)
+        })
+        .await;
+
+        let shuffle_count = plan.matches("NetworkShuffleExec").count();
+        assert_eq!(
+            shuffle_count, 1,
+            "default single-boundary plan must have exactly 1 NetworkShuffleExec; plan was:\n{plan}"
+        );
     }
 
     async fn sql_to_explain_with_broadcast(

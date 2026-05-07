@@ -63,7 +63,7 @@ pub(super) async fn distribute_plan(
 
     // Based on the annotations, place the actual network boundaries with the appropriate dimensions.
     let mut stage_id = 1;
-    let plan = _distribute_plan(annotated, cfg, Uuid::new_v4(), &mut stage_id, false)?;
+    let plan = _distribute_plan(annotated, cfg, Uuid::new_v4(), &mut stage_id, false, false)?;
     if stage_id == 1 {
         return Ok(None);
     }
@@ -87,6 +87,7 @@ fn _distribute_plan(
     query_id: Uuid,
     stage_id: &mut usize,
     has_boundary_ancestor: bool,
+    has_shuffle_ancestor: bool,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let d_cfg = DistributedConfig::from_config_options(cfg)?;
     // In-process mode: a custom WorkerTransport is registered, meaning the
@@ -152,6 +153,14 @@ fn _distribute_plan(
         PlanOrNetworkBoundary::Plan(_) => false,
     };
     let children_have_boundary_ancestor = has_boundary_ancestor || this_is_real_boundary;
+    // Track whether descendants will have an emitted `NetworkShuffleExec`
+    // ancestor. Only the FIRST nested Shuffle below the OUTER Coalesce
+    // becomes the peer-mesh boundary; deeper nested Shuffles (e.g. join-side
+    // hash repartitions inserted by `HashJoinExec(Partitioned)`) keep the
+    // legacy in-process elision so the runtime allocates exactly one peer
+    // mesh per query.
+    let this_emits_shuffle = matches!(annotated_plan.plan_or_nb, PlanOrNetworkBoundary::Shuffle);
+    let children_have_shuffle_ancestor = has_shuffle_ancestor || this_emits_shuffle;
     let new_children = children
         .into_iter()
         .map(|child| {
@@ -161,6 +170,7 @@ fn _distribute_plan(
                 query_id,
                 stage_id,
                 children_have_boundary_ancestor,
+                children_have_shuffle_ancestor,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -180,10 +190,13 @@ fn _distribute_plan(
         // This is a shuffle, so inject a NetworkShuffleExec here in the plan.
         PlanOrNetworkBoundary::Shuffle => {
             // Track A — nested in-process Shuffle: when the peer-shuffle flag
-            // is on, a nested Shuffle becomes a real cross-worker boundary
-            // (`consumer_tc=N, input_tc=N`) instead of eliding to (1, 1).
-            // The outer worker→leader gather is now the Coalesce arm's job.
-            let nested_peer = nested_in_process && peer_shuffle;
+            // is on, the FIRST nested Shuffle below the OUTER Coalesce gather
+            // becomes a real cross-worker boundary (`consumer_tc=N, input_tc=N`)
+            // — the peer-mesh post-aggregate shuffle. Any further-nested
+            // Shuffles (e.g. join-side hash repartitions inserted by
+            // `HashJoinExec(Partitioned)`) keep the legacy in-process elision
+            // because the runtime allocates exactly one peer mesh per query.
+            let nested_peer = nested_in_process && peer_shuffle && !has_shuffle_ancestor;
             let consumer_task_count = if nested_peer {
                 max_child_task_count.unwrap_or(1)
             } else if in_process {

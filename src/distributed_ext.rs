@@ -584,7 +584,7 @@ pub trait DistributedExt: Sized {
     /// Same as [DistributedExt::with_distributed_partial_reduce] but with an in-place mutation.
     fn set_distributed_partial_reduce(&mut self, enabled: bool) -> Result<(), DataFusionError>;
 
-    /// Toggle the in-process peer-shuffle plan shape (Track A/B). When `true`, in-process
+    /// Toggle the in-process peer-shuffle plan shape. When `true`, in-process
     /// `_distribute_plan` emits a two-boundary plan: `Coalesce` becomes a worker→leader gather
     /// and the descendant `Shuffle` becomes a peer-mesh `NetworkShuffleExec(N, N)`. When
     /// `false` (default), the legacy single-boundary path is preserved.

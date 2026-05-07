@@ -92,26 +92,26 @@ fn _distribute_plan(
     let d_cfg = DistributedConfig::from_config_options(cfg)?;
     // In-process mode: a custom WorkerTransport is registered, meaning the
     // entire pipeline is running inside one process with a single consumer
-    // task (the leader) and N producer tasks (the PG parallel workers).
+    // task (the leader) and N producer tasks (the parallel workers).
     //
     // Two stage shapes need different `(consumer_task_count, input_task_count)`:
     //
     // - **Outer boundary** (worker → leader): the OUTERMOST `NetworkBoundary`
-    //   straddles the PG worker / leader split. Its producers ARE separate
-    //   processes (PG workers each holding a 1/N slice via `parallel_state`).
-    //   So `consumer_task_count = 1` (single in-process leader), and
-    //   `input_task_count = N` (N real remote producers via shm_mq).
+    //   straddles the worker/leader split. Its producers ARE separate
+    //   processes (each holding a 1/N slice of the input). So
+    //   `consumer_task_count = 1` (single in-process leader), and
+    //   `input_task_count = N` (N real remote producers).
     //
-    // - **Nested boundaries** (inside one PG worker's producer fragment):
-    //   when `HashJoinExec(Partitioned)` or similar is chosen, the planner
+    // - **Nested boundaries** (inside one worker's producer fragment): when
+    //   `HashJoinExec(Partitioned)` or similar is chosen, the planner
     //   inserts shuffles on each side. These are *all* in-process within
-    //   the same PG worker — there is exactly ONE local producer per nested
+    //   the same worker — there is exactly ONE local producer per nested
     //   boundary (the inner `RepartitionExec`). For these, both
     //   `consumer_task_count = 1` AND `input_task_count = 1`. Otherwise
     //   `NetworkShuffleExec.execute` would open `input_task_count`
     //   connections via `WorkerTransport` and `select_all`-merge them; the
-    //   in-process `LocalExecWorkerTransport` would then re-execute the
-    //   same `RepartitionExec` for each call and panic on the second call
+    //   in-process transport would then re-execute the same
+    //   `RepartitionExec` for each call and panic on the second call
     //   ("partition not used yet" — `RepartitionExec.execute(p)` is
     //   single-shot per partition).
     //
@@ -123,9 +123,9 @@ fn _distribute_plan(
         .get::<DistributedConfig>()
         .map(|c| c.is_in_process())
         .unwrap_or(false);
-    // Track A — peer-mesh shuffle gate. When the embedder (ParadeDB pg_search)
-    // sets `in_process_peer_shuffle = true`, in-process mode emits a two-
-    // boundary plan: the OUTER `Coalesce` arm produces a worker→leader gather
+    // Peer-mesh shuffle gate. When the embedder sets
+    // `in_process_peer_shuffle = true`, in-process mode emits a two-boundary
+    // plan: the OUTER `Coalesce` arm produces a worker→leader gather
     // (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`) and the NESTED
     // `Shuffle` arm produces a peer-mesh shuffle
     // (`NetworkShuffleExec(consumer_tc=N, input_tc=N)`). When false,
@@ -189,11 +189,11 @@ fn _distribute_plan(
         PlanOrNetworkBoundary::Plan(plan) => plan.with_new_children(new_children),
         // This is a shuffle, so inject a NetworkShuffleExec here in the plan.
         PlanOrNetworkBoundary::Shuffle => {
-            // Track A — nested in-process Shuffle: when the peer-shuffle flag
-            // is on, EVERY nested Shuffle below the OUTER Coalesce gather
-            // becomes a real cross-worker boundary (`consumer_tc=N, input_tc=N`)
-            // — the embedder is responsible for allocating one peer mesh per
-            // such stage (counted by walking the produced physical plan).
+            // Nested in-process Shuffle: when the peer-shuffle flag is on,
+            // EVERY nested Shuffle below the OUTER Coalesce gather becomes a
+            // real cross-worker boundary (`consumer_tc=N, input_tc=N`) — the
+            // embedder is responsible for allocating one peer mesh per such
+            // stage (counted by walking the produced physical plan).
             let nested_peer = nested_in_process && peer_shuffle;
             let consumer_task_count = if nested_peer {
                 max_child_task_count.unwrap_or(1)
@@ -227,10 +227,10 @@ fn _distribute_plan(
         // DataFusion is trying to coalesce multiple partitions into one, so we should do the
         // same with tasks.
         PlanOrNetworkBoundary::Coalesce => {
-            // Track A — in-process peer-shuffle path: emit a worker→leader
-            // gather as `NetworkShuffleExec(consumer_tc=1, input_tc=N)`.
-            // This positions the gather as the OUTER boundary, with the
-            // descendant `Shuffle` becoming a nested peer-mesh boundary.
+            // In-process peer-shuffle path: emit a worker→leader gather as
+            // `NetworkShuffleExec(consumer_tc=1, input_tc=N)`. This positions
+            // the gather as the OUTER boundary, with the descendant `Shuffle`
+            // becoming a nested peer-mesh boundary.
             if peer_shuffle && in_process && multi_task_below {
                 let input_task_count = max_child_task_count.unwrap_or(1);
                 let node = Arc::new(NetworkShuffleExec::try_new(
@@ -270,11 +270,10 @@ fn _distribute_plan(
         PlanOrNetworkBoundary::Broadcast => {
             // Same outer-vs-nested logic as Shuffle. Outer broadcast (worker
             // → leader for the whole HashJoin's build side) needs
-            // input_task_count = N because each PG worker runs the
-            // broadcast subtree locally and contributes a stream. Nested
-            // broadcast (inside one worker's producer fragment) has only
-            // ONE local producer of the broadcast subtree, so
-            // input_task_count = 1.
+            // input_task_count = N because each worker runs the broadcast
+            // subtree locally and contributes a stream. Nested broadcast
+            // (inside one worker's producer fragment) has only ONE local
+            // producer of the broadcast subtree, so input_task_count = 1.
             let consumer_tc = if in_process { 1 } else { task_count };
             let input_tc = if nested_in_process {
                 1
@@ -1051,8 +1050,8 @@ mod tests {
         }
     }
 
-    /// Track A + Track B: with `in_process_peer_shuffle = true` the planner
-    /// must emit a TWO-boundary plan for an aggregate-on-join shape:
+    /// With `in_process_peer_shuffle = true` the planner must emit a
+    /// TWO-boundary plan for an aggregate-on-join shape:
     /// 1. an OUTER `NetworkShuffleExec` emitted by the `Coalesce` arm (the
     ///    worker→leader gather; `consumer_tc=1`).
     /// 2. a NESTED `NetworkShuffleExec` emitted by the `Shuffle` arm with

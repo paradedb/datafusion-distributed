@@ -68,7 +68,7 @@ extensions_options! {
         /// When false (default), the `Coalesce` arm elides to its child and the inner Shuffle
         /// uses `(consumer_tc=1, input_tc=1)` (legacy single-boundary path; the leader runs
         /// `FinalPartitioned` single-threaded). The runtime side that consumes the peer mesh
-        /// is the embedder's responsibility (e.g. ParadeDB's `ShmMqPeerWorkerTransport`).
+        /// is the embedder's responsibility.
         pub in_process_peer_shuffle: bool, default = false
         /// Soft byte budget that each per-worker connection will buffer in memory before pausing
         /// the gRPC pull from that worker. Per-partition channels are unbounded (to avoid

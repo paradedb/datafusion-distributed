@@ -1,4 +1,5 @@
 use crate::Stage;
+use crate::worker::generated::worker::FlightAppMetadata;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::Result;
 use datafusion::execution::TaskContext;
@@ -7,6 +8,12 @@ use futures::Stream;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+
+/// Per-batch out-of-band metadata callback. The Flight transport invokes this for each
+/// `FlightAppMetadata` it decodes from the wire (carrying the partition number and the
+/// worker-side timestamp). Custom transports that have no equivalent metadata may leave
+/// the callback uninvoked.
+pub type OnMetadataCallback = Box<dyn Fn(FlightAppMetadata) + Send + Sync + 'static>;
 
 /// A schema-less stream of record batches produced by a single partition of a [WorkerConnection].
 ///
@@ -27,7 +34,15 @@ pub trait WorkerConnection: Send + Sync {
     /// partition MUST return `Err(DataFusionError::Internal(...))`. Operators above (e.g.
     /// `NetworkShuffleExec`) do not retry, but pinning this contract lets future work assume
     /// `stream_partition` is a single-shot consumer per partition.
-    fn stream_partition(&self, partition: usize) -> Result<WorkerPartitionStream>;
+    ///
+    /// `on_metadata` is invoked once per batch with the worker-side `FlightAppMetadata`
+    /// (partition + creation timestamp). Custom transports without an equivalent concept
+    /// may leave it uninvoked.
+    fn stream_partition(
+        &self,
+        partition: usize,
+        on_metadata: OnMetadataCallback,
+    ) -> Result<WorkerPartitionStream>;
 
     /// Optional snapshot of metrics emitted by this connection. Operators surface these through
     /// their own `metrics()` method, so a transport that has nothing to report can stay at the

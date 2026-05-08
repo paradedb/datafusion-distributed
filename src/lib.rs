@@ -48,11 +48,13 @@ pub use work_unit_feed::{
 };
 pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
-pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
+pub use worker::generated::worker::{
+    FlightAppMetadata, GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey,
+};
 pub use worker::{
     DefaultSessionBuilder, FlightWorkerTransport, MappedWorkerSessionBuilder,
-    MappedWorkerSessionBuilderExt, TaskData, Worker, WorkerConnection, WorkerPartitionStream,
-    WorkerQueryContext, WorkerSessionBuilder, WorkerTransport,
+    MappedWorkerSessionBuilderExt, OnMetadataCallback, TaskData, Worker, WorkerConnection,
+    WorkerPartitionStream, WorkerQueryContext, WorkerSessionBuilder, WorkerTransport,
 };
 
 pub use observability::{

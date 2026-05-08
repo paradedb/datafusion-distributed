@@ -390,7 +390,11 @@ impl WorkerConnection for FlightWorkerConnection {
     ///
     /// When the returned stream is dropped (e.g., due to query cancellation), the background task
     /// pulling from the Flight stream will be cancelled promptly.
-    fn stream_partition(&self, partition: usize) -> Result<WorkerPartitionStream> {
+    fn stream_partition(
+        &self,
+        partition: usize,
+        on_metadata: crate::worker::transport::OnMetadataCallback,
+    ) -> Result<WorkerPartitionStream> {
         let Some((_, partition_receiver)) = self.per_partition_rx.remove(&partition) else {
             return internal_err!(
                 "WorkerConnection has no stream for target partition {partition}. Was it already consumed?"
@@ -403,11 +407,12 @@ impl WorkerConnection for FlightWorkerConnection {
         let stream = stream.map_err(|err| FlightError::Tonic(Box::new(err)));
         let reservation = Arc::clone(&self.memory_reservation);
         let mem_available_notify = Arc::clone(&self.mem_available_notify);
-        let stream = stream.map_ok(move |(data, _meta)| {
+        let stream = stream.map_ok(move |(data, meta)| {
             reservation.shrink(data.encoded_len());
             // Wake the demux task in case it is blocked on the byte budget.
             mem_available_notify.notify_one();
             let _ = &task; // <- keep the task that polls data from the network alive.
+            on_metadata(meta);
             data
         });
         let stream = FlightRecordBatchStream::new_from_flight_data(stream);

@@ -227,7 +227,8 @@ impl ExecutionPlan for NetworkShuffleExec {
                 &context,
             )?;
 
-            let stream = worker_connection.stream_partition(off + partition)?;
+            let stream =
+                worker_connection.stream_partition(off + partition, Box::new(|_meta| {}))?;
             streams.push(stream);
         }
 

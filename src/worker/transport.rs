@@ -54,17 +54,3 @@ pub trait WorkerTransport: Send + Sync + 'static {
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Box<dyn WorkerConnection>>;
 }
-
-impl WorkerTransport for Arc<dyn WorkerTransport> {
-    fn open(
-        &self,
-        input_stage: &Stage,
-        target_partitions: Range<usize>,
-        target_task: usize,
-        ctx: &Arc<TaskContext>,
-        metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection>> {
-        self.as_ref()
-            .open(input_stage, target_partitions, target_task, ctx, metrics)
-    }
-}

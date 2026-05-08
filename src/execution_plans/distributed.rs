@@ -123,10 +123,17 @@ impl DistributedExec {
     /// [`rewrite_distributed_plan_with_metrics`]: crate::rewrite_distributed_plan_with_metrics
     pub async fn wait_for_metrics(&self) {
         let mut expected_keys: Vec<TaskKey> = Vec::new();
+        // Custom-transport stages land with `url: None` (see `Stage::new_unaddressed`
+        // and the in-process fast path in `prepare_plan`). The metrics-collection
+        // tasks that populate `task_metrics` are only spawned for the gRPC path, so
+        // unaddressed stages would block this method forever. Skip them.
         let _ = self.plan.apply(|plan| {
             if let Some(boundary) = plan.as_network_boundary() {
                 let stage = boundary.input_stage();
-                for i in 0..stage.tasks.len() {
+                for (i, task) in stage.tasks.iter().enumerate() {
+                    if task.url.is_none() {
+                        continue;
+                    }
                     expected_keys.push(TaskKey {
                         query_id: stage.query_id.as_bytes().to_vec(),
                         stage_id: stage.num as u64,

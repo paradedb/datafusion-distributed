@@ -62,8 +62,22 @@ pub(super) async fn distribute_plan(
     let annotated = annotate_plan(plan, cfg).await?;
 
     // Based on the annotations, place the actual network boundaries with the appropriate dimensions.
+    // `in_process` and `peer_shuffle` are query-wide planner modes; resolve them once here so the
+    // recursion doesn't re-read `cfg.extensions` at every node.
+    let d_cfg = DistributedConfig::from_config_options(cfg)?;
+    let in_process = d_cfg.is_in_process();
+    let peer_shuffle = in_process && d_cfg.in_process_peer_shuffle;
     let mut stage_id = 1;
-    let plan = _distribute_plan(annotated, cfg, Uuid::new_v4(), &mut stage_id, false, false)?;
+    let plan = _distribute_plan(
+        annotated,
+        cfg,
+        Uuid::new_v4(),
+        &mut stage_id,
+        in_process,
+        peer_shuffle,
+        false,
+        false,
+    )?;
     if stage_id == 1 {
         return Ok(None);
     }
@@ -81,15 +95,17 @@ pub(super) async fn distribute_plan(
 ///   which they are going to run. This is configurable by the user via the [TaskEstimator] trait.
 /// - The appropriate network boundaries are placed in the plan depending on how it was annotated,
 ///   so new nodes like [NetworkBroadcastExec], [NetworkCoalesceExec] and [NetworkShuffleExec] will be present.
+#[allow(clippy::too_many_arguments)]
 fn _distribute_plan(
     annotated_plan: AnnotatedPlan,
     cfg: &ConfigOptions,
     query_id: Uuid,
     stage_id: &mut usize,
+    in_process: bool,
+    peer_shuffle: bool,
     has_boundary_ancestor: bool,
     has_shuffle_ancestor: bool,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    let d_cfg = DistributedConfig::from_config_options(cfg)?;
     // In-process mode: a custom WorkerTransport is registered, meaning the
     // entire pipeline is running inside one process with a single consumer
     // task (the leader) and N producer tasks (the parallel workers).
@@ -118,24 +134,13 @@ fn _distribute_plan(
     // We distinguish "outer" from "nested" by threading
     // `has_boundary_ancestor` down the recursion: a boundary is OUTER if no
     // ancestor in the annotation tree is also a boundary, NESTED otherwise.
-    let in_process = cfg
-        .extensions
-        .get::<DistributedConfig>()
-        .map(|c| c.is_in_process())
-        .unwrap_or(false);
-    // Peer-mesh shuffle gate. When the embedder sets
-    // `in_process_peer_shuffle = true`, in-process mode emits a two-boundary
+    //
+    // `peer_shuffle` (when `in_process` is also true) opts into a two-boundary
     // plan: the OUTER `Coalesce` arm produces a worker→leader gather
-    // (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`) and the NESTED
-    // `Shuffle` arm produces a peer-mesh shuffle
-    // (`NetworkShuffleExec(consumer_tc=N, input_tc=N)`). When false,
-    // `_distribute_plan` keeps the legacy single-boundary path.
-    let peer_shuffle = in_process
-        && cfg
-            .extensions
-            .get::<DistributedConfig>()
-            .map(|c| c.in_process_peer_shuffle)
-            .unwrap_or(false);
+    // (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`) and nested `Shuffle`
+    // arms below it produce peer-mesh shuffles
+    // (`NetworkShuffleExec(consumer_tc=N, input_tc=N)`). When false, the
+    // legacy single-boundary path is preserved.
     let nested_in_process = in_process && has_boundary_ancestor;
     let children = annotated_plan.children;
     let task_count = annotated_plan.task_count.as_usize();
@@ -169,6 +174,8 @@ fn _distribute_plan(
                 cfg,
                 query_id,
                 stage_id,
+                in_process,
+                peer_shuffle,
                 children_have_boundary_ancestor,
                 children_have_shuffle_ancestor,
             )
@@ -178,11 +185,9 @@ fn _distribute_plan(
         // This is a leaf node. It needs to be scaled up in order to account for it running in
         // multiple tasks.
         PlanOrNetworkBoundary::Plan(plan) if plan.children().is_empty() => {
-            let scaled_up = d_cfg.__private_task_estimator.scale_up_leaf_node(
-                &plan,
-                annotated_plan.task_count.as_usize(),
-                cfg,
-            );
+            let scaled_up = DistributedConfig::from_config_options(cfg)?
+                .__private_task_estimator
+                .scale_up_leaf_node(&plan, annotated_plan.task_count.as_usize(), cfg);
             Ok(scaled_up.unwrap_or(plan))
         }
         // This is a normal intermediate plan, just pass it through with the mapped children.
@@ -281,8 +286,8 @@ fn _distribute_plan(
                 max_child_task_count.unwrap_or(1)
             };
             // It would need a network boundary, but on both sides of the boundary there is just 1 task,
-            // so we are fine with not introducing any network boundary.
-            if consumer_tc == 1 && input_tc == 1 && !in_process {
+            // so we are fine with not introducing any network boundary. Mirrors the Shuffle arm.
+            if consumer_tc == 1 && input_tc == 1 {
                 return require_one_child(new_children);
             }
             let node = Arc::new(NetworkBroadcastExec::try_new(

@@ -13,7 +13,7 @@ use arrow_flight::error::FlightError;
 use dashmap::DashMap;
 use datafusion::common::instant::Instant;
 use datafusion::common::runtime::SpawnedTask;
-use datafusion::common::{DataFusionError, Result, internal_err};
+use datafusion::common::{DataFusionError, Result, internal_err, not_impl_err};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr_common::metrics::{ExecutionPlanMetricsSet, MetricValue};
@@ -232,7 +232,10 @@ impl FlightWorkerConnection {
             return internal_err!("ProgrammingError: Task {target_task} not found");
         };
         let Some(url) = task.url.clone() else {
-            return internal_err!("ProgrammingError: task is unassigned, cannot proceed");
+            return not_impl_err!(
+                "FlightWorkerTransport called on unaddressed stage (task {target_task} has no url). \
+                 Did you forget `with_distributed_worker_transport(...)` to register a custom transport?"
+            );
         };
 
         // The senders and receivers are unbounded queues used for multiplexing the record

@@ -106,34 +106,36 @@ fn _distribute_plan(
     has_boundary_ancestor: bool,
     has_shuffle_ancestor: bool,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    // In-process mode: a custom WorkerTransport is registered, meaning the
-    // entire pipeline is running inside one process with a single consumer
-    // task (the leader) and N producer tasks (the parallel workers).
+    // In-process mode: a custom WorkerTransport handles the data path instead
+    // of the default Flight gRPC dialer. The pipeline still has a single
+    // consumer task (the leader) and N producer tasks (workers). Workers are
+    // separate execution units reached through the embedder's transport — they
+    // may be OS processes, threads, or anything else; the planner doesn't care
+    // about their topology, only that there is exactly one consumer.
     //
     // Two stage shapes need different `(consumer_task_count, input_task_count)`:
     //
     // - **Outer boundary** (worker → leader): the OUTERMOST `NetworkBoundary`
-    //   straddles the worker/leader split. Its producers ARE separate
-    //   processes (each holding a 1/N slice of the input). So
-    //   `consumer_task_count = 1` (single in-process leader), and
-    //   `input_task_count = N` (N real remote producers).
+    //   straddles the worker/leader split. Its producers are N independent
+    //   workers, each holding a 1/N slice of the input. So
+    //   `consumer_task_count = 1` (single leader) and `input_task_count = N`
+    //   (N producers).
     //
     // - **Nested boundaries** (inside one worker's producer fragment): when
-    //   `HashJoinExec(Partitioned)` or similar is chosen, the planner
-    //   inserts shuffles on each side. These are *all* in-process within
-    //   the same worker — there is exactly ONE local producer per nested
-    //   boundary (the inner `RepartitionExec`). For these, both
-    //   `consumer_task_count = 1` AND `input_task_count = 1`. Otherwise
-    //   `NetworkShuffleExec.execute` would open `input_task_count`
-    //   connections via `WorkerTransport` and `select_all`-merge them; the
-    //   in-process transport would then re-execute the same
+    //   `HashJoinExec(Partitioned)` or similar is chosen, the planner inserts
+    //   shuffles on each side. These all live within a single worker's local
+    //   plan — there is exactly ONE local producer per nested boundary (the
+    //   inner `RepartitionExec`). For these, both `consumer_task_count = 1`
+    //   AND `input_task_count = 1`. Otherwise `NetworkShuffleExec.execute`
+    //   would open `input_task_count` connections via `WorkerTransport` and
+    //   `select_all`-merge them; the transport would then re-execute the same
     //   `RepartitionExec` for each call and panic on the second call
     //   ("partition not used yet" — `RepartitionExec.execute(p)` is
     //   single-shot per partition).
     //
-    // We distinguish "outer" from "nested" by threading
-    // `has_boundary_ancestor` down the recursion: a boundary is OUTER if no
-    // ancestor in the annotation tree is also a boundary, NESTED otherwise.
+    // We distinguish "outer" from "nested" by threading `has_boundary_ancestor`
+    // down the recursion: a boundary is OUTER if no ancestor in the annotation
+    // tree is also a boundary, NESTED otherwise.
     //
     // `peer_shuffle` (when `in_process` is also true) opts into a two-boundary
     // plan: the OUTER `Coalesce` arm produces a worker→leader gather

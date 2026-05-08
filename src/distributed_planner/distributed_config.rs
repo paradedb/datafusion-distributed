@@ -60,10 +60,12 @@ extensions_options! {
         /// Disabled by default because its effectiveness is workload-dependent: it helps when
         /// aggregation significantly reduces cardinality, but adds overhead when it does not.
         pub partial_reduce: bool, default = false
-        /// In-process mode: the entire pipeline runs inside one process with a single consumer
-        /// task (the leader) and N producer tasks. The planner switches to single-consumer
-        /// arithmetic (`consumer_tc=1`) and `prepare_plan` skips the gRPC dialer. Embedders must
-        /// register a [crate::WorkerTransport] via
+        /// In-process mode: the pipeline has a single consumer task (the leader) reachable
+        /// through a custom transport instead of the gRPC dialer. The N producer tasks
+        /// (workers) may be OS processes, threads, or anything else the embedder's
+        /// [crate::WorkerTransport] knows how to address. The planner switches to single-
+        /// consumer arithmetic (`consumer_tc=1`) and `prepare_plan` skips the gRPC dialer.
+        /// Embedders must register a [crate::WorkerTransport] via
         /// [crate::DistributedExt::with_distributed_worker_transport]; otherwise, executing the
         /// produced plan will fall back to the default Flight transport, which only supports
         /// addressed task URLs.

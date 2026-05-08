@@ -60,16 +60,23 @@ extensions_options! {
         /// Disabled by default because its effectiveness is workload-dependent: it helps when
         /// aggregation significantly reduces cardinality, but adds overhead when it does not.
         pub partial_reduce: bool, default = false
-        /// In in-process mode (`is_in_process() == true`), emit a two-boundary plan for
-        /// aggregate-on-join queries: a peer-mesh `NetworkShuffleExec(consumer_tc=N, input_tc=N)`
-        /// below `AggregateExec(FinalPartitioned)` so workers run the final aggregate in
-        /// parallel, plus an outer worker→leader gather emitted by the `Coalesce` arm.
+        /// In-process mode: the entire pipeline runs inside one process with a single consumer
+        /// task (the leader) and N producer tasks. The planner switches to single-consumer
+        /// arithmetic (`consumer_tc=1`) and `prepare_plan` skips the gRPC dialer. Embedders must
+        /// register a [crate::WorkerTransport] via
+        /// [crate::DistributedExt::with_distributed_worker_transport]; otherwise, executing the
+        /// produced plan will fall back to the default Flight transport, which only supports
+        /// addressed task URLs.
+        pub in_process_mode: bool, default = false
+        /// In in-process mode, emit a two-boundary plan: the OUTER `Coalesce` arm produces a
+        /// worker→leader gather (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`) and nested
+        /// `Shuffle` arms below it produce peer-mesh shuffles
+        /// (`NetworkShuffleExec(consumer_tc=N, input_tc=N)`). When false (default), the `Coalesce`
+        /// arm elides to its child and the inner Shuffle uses `(consumer_tc=1, input_tc=1)` —
+        /// the legacy single-boundary path where the leader runs `FinalPartitioned` single-threaded.
         ///
-        /// When false (default), the `Coalesce` arm elides to its child and the inner Shuffle
-        /// uses `(consumer_tc=1, input_tc=1)` (legacy single-boundary path; the leader runs
-        /// `FinalPartitioned` single-threaded). The runtime side that consumes the peer mesh
-        /// is the embedder's responsibility.
-        pub in_process_peer_shuffle: bool, default = false
+        /// Has no effect when `in_process_mode` is false.
+        pub emit_peer_shuffles: bool, default = false
         /// Soft byte budget that each per-worker connection will buffer in memory before pausing
         /// the gRPC pull from that worker. Per-partition channels are unbounded (to avoid
         /// head-of-line blocking between sibling partitions), so backpressure is enforced
@@ -142,12 +149,13 @@ impl DistributedConfig {
         Ok(distributed_cfg)
     }
 
-    /// True iff a custom [crate::WorkerTransport] has been registered. The distributed planner
-    /// and `DistributedExec::prepare_plan` use this as the single check for "in-process": when
-    /// it's true, the gRPC dialer is bypassed and `_distribute_plan` switches to single-consumer
+    /// True iff in-process mode is explicitly enabled via
+    /// [crate::DistributedExt::with_distributed_in_process_mode]. The distributed planner and
+    /// `DistributedExec::prepare_plan` use this as the single check for "in-process": when it's
+    /// true, the gRPC dialer is bypassed and `_distribute_plan` switches to single-consumer
     /// arithmetic.
     pub(crate) fn is_in_process(&self) -> bool {
-        self.__private_worker_transport.0.is_some()
+        self.in_process_mode
     }
 }
 

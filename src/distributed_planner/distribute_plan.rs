@@ -66,7 +66,7 @@ pub(super) async fn distribute_plan(
     // recursion doesn't re-read `cfg.extensions` at every node.
     let d_cfg = DistributedConfig::from_config_options(cfg)?;
     let in_process = d_cfg.is_in_process();
-    let peer_shuffle = in_process && d_cfg.in_process_peer_shuffle;
+    let peer_shuffle = in_process && d_cfg.emit_peer_shuffles;
     let mut stage_id = 1;
     let plan = _distribute_plan(
         annotated,
@@ -1049,14 +1049,13 @@ mod tests {
             _target_partitions: std::ops::Range<usize>,
             _target_task: usize,
             _ctx: &std::sync::Arc<datafusion::execution::TaskContext>,
-            _metrics: &datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet,
         ) -> datafusion::common::Result<Box<dyn crate::WorkerConnection>> {
             unreachable!("NoopTransport::open called in a snapshot-only test")
         }
     }
 
-    /// With `in_process_peer_shuffle = true` the planner must emit a
-    /// TWO-boundary plan for an aggregate-on-join shape:
+    /// With `emit_peer_shuffles = true` (in-process mode) the planner must emit
+    /// a TWO-boundary plan for an aggregate-on-join shape:
     /// 1. an OUTER `NetworkShuffleExec` emitted by the `Coalesce` arm (the
     ///    worker→leader gather; `consumer_tc=1`).
     /// 2. a NESTED `NetworkShuffleExec` emitted by the `Shuffle` arm with
@@ -1075,8 +1074,10 @@ mod tests {
         let plan = sql_to_explain(query, |b| {
             b.with_distributed_worker_resolver(InMemoryWorkerResolver::new(3))
                 .with_distributed_worker_transport(NoopTransport)
-                .with_distributed_in_process_peer_shuffle(true)
-                .expect("with_distributed_in_process_peer_shuffle")
+                .with_distributed_in_process_mode(true)
+                .expect("with_distributed_in_process_mode")
+                .with_distributed_emit_peer_shuffles(true)
+                .expect("with_distributed_emit_peer_shuffles")
         })
         .await;
 
@@ -1087,7 +1088,7 @@ mod tests {
         );
     }
 
-    /// With `in_process_peer_shuffle = false` (default) the same query must
+    /// With `emit_peer_shuffles = false` (default) the same query must
     /// produce a SINGLE-boundary plan — the legacy single-shuffle path is
     /// unchanged.
     #[tokio::test]
@@ -1098,6 +1099,8 @@ mod tests {
         let plan = sql_to_explain(query, |b| {
             b.with_distributed_worker_resolver(InMemoryWorkerResolver::new(3))
                 .with_distributed_worker_transport(NoopTransport)
+                .with_distributed_in_process_mode(true)
+                .expect("with_distributed_in_process_mode")
         })
         .await;
 

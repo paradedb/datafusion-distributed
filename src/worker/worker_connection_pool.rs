@@ -17,7 +17,7 @@ use datafusion::common::{DataFusionError, Result, internal_err, not_impl_err};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr_common::metrics::{ExecutionPlanMetricsSet, MetricValue};
-use datafusion::physical_plan::metrics::{MetricBuilder, Time};
+use datafusion::physical_plan::metrics::{MetricBuilder, MetricsSet, Time};
 use futures::{Stream, TryStreamExt};
 use http::Extensions;
 use pin_project::{pin_project, pinned_drop};
@@ -61,7 +61,6 @@ type ConnectionSlot = OnceLock<Result<Box<dyn WorkerConnection>, Arc<DataFusionE
 /// callers reuse it.
 pub(crate) struct WorkerConnectionPool {
     connections: Vec<ConnectionSlot>,
-    pub(crate) metrics: ExecutionPlanMetricsSet,
 }
 
 impl WorkerConnectionPool {
@@ -72,10 +71,7 @@ impl WorkerConnectionPool {
         for _ in 0..input_tasks {
             connections.push(OnceLock::new());
         }
-        Self {
-            connections,
-            metrics: ExecutionPlanMetricsSet::default(),
-        }
+        Self { connections }
     }
 
     /// Lazily opens the [WorkerConnection] corresponding to `target_task` (so each task keeps its
@@ -99,13 +95,7 @@ impl WorkerConnectionPool {
         let conn = slot.get_or_init(|| {
             let transport = get_distributed_worker_transport(ctx);
             transport
-                .open(
-                    input_stage,
-                    target_partitions,
-                    target_task,
-                    ctx,
-                    &self.metrics,
-                )
+                .open(input_stage, target_partitions, target_task, ctx)
                 .map_err(Arc::new)
         });
 
@@ -113,6 +103,21 @@ impl WorkerConnectionPool {
             Ok(v) => Ok(v.as_ref()),
             Err(err) => Err(DataFusionError::Shared(Arc::clone(err))),
         }
+    }
+
+    /// Aggregated metrics across every initialized connection in this pool. Slots that have
+    /// not yet been opened contribute nothing; transports without metrics contribute an empty
+    /// snapshot.
+    pub(crate) fn metrics(&self) -> MetricsSet {
+        let mut combined = MetricsSet::new();
+        for slot in &self.connections {
+            if let Some(Ok(conn)) = slot.get() {
+                for m in conn.metrics().iter() {
+                    combined.push(Arc::clone(m));
+                }
+            }
+        }
+        combined
     }
 }
 
@@ -129,15 +134,9 @@ impl WorkerTransport for FlightWorkerTransport {
         target_partitions: Range<usize>,
         target_task: usize,
         ctx: &Arc<TaskContext>,
-        metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Box<dyn WorkerConnection>> {
-        let connection = FlightWorkerConnection::open(
-            input_stage,
-            target_partitions,
-            target_task,
-            ctx,
-            metrics,
-        )?;
+        let connection =
+            FlightWorkerConnection::open(input_stage, target_partitions, target_task, ctx)?;
         Ok(Box::new(connection))
     }
 }
@@ -169,6 +168,9 @@ struct FlightWorkerConnection {
     // Metrics collection stuff.
     memory_reservation: Arc<MemoryReservation>,
     elapsed_compute: Time,
+    // Owns the metrics emitted by this connection. Surfaced to the operator's
+    // metrics() via WorkerConnection::metrics() and the pool's aggregation.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl FlightWorkerConnection {
@@ -177,8 +179,8 @@ impl FlightWorkerConnection {
         target_partition_range: Range<usize>,
         target_task: usize,
         ctx: &Arc<TaskContext>,
-        metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
+        let metrics = ExecutionPlanMetricsSet::default();
         let channel_resolver = get_distributed_channel_resolver(ctx.as_ref());
         let buffer_budget_bytes =
             DistributedConfig::from_config_options(ctx.session_config().options())?
@@ -191,26 +193,26 @@ impl FlightWorkerConnection {
 
         // Track the maximum memory used to buffer recieved messages.
         let mut curr_max_mem = 0;
-        let max_mem_used = MetricBuilder::new(metrics).global_gauge("max_mem_used");
+        let max_mem_used = MetricBuilder::new(&metrics).global_gauge("max_mem_used");
         // Track the total encoded size of all recieved messages.
-        let bytes_transferred = MetricBuilder::new(metrics).bytes_counter("bytes_transferred");
-        let msg_count = MetricBuilder::new(metrics).global_counter("msg_count");
+        let bytes_transferred = MetricBuilder::new(&metrics).bytes_counter("bytes_transferred");
+        let msg_count = MetricBuilder::new(&metrics).global_counter("msg_count");
         // Track end-to-end network latency distribution for all messages.
-        let min_latency = MetricBuilder::new(metrics).min_latency("network_latency_min");
-        let max_latency = MetricBuilder::new(metrics).max_latency("network_latency_max");
-        let p50_latency = MetricBuilder::new(metrics).p50_latency("network_latency_p50");
-        let p95_latency = MetricBuilder::new(metrics).p95_latency("network_latency_p95");
-        let first_latency = MetricBuilder::new(metrics).first_latency("network_latency_first");
+        let min_latency = MetricBuilder::new(&metrics).min_latency("network_latency_min");
+        let max_latency = MetricBuilder::new(&metrics).max_latency("network_latency_max");
+        let p50_latency = MetricBuilder::new(&metrics).p50_latency("network_latency_p50");
+        let p95_latency = MetricBuilder::new(&metrics).p95_latency("network_latency_p95");
+        let first_latency = MetricBuilder::new(&metrics).first_latency("network_latency_first");
         let sum_latency = Time::new();
-        MetricBuilder::new(metrics).build(MetricValue::Time {
+        MetricBuilder::new(&metrics).build(MetricValue::Time {
             name: Cow::Borrowed("network_latency_sum"),
             time: sum_latency.clone(),
         });
-        let latency_count = MetricBuilder::new(metrics).counter("network_latency_count", 0);
+        let latency_count = MetricBuilder::new(&metrics).counter("network_latency_count", 0);
         // Track the total CPU time spent in polling messages over the network + decoding them.
         let elapsed_compute = Time::new();
         let elapsed_compute_clone = elapsed_compute.clone();
-        MetricBuilder::new(metrics).build(MetricValue::ElapsedCompute(elapsed_compute.clone()));
+        MetricBuilder::new(&metrics).build(MetricValue::ElapsedCompute(elapsed_compute.clone()));
 
         // Building the actual request that will be sent to the worker.
         let headers = get_passthrough_headers(ctx.session_config());
@@ -372,6 +374,7 @@ impl FlightWorkerConnection {
             // metrics stuff
             memory_reservation: memory_reservation_clone,
             elapsed_compute: elapsed_compute_clone,
+            metrics,
         })
     }
 }
@@ -420,6 +423,10 @@ impl WorkerConnection for FlightWorkerConnection {
             }
         });
         Ok(Box::pin(stream))
+    }
+
+    fn metrics(&self) -> MetricsSet {
+        self.metrics.clone_inner()
     }
 }
 

@@ -14,7 +14,7 @@ use crate::{
     WorkerResolver, WorkerTransport,
 };
 use arrow_ipc::CompressionType;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DataFusionError, plan_err};
 use datafusion::config::ConfigExtension;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::physical_plan::ExecutionPlan;
@@ -584,17 +584,33 @@ pub trait DistributedExt: Sized {
     /// Same as [DistributedExt::with_distributed_partial_reduce] but with an in-place mutation.
     fn set_distributed_partial_reduce(&mut self, enabled: bool) -> Result<(), DataFusionError>;
 
-    /// Toggle the in-process peer-shuffle plan shape. When `true`, in-process
-    /// `_distribute_plan` emits a two-boundary plan: `Coalesce` becomes a worker→leader gather
-    /// and the descendant `Shuffle` becomes a peer-mesh `NetworkShuffleExec(N, N)`. When
-    /// `false` (default), the legacy single-boundary path is preserved.
-    fn with_distributed_in_process_peer_shuffle(
+    /// Toggle in-process mode. When `true`, the planner produces a single-consumer plan
+    /// (`consumer_tc=1`) and `prepare_plan` skips the gRPC dialer; embedders must register a
+    /// custom [crate::WorkerTransport] via [DistributedExt::with_distributed_worker_transport]
+    /// to provide the data path. When `false` (default), the standard Flight gRPC path is used.
+    fn with_distributed_in_process_mode(self, enabled: bool) -> Result<Self, DataFusionError>;
+
+    /// Same as [DistributedExt::with_distributed_in_process_mode] but with an in-place mutation.
+    fn set_distributed_in_process_mode(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), DataFusionError>;
+
+    /// Toggle peer-mesh shuffle emission. When `true`, the planner produces a two-boundary plan:
+    /// `Coalesce` becomes a worker→leader gather (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`)
+    /// and nested `Shuffle` arms below it become peer-mesh shuffles
+    /// (`NetworkShuffleExec(consumer_tc=N, input_tc=N)`). When `false` (default), the legacy
+    /// single-boundary path is preserved.
+    ///
+    /// Requires in-process mode (set via [DistributedExt::with_distributed_in_process_mode]);
+    /// returns an error if peer-shuffle emission is requested without in-process mode.
+    fn with_distributed_emit_peer_shuffles(
         self,
         enabled: bool,
     ) -> Result<Self, DataFusionError>;
 
-    /// Same as [DistributedExt::with_distributed_in_process_peer_shuffle] but with an in-place mutation.
-    fn set_distributed_in_process_peer_shuffle(
+    /// Same as [DistributedExt::with_distributed_emit_peer_shuffles] but with an in-place mutation.
+    fn set_distributed_emit_peer_shuffles(
         &mut self,
         enabled: bool,
     ) -> Result<(), DataFusionError>;
@@ -771,12 +787,27 @@ impl DistributedExt for SessionConfig {
         Ok(())
     }
 
-    fn set_distributed_in_process_peer_shuffle(
+    fn set_distributed_in_process_mode(
         &mut self,
         enabled: bool,
     ) -> Result<(), DataFusionError> {
         let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
-        d_cfg.in_process_peer_shuffle = enabled;
+        d_cfg.in_process_mode = enabled;
+        Ok(())
+    }
+
+    fn set_distributed_emit_peer_shuffles(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), DataFusionError> {
+        let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
+        if enabled && !d_cfg.in_process_mode {
+            return plan_err!(
+                "with_distributed_emit_peer_shuffles(true) requires in-process mode; \
+                 call with_distributed_in_process_mode(true) first."
+            );
+        }
+        d_cfg.emit_peer_shuffles = enabled;
         Ok(())
     }
 
@@ -875,9 +906,13 @@ impl DistributedExt for SessionConfig {
             #[expr($?;Ok(self))]
             fn with_distributed_partial_reduce(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            #[call(set_distributed_in_process_peer_shuffle)]
+            #[call(set_distributed_in_process_mode)]
             #[expr($?;Ok(self))]
-            fn with_distributed_in_process_peer_shuffle(mut self, enabled: bool) -> Result<Self, DataFusionError>;
+            fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
+
+            #[call(set_distributed_emit_peer_shuffles)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_emit_peer_shuffles(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
             #[call(set_distributed_worker_connection_buffer_budget_bytes)]
             #[expr($?;Ok(self))]
@@ -988,10 +1023,15 @@ impl DistributedExt for SessionStateBuilder {
             #[expr($?;Ok(self))]
             fn with_distributed_partial_reduce(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            fn set_distributed_in_process_peer_shuffle(&mut self, enabled: bool) -> Result<(), DataFusionError>;
-            #[call(set_distributed_in_process_peer_shuffle)]
+            fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
+            #[call(set_distributed_in_process_mode)]
             #[expr($?;Ok(self))]
-            fn with_distributed_in_process_peer_shuffle(mut self, enabled: bool) -> Result<Self, DataFusionError>;
+            fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
+
+            fn set_distributed_emit_peer_shuffles(&mut self, enabled: bool) -> Result<(), DataFusionError>;
+            #[call(set_distributed_emit_peer_shuffles)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_emit_peer_shuffles(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
             fn set_distributed_worker_connection_buffer_budget_bytes(&mut self, budget_bytes: usize) -> Result<(), DataFusionError>;
             #[call(set_distributed_worker_connection_buffer_budget_bytes)]
@@ -1109,10 +1149,15 @@ impl DistributedExt for SessionState {
             #[expr($?;Ok(self))]
             fn with_distributed_partial_reduce(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            fn set_distributed_in_process_peer_shuffle(&mut self, enabled: bool) -> Result<(), DataFusionError>;
-            #[call(set_distributed_in_process_peer_shuffle)]
+            fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
+            #[call(set_distributed_in_process_mode)]
             #[expr($?;Ok(self))]
-            fn with_distributed_in_process_peer_shuffle(mut self, enabled: bool) -> Result<Self, DataFusionError>;
+            fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
+
+            fn set_distributed_emit_peer_shuffles(&mut self, enabled: bool) -> Result<(), DataFusionError>;
+            #[call(set_distributed_emit_peer_shuffles)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_emit_peer_shuffles(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
             fn set_distributed_worker_connection_buffer_budget_bytes(&mut self, budget_bytes: usize) -> Result<(), DataFusionError>;
             #[call(set_distributed_worker_connection_buffer_budget_bytes)]
@@ -1230,10 +1275,15 @@ impl DistributedExt for SessionContext {
             #[expr($?;Ok(self))]
             fn with_distributed_partial_reduce(self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            fn set_distributed_in_process_peer_shuffle(&mut self, enabled: bool) -> Result<(), DataFusionError>;
-            #[call(set_distributed_in_process_peer_shuffle)]
+            fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
+            #[call(set_distributed_in_process_mode)]
             #[expr($?;Ok(self))]
-            fn with_distributed_in_process_peer_shuffle(self, enabled: bool) -> Result<Self, DataFusionError>;
+            fn with_distributed_in_process_mode(self, enabled: bool) -> Result<Self, DataFusionError>;
+
+            fn set_distributed_emit_peer_shuffles(&mut self, enabled: bool) -> Result<(), DataFusionError>;
+            #[call(set_distributed_emit_peer_shuffles)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_emit_peer_shuffles(self, enabled: bool) -> Result<Self, DataFusionError>;
 
             fn set_distributed_worker_connection_buffer_budget_bytes(&mut self, budget_bytes: usize) -> Result<(), DataFusionError>;
             #[call(set_distributed_worker_connection_buffer_budget_bytes)]

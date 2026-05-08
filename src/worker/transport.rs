@@ -2,7 +2,7 @@ use crate::Stage;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::Result;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::metrics::MetricsSet;
 use futures::Stream;
 use std::ops::Range;
 use std::pin::Pin;
@@ -28,6 +28,14 @@ pub trait WorkerConnection: Send + Sync {
     /// `NetworkShuffleExec`) do not retry, but pinning this contract lets future work assume
     /// `stream_partition` is a single-shot consumer per partition.
     fn stream_partition(&self, partition: usize) -> Result<WorkerPartitionStream>;
+
+    /// Optional snapshot of metrics emitted by this connection. Operators surface these through
+    /// their own `metrics()` method, so a transport that has nothing to report can stay at the
+    /// default. The snapshot is taken at the moment of the call; metrics that update after the
+    /// call won't be visible until the next snapshot.
+    fn metrics(&self) -> MetricsSet {
+        MetricsSet::new()
+    }
 }
 
 /// Factory that opens a [WorkerConnection] to a single worker task.
@@ -51,6 +59,5 @@ pub trait WorkerTransport: Send + Sync + 'static {
         target_partitions: Range<usize>,
         target_task: usize,
         ctx: &Arc<TaskContext>,
-        metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Box<dyn WorkerConnection>>;
 }

@@ -249,6 +249,6 @@ impl ExecutionPlan for NetworkBroadcastExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.worker_connections.metrics.clone_inner())
+        Some(self.worker_connections.metrics())
     }
 }

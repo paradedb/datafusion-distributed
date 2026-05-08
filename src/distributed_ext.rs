@@ -591,10 +591,7 @@ pub trait DistributedExt: Sized {
     fn with_distributed_in_process_mode(self, enabled: bool) -> Result<Self, DataFusionError>;
 
     /// Same as [DistributedExt::with_distributed_in_process_mode] but with an in-place mutation.
-    fn set_distributed_in_process_mode(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), DataFusionError>;
+    fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
 
     /// Toggle peer-mesh shuffle emission. When `true`, the planner produces a two-boundary plan:
     /// `Coalesce` becomes a worker→leader gather (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`)
@@ -604,16 +601,10 @@ pub trait DistributedExt: Sized {
     ///
     /// Requires in-process mode (set via [DistributedExt::with_distributed_in_process_mode]);
     /// returns an error if peer-shuffle emission is requested without in-process mode.
-    fn with_distributed_emit_peer_shuffles(
-        self,
-        enabled: bool,
-    ) -> Result<Self, DataFusionError>;
+    fn with_distributed_emit_peer_shuffles(self, enabled: bool) -> Result<Self, DataFusionError>;
 
     /// Same as [DistributedExt::with_distributed_emit_peer_shuffles] but with an in-place mutation.
-    fn set_distributed_emit_peer_shuffles(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), DataFusionError>;
+    fn set_distributed_emit_peer_shuffles(&mut self, enabled: bool) -> Result<(), DataFusionError>;
 
     /// Sets the soft byte budget that each per-worker connection will buffer in memory before
     /// pausing the gRPC pull from that worker. Per-partition channels are unbounded (to avoid
@@ -787,19 +778,13 @@ impl DistributedExt for SessionConfig {
         Ok(())
     }
 
-    fn set_distributed_in_process_mode(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), DataFusionError> {
+    fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError> {
         let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
         d_cfg.in_process_mode = enabled;
         Ok(())
     }
 
-    fn set_distributed_emit_peer_shuffles(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), DataFusionError> {
+    fn set_distributed_emit_peer_shuffles(&mut self, enabled: bool) -> Result<(), DataFusionError> {
         let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
         if enabled && !d_cfg.in_process_mode {
             return plan_err!(

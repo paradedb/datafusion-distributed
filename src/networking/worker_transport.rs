@@ -5,6 +5,10 @@ use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionConfig;
 use std::sync::{Arc, LazyLock};
 
+/// Stores `transport` on `cfg` so that [crate::worker::WorkerConnectionPool] picks it up at
+/// execute time instead of falling back to the default Flight gRPC dialer. Used by embedders
+/// (e.g. shared-memory transports) that want to keep DataFusion's distributed plan tree but
+/// swap out the network path.
 pub(crate) fn set_distributed_worker_transport(
     cfg: &mut SessionConfig,
     transport: impl WorkerTransport,
@@ -33,15 +37,15 @@ static DEFAULT_WORKER_TRANSPORT: LazyLock<Arc<dyn WorkerTransport>> =
 /// Returns the [WorkerTransport] registered on the session config attached to `task_ctx`, or a
 /// process-wide [FlightWorkerTransport] if none has been set. This is what
 /// [crate::worker::WorkerConnectionPool] consults at execute time when opening connections to
-/// remote workers.
-pub fn get_distributed_worker_transport(task_ctx: &TaskContext) -> Arc<dyn WorkerTransport> {
+/// remote workers. Returns a reference so the caller can decide whether to clone the `Arc`.
+pub fn get_distributed_worker_transport(task_ctx: &TaskContext) -> &Arc<dyn WorkerTransport> {
     let opts = task_ctx.session_config().options();
     if let Some(distributed_cfg) = opts.extensions.get::<DistributedConfig>()
         && let Some(t) = &distributed_cfg.__private_worker_transport.0
     {
-        return Arc::clone(t);
+        return t;
     }
-    Arc::clone(&DEFAULT_WORKER_TRANSPORT)
+    &DEFAULT_WORKER_TRANSPORT
 }
 
 #[derive(Clone, Default)]

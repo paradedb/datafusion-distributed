@@ -70,15 +70,6 @@ extensions_options! {
         /// produced plan will fall back to the default Flight transport, which only supports
         /// addressed task URLs.
         pub in_process_mode: bool, default = false
-        /// In in-process mode, emit a two-boundary plan: the OUTER `Coalesce` arm produces a
-        /// worker→leader gather (`NetworkShuffleExec(consumer_tc=1, input_tc=N)`) and nested
-        /// `Shuffle` arms below it produce peer-mesh shuffles
-        /// (`NetworkShuffleExec(consumer_tc=N, input_tc=N)`). When false (default), the `Coalesce`
-        /// arm elides to its child and the inner Shuffle uses `(consumer_tc=1, input_tc=1)` —
-        /// the legacy single-boundary path where the leader runs `FinalPartitioned` single-threaded.
-        ///
-        /// Has no effect when `in_process_mode` is false.
-        pub emit_peer_shuffles: bool, default = false
         /// Soft byte budget that each per-worker connection will buffer in memory before pausing
         /// the gRPC pull from that worker. Per-partition channels are unbounded (to avoid
         /// head-of-line blocking between sibling partitions), so backpressure is enforced

@@ -251,7 +251,7 @@ impl ExecutionPlan for NetworkBroadcastExec {
                 &context,
             )?;
 
-            let stream = worker_connection.stream_partition(off + partition, |_meta| {})?;
+            let stream = worker_connection.stream_partition(off + partition)?;
             streams.push(stream);
         }
 

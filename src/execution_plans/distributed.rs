@@ -145,6 +145,21 @@ impl DistributedExec {
             .await;
     }
 
+    /// Runs the lazy `prepare_plan` step and returns the prepared inner plan, discarding the
+    /// `JoinSet` of coordinator-to-worker gRPC tasks. Intended for embedders running with
+    /// `in_process_mode = true`: the gRPC tasks are no-ops (see `prepare_plan`), and the
+    /// embedder owns its own dispatcher, so it only needs the post-prepare plan tree with all
+    /// `Stage::Local` boundaries converted to `Stage::Remote`. Calling this with
+    /// `in_process_mode = false` still works but spawns the gRPC tasks and drops them, which is
+    /// almost certainly not what the caller wants.
+    pub fn prepare_in_process_plan(
+        &self,
+        ctx: &Arc<TaskContext>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let PreparedPlan { plan, .. } = self.prepare_plan(ctx)?;
+        Ok(plan)
+    }
+
     /// Returns the plan which is lazily prepared on execute() and actually gets executed.
     /// It is updated on every call to execute(). Returns an error if .execute() has not been called.
     pub(crate) fn prepared_plan(&self) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
@@ -170,6 +185,9 @@ impl DistributedExec {
     fn prepare_plan(&self, ctx: &Arc<TaskContext>) -> Result<PreparedPlan> {
         let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
         let codec = DistributedCodec::new_combined_with_user(ctx.session_config());
+        let in_process = DistributedConfig::from_config_options(ctx.session_config().options())
+            .map(|c| c.in_process_mode)
+            .unwrap_or(false);
 
         let available_urls = worker_resolver.get_urls()?;
 
@@ -236,6 +254,13 @@ impl DistributedExec {
             let mut workers = Vec::with_capacity(stage.tasks);
             for (i, routed_url) in routed_urls.into_iter().enumerate() {
                 workers.push(routed_url.clone());
+                if in_process {
+                    // Skip the coordinator → worker gRPC plumbing: the embedder ships the
+                    // worker plan over a side channel and exposes its own `WorkerTransport`.
+                    // The URL is still recorded on the `RemoteStage` so the transport can
+                    // key off `target_task` (the index into `RemoteStage::workers`).
+                    continue;
+                }
                 // Spawn a task that sends the subplan to the chosen URL.
                 // There will be as many spawned tasks as workers.
                 let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;

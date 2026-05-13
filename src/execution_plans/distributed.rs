@@ -170,6 +170,9 @@ impl DistributedExec {
     fn prepare_plan(&self, ctx: &Arc<TaskContext>) -> Result<PreparedPlan> {
         let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
         let codec = DistributedCodec::new_combined_with_user(ctx.session_config());
+        let in_process = DistributedConfig::from_config_options(ctx.session_config().options())
+            .map(|c| c.in_process_mode)
+            .unwrap_or(false);
 
         let available_urls = worker_resolver.get_urls()?;
 
@@ -236,6 +239,13 @@ impl DistributedExec {
             let mut workers = Vec::with_capacity(stage.tasks);
             for (i, routed_url) in routed_urls.into_iter().enumerate() {
                 workers.push(routed_url.clone());
+                if in_process {
+                    // Skip the coordinator → worker gRPC plumbing: the embedder ships the
+                    // worker plan over a side channel and exposes its own `WorkerTransport`.
+                    // The URL is still recorded on the `RemoteStage` so the transport can
+                    // key off `target_task` (the index into `RemoteStage::workers`).
+                    continue;
+                }
                 // Spawn a task that sends the subplan to the chosen URL.
                 // There will be as many spawned tasks as workers.
                 let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;

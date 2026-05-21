@@ -217,13 +217,29 @@ impl DistributedExec {
 
             let task_estimator = get_distributed_task_estimator(ctx.session_config())?;
 
-            let mut spawner = CoordinatorToWorkerTaskSpawner::new(
-                stage,
-                &metrics,
-                &self.task_metrics,
-                &codec,
-                &mut join_set,
-            )?;
+            // When `in_process_mode = true` the embedder ships the worker plan over its own
+            // side channel (e.g. a shared-memory queue in an embedded Postgres extension) and
+            // exposes a `WorkerTransport` that consumes it. None of the coordinator → worker
+            // gRPC plumbing runs in that mode (see the `if in_process { continue; }` guard in
+            // the per-worker loop below), and the only side-effect of `Spawner::new` that
+            // matters across modes is the eager
+            // `PhysicalPlanNode::try_from_physical_plan(stage.plan, codec).encode_to_vec()` it
+            // performs to build `plan_proto` — bytes that are otherwise pushed onto the gRPC
+            // stream by `send_plan_task`. Under `in_process` those bytes are never observed,
+            // so the encode is pure overhead AND it forces embedders to maintain a physical
+            // codec for every custom exec they ship even though decode is unreachable. Guard
+            // the spawner construction to lift that requirement.
+            let mut spawner = if in_process {
+                None
+            } else {
+                Some(CoordinatorToWorkerTaskSpawner::new(
+                    stage,
+                    &metrics,
+                    &self.task_metrics,
+                    &codec,
+                    &mut join_set,
+                )?)
+            };
 
             let routed_urls = match task_estimator.route_tasks(&TaskRoutingContext {
                 task_ctx: Arc::clone(ctx),
@@ -254,15 +270,16 @@ impl DistributedExec {
             let mut workers = Vec::with_capacity(stage.tasks);
             for (i, routed_url) in routed_urls.into_iter().enumerate() {
                 workers.push(routed_url.clone());
-                if in_process {
-                    // Skip the coordinator → worker gRPC plumbing: the embedder ships the
-                    // worker plan over a side channel and exposes its own `WorkerTransport`.
-                    // The URL is still recorded on the `RemoteStage` so the transport can
-                    // key off `target_task` (the index into `RemoteStage::workers`).
+                let Some(spawner) = spawner.as_mut() else {
+                    // `in_process_mode = true`: the embedder ships the worker plan over a
+                    // side channel and exposes its own `WorkerTransport`. None of the
+                    // coordinator → worker gRPC plumbing runs. The URL is still recorded on
+                    // the `RemoteStage` so the transport can key off `target_task` (the
+                    // index into `RemoteStage::workers`).
                     continue;
-                }
-                // Spawn a task that sends the subplan to the chosen URL.
-                // There will be as many spawned tasks as workers.
+                };
+                // Spawn a task that sends the subplan to the chosen URL. There will be as
+                // many spawned tasks as workers.
                 let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;
                 spawner.metrics_collection_task(i, worker_rx);
                 spawner.work_unit_feed_task(Arc::clone(ctx), i, tx)?;

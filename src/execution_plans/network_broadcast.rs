@@ -1,6 +1,6 @@
 use crate::DistributedTaskContext;
 use crate::common::require_one_child;
-use crate::distributed_planner::NetworkBoundary;
+use crate::distributed_planner::{NetworkBoundary, NetworkBoundaryKind};
 use crate::stage::{LocalStage, Stage};
 use crate::worker::WorkerConnectionPool;
 use datafusion::common::{internal_datafusion_err, not_impl_err};
@@ -163,8 +163,8 @@ impl NetworkBroadcastExec {
 }
 
 impl NetworkBoundary for NetworkBroadcastExec {
-    fn kind(&self) -> crate::NetworkBoundaryKind {
-        crate::NetworkBoundaryKind::Broadcast
+    fn kind(&self) -> NetworkBoundaryKind {
+        NetworkBoundaryKind::Broadcast
     }
 
     fn with_input_stage(

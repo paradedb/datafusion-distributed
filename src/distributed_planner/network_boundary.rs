@@ -2,14 +2,20 @@ use crate::{NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec, Stage
 use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 
-/// Discriminator for the three concrete [NetworkBoundary] kinds the planner produces.
+/// Discriminator for the concrete [NetworkBoundary] kinds the planner produces.
 ///
 /// Exposed so embedders (and any caller that needs to branch on the boundary's routing
 /// semantics) can do a typed enum match instead of comparing against `ExecutionPlan::name()`
 /// strings. The latter couples the embedder to internal type-name choices in this crate; a
 /// future rename of `NetworkShuffleExec` would silently break consumers doing
 /// `if plan.name() == "NetworkShuffleExec" { ... }`.
+///
+/// Marked `#[non_exhaustive]` so adding a new variant in a future release of this crate is
+/// not a breaking change for downstream consumers — they're still required to keep a `_`
+/// arm in their `match`. Each existing variant continues to map 1:1 to one of the three
+/// concrete `Network*Exec` types and is stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum NetworkBoundaryKind {
     /// Hash-partitioned mesh — [`NetworkShuffleExec`].
     Shuffle,

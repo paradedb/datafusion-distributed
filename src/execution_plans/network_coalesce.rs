@@ -1,6 +1,6 @@
 use crate::DistributedTaskContext;
 use crate::common::require_one_child;
-use crate::distributed_planner::NetworkBoundary;
+use crate::distributed_planner::{NetworkBoundary, NetworkBoundaryKind};
 use crate::execution_plans::common::scale_partitioning_props;
 use crate::stage::{LocalStage, Stage};
 use crate::worker::WorkerConnectionPool;
@@ -115,8 +115,8 @@ impl NetworkCoalesceExec {
 }
 
 impl NetworkBoundary for NetworkCoalesceExec {
-    fn kind(&self) -> crate::NetworkBoundaryKind {
-        crate::NetworkBoundaryKind::Coalesce
+    fn kind(&self) -> NetworkBoundaryKind {
+        NetworkBoundaryKind::Coalesce
     }
 
     fn input_stage(&self) -> &Stage {

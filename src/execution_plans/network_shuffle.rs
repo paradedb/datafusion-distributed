@@ -2,7 +2,7 @@ use crate::common::require_one_child;
 use crate::execution_plans::common::scale_partitioning;
 use crate::stage::{LocalStage, Stage};
 use crate::worker::WorkerConnectionPool;
-use crate::{DistributedTaskContext, NetworkBoundary};
+use crate::{DistributedTaskContext, NetworkBoundary, NetworkBoundaryKind};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, not_impl_err, plan_err};
 use datafusion::error::DataFusionError;
@@ -158,8 +158,8 @@ impl NetworkShuffleExec {
 }
 
 impl NetworkBoundary for NetworkShuffleExec {
-    fn kind(&self) -> crate::NetworkBoundaryKind {
-        crate::NetworkBoundaryKind::Shuffle
+    fn kind(&self) -> NetworkBoundaryKind {
+        NetworkBoundaryKind::Shuffle
     }
 
     fn input_stage(&self) -> &Stage {

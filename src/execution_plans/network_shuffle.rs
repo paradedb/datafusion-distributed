@@ -158,6 +158,10 @@ impl NetworkShuffleExec {
 }
 
 impl NetworkBoundary for NetworkShuffleExec {
+    fn kind(&self) -> crate::NetworkBoundaryKind {
+        crate::NetworkBoundaryKind::Shuffle
+    }
+
     fn input_stage(&self) -> &Stage {
         &self.input_stage
     }

@@ -115,6 +115,10 @@ impl NetworkCoalesceExec {
 }
 
 impl NetworkBoundary for NetworkCoalesceExec {
+    fn kind(&self) -> crate::NetworkBoundaryKind {
+        crate::NetworkBoundaryKind::Coalesce
+    }
+
     fn input_stage(&self) -> &Stage {
         &self.input_stage
     }

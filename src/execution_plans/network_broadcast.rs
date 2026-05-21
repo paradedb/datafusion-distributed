@@ -163,6 +163,10 @@ impl NetworkBroadcastExec {
 }
 
 impl NetworkBoundary for NetworkBroadcastExec {
+    fn kind(&self) -> crate::NetworkBoundaryKind {
+        crate::NetworkBoundaryKind::Broadcast
+    }
+
     fn with_input_stage(
         &self,
         input_stage: Stage,

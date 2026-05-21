@@ -2,10 +2,33 @@ use crate::{NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec, Stage
 use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 
+/// Discriminator for the three concrete [NetworkBoundary] kinds the planner produces.
+///
+/// Exposed so embedders (and any caller that needs to branch on the boundary's routing
+/// semantics) can do a typed enum match instead of comparing against `ExecutionPlan::name()`
+/// strings. The latter couples the embedder to internal type-name choices in this crate; a
+/// future rename of `NetworkShuffleExec` would silently break consumers doing
+/// `if plan.name() == "NetworkShuffleExec" { ... }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NetworkBoundaryKind {
+    /// Hash-partitioned mesh — [`NetworkShuffleExec`].
+    Shuffle,
+    /// Broadcast (one producer task, every consumer task receives every partition) —
+    /// [`NetworkBroadcastExec`].
+    Broadcast,
+    /// Gather to a single consumer task — [`NetworkCoalesceExec`].
+    Coalesce,
+}
+
 /// This trait represents a node that introduces the necessity of a network boundary in the plan.
 /// The distributed planner, upon stepping into one of these, will break the plan and build a stage
 /// out of it.
 pub trait NetworkBoundary: ExecutionPlan {
+    /// Returns the boundary's [`NetworkBoundaryKind`]. Embedders use this to switch on routing
+    /// semantics (shuffle hash-partitions, broadcast replicates, coalesce gathers) without
+    /// matching on `ExecutionPlan::name()` strings.
+    fn kind(&self) -> NetworkBoundaryKind;
+
     /// Called when a [Stage] is correctly formed. The [NetworkBoundary] can use this
     /// information to perform any internal transformations necessary for distributed execution.
     ///

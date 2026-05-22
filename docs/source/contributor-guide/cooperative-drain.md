@@ -30,8 +30,8 @@ The fork's default `FlightWorkerTransport` is **not** affected: gRPC streams
 are backed by unbounded tokio channels per partition, with a global memory
 budget ([`worker_connection_buffer_budget_bytes`](../user-guide/task-estimator.md))
 that gates the upstream pull rather than the downstream send. The deadlock
-below cannot occur on that transport — but it can on any in-process transport
-that maps logical channels onto a fixed-capacity byte queue.
+below can't occur on that transport. It can on any in-process transport that
+maps logical channels onto a fixed-capacity byte queue.
 
 ## The deadlock
 
@@ -47,9 +47,9 @@ Nobody makes progress.
 
 The blocker is symmetric: each proc waits for the peer to drain its outbound,
 but the peer is itself waiting for *its* outbound to drain. On a multi-threaded
-runtime with spare capacity, the consumer task on a different OS thread can
+runtime with spare capacity, a consumer task on a different OS thread can
 step in and pull from inbound. On a single-threaded current-thread runtime
-there's no such thread — the producer task holds the executor while it spins
+there's no such thread. The producer task holds the executor while it spins
 on `would_block`.
 
 ## The fix: cooperative drain
@@ -71,7 +71,7 @@ Drain work happens on the same OS thread as the send. This matches the
 single-thread invariant most in-process embedders are subject to (e.g.
 Postgres parallel workers, where FFI into the engine is backend-thread-only).
 
-The "drain inbound" hook is supplied by the embedder, not the fork — the
+The "drain inbound" hook is supplied by the embedder, not the fork. The
 embedder owns the proc-to-peer routing topology and knows how to enumerate
 "every inbound queue". A trait like
 
@@ -86,19 +86,19 @@ loop something to call at each retry.
 
 ## Reference implementation
 
-paradedb/paradedb pg_search's MPP layer uses this pattern with Postgres
-`shm_mq` as the bounded transport, the current-thread tokio runtime pinned to
-the backend thread, and a peer-mesh shuffle across N parallel workers. The
-producer-side spin lives in
-[`MppSender::send_batch_traced`](https://github.com/paradedb/paradedb/blob/d6b8b9036/pg_search/src/postgres/customscan/mpp/transport.rs#L299)
-and calls `try_drain_pass` on a `CooperativeDrainSet` injected at sender
-construction time. The mesh-level impl (`impl CooperativeDrainSet for
-MppMesh`) enumerates every inbound `shm_mq` for the current proc — see
-[`MppMesh::drain_all_inbound`](https://github.com/paradedb/paradedb/blob/d6b8b9036/pg_search/src/postgres/customscan/mpp/runtime.rs#L133).
+paradedb pg_search's MPP layer uses this pattern with Postgres `shm_mq` as the
+bounded transport, the current-thread tokio runtime pinned to the backend
+thread, and a peer-mesh shuffle across N parallel workers. The producer-side
+spin lives in `MppSender::send_batch_traced`
+(`pg_search/src/postgres/customscan/mpp/transport.rs`) and calls
+`try_drain_pass` on a `CooperativeDrainSet` injected at sender construction
+time. The mesh-level impl (`impl CooperativeDrainSet for MppMesh`) enumerates
+every inbound `shm_mq` for the current proc; see `MppMesh::drain_all_inbound`
+in `pg_search/src/postgres/customscan/mpp/runtime.rs`.
 
-`pgrx::check_for_interrupts!()` is also called inside the spin so a user
-CANCEL or query timeout `longjmp`s out before the next drain pass — a
-Postgres-specific safety net that doesn't have a fork-level equivalent.
+`pgrx::check_for_interrupts!()` runs inside the spin so a user CANCEL or
+query timeout `longjmp`s out before the next drain pass. That's a
+Postgres-specific safety net; no fork-level equivalent.
 
 ## Why the fork doesn't ship this pattern as code
 
@@ -113,7 +113,7 @@ Two reasons:
    embedder must implement entirely) or wrong (a default that assumes
    gRPC-style point-to-point).
 
-If a second in-process embedder with a bounded transport appears, this pattern
-can be promoted to a `CooperativeDrainSet` trait + a producer-side helper
-inside the fork. Until then it's documented here so the next implementer
-doesn't reinvent the deadlock-resolution wheel.
+If a second in-process embedder with a bounded transport appears, this
+pattern can move into the fork as a `CooperativeDrainSet` trait plus a
+producer-side helper. Until then it lives here so the next implementer
+doesn't reinvent the deadlock fix.

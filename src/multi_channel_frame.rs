@@ -12,40 +12,37 @@
 //! |---------- 16 bytes --------|           |---- variable ----|
 //! ```
 //!
-//! The codec is transport-agnostic: it knows nothing about gRPC, `shm_mq`, or
+//! Transport-agnostic: the codec knows nothing about gRPC, `shm_mq`, or
 //! `std::sync::mpsc`. Embedders pick a transport and use these primitives to
-//! frame each payload before sending. The fork's [`crate::FlightWorkerTransport`]
-//! does not currently use this codec (gRPC has its own framing), but
-//! out-of-tree embedders like paradedb pg_search's shm_mq mesh do — and a
-//! future fork transport that needs to fold multiple logical channels onto a
-//! single byte stream (e.g. a streaming-RPC variant) would too.
+//! frame each payload. The fork's [`crate::FlightWorkerTransport`] doesn't use
+//! it (gRPC has its own framing); out-of-tree embedders that fold multiple
+//! logical channels onto one byte stream do.
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::DataFusionError;
 
-/// Magic bytes "MPPF" (Multi-channel Plan Framing) at the start of every wire
-/// message. Lets receivers reject misrouted / corrupt frames before they hit
-/// Arrow IPC.
+/// Magic bytes "MPPF" (Multi-channel Plan Framing) on every wire message. Lets
+/// receivers reject misrouted or corrupt frames before they hit Arrow IPC.
 const FRAME_MAGIC: u32 = 0x4D505046;
 
-/// Wire-format size of [`MultiChannelFrameHeader`] in bytes. Asserted at
-/// compile time below via `const _: ()`.
+/// Wire-format size of [`MultiChannelFrameHeader`] in bytes. Asserted at compile
+/// time below.
 pub const MULTI_CHANNEL_FRAME_HEADER_SIZE: usize = 16;
 
 /// Kind of payload following [`MultiChannelFrameHeader`].
 ///
-/// `Batch` is the common case. The header is followed by an Arrow IPC stream
-/// containing one `RecordBatch`. `Eof` carries no payload. It signals the
-/// receiver that the named `(stage_id, partition)` channel is done, even
-/// though the underlying byte queue may still carry frames for other channels.
+/// `Batch` is the common case: the header is followed by an Arrow IPC stream
+/// containing one `RecordBatch`. `Eof` carries no payload. It tells the receiver
+/// the named `(stage_id, partition)` channel is done, even if the underlying
+/// byte queue still carries frames for other channels.
 ///
-/// Crate-private because external callers don't currently introspect the
-/// discriminant — `encode_*_frame_into` accepts a `MultiChannelFrameHeader`
-/// directly, and `decode_frame` returns the typed payload via
-/// `Option<RecordBatch>`. Promote to `pub` if a future caller needs to
-/// branch on the kind without going through `decode_frame`.
+/// Crate-private: external callers don't introspect the discriminant.
+/// `encode_*_frame_into` takes a `MultiChannelFrameHeader` directly and
+/// `decode_frame` returns the typed payload via `Option<RecordBatch>`. Promote
+/// to `pub` if a future caller needs to branch on kind without going through
+/// `decode_frame`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrameKind {
@@ -55,14 +52,13 @@ pub(crate) enum FrameKind {
 
 /// 16-byte prefix on every transport frame.
 ///
-/// The fixed layout `[magic, flags, stage_id, partition]` (4×u32) is what
-/// senders prepend before the Arrow IPC stream bytes and what receivers
-/// parse before deciding which channel buffer the payload belongs to.
+/// Fixed layout `[magic, flags, stage_id, partition]` (4×u32). Senders prepend
+/// it before the Arrow IPC stream bytes; receivers parse it to decide which
+/// channel buffer the payload belongs to.
 ///
-/// The `flags` word currently encodes [`FrameKind`] in its low byte (mask
-/// `0x0000_00FF`); the upper 24 bits are reserved-must-be-zero and are
-/// validated at parse time so a future use can repurpose them without a
-/// wire-format break.
+/// `flags` carries the [`FrameKind`] in its low byte (mask `0x0000_00FF`). The
+/// upper 24 bits are reserved-must-be-zero and get validated at parse time, so
+/// a future use can repurpose them without a wire-format break.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultiChannelFrameHeader {
@@ -76,9 +72,9 @@ pub struct MultiChannelFrameHeader {
 const FRAME_KIND_MASK: u32 = 0x0000_00FF;
 
 const _: () = {
-    // Downstream wire-layer slot-size math depends on this being exact (e.g. embedder
-    // shared-memory mesh sizing). Asserted here so a future field reorder breaks the codec
-    // build before it can silently shift slot offsets.
+    // Wire-layer slot-size math downstream depends on this being exact (e.g. embedder
+    // shared-memory mesh sizing). Catch a field reorder at build time before it can
+    // silently shift slot offsets.
     assert!(std::mem::size_of::<MultiChannelFrameHeader>() == MULTI_CHANNEL_FRAME_HEADER_SIZE);
 };
 
@@ -93,8 +89,8 @@ impl MultiChannelFrameHeader {
         }
     }
 
-    /// Build an `Eof` header for the given `(stage_id, partition)`. Carries no payload;
-    /// receivers route it to the channel buffer's source-done counter. Emitted after a
+    /// Build an `Eof` header for the given `(stage_id, partition)`. Carries no payload.
+    /// Receivers route it to the channel buffer's source-done counter. Emit after a
     /// producer fragment's per-partition stream exhausts (or errors).
     pub fn eof(stage_id: u32, partition: u32) -> Self {
         Self {
@@ -105,9 +101,8 @@ impl MultiChannelFrameHeader {
         }
     }
 
-    /// Read the kind out of `flags`. Returns an error if the kind byte is
-    /// unknown or if any reserved upper bit is set, which catches wire-format
-    /// drift early.
+    /// Read the kind out of `flags`. Errors if the kind byte is unknown or any
+    /// reserved upper bit is set. Catches wire-format drift early.
     pub(crate) fn kind(&self) -> Result<FrameKind, DataFusionError> {
         let reserved = self.flags & !FRAME_KIND_MASK;
         if reserved != 0 {
@@ -138,9 +133,9 @@ impl MultiChannelFrameHeader {
     /// `Err` if the slice is too short or the magic doesn't match.
     fn parse(bytes: &[u8]) -> Result<Self, DataFusionError> {
         if bytes.len() < MULTI_CHANNEL_FRAME_HEADER_SIZE {
-            // No encoder in this file emits sub-header output, so a short frame means the
-            // byte queue stitched together payloads from different senders. Hex-dump the
-            // bytes so the source is identifiable from log output without a debugger.
+            // No encoder here emits sub-header output, so a short frame means the byte
+            // queue stitched together payloads from different senders. Hex-dump the bytes
+            // so the source is identifiable from logs without a debugger.
             let hex = bytes
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -175,8 +170,7 @@ impl MultiChannelFrameHeader {
 /// |---------- 16 bytes --------|           |---- variable ----|
 /// ```
 ///
-/// Caller is expected to hold `buf` alive across many encodes so the peak-sized
-/// allocation amortizes.
+/// Hold `buf` alive across many encodes to amortize the peak-sized allocation.
 pub fn encode_frame_into(
     header: MultiChannelFrameHeader,
     batch: &RecordBatch,
@@ -192,12 +186,12 @@ pub fn encode_frame_into(
 }
 
 /// Serialize a payload-less [`FrameKind::Eof`] frame for `(stage_id, partition)`
-/// into `buf`. Receivers read this as a 16-byte message and route it to the
-/// channel buffer's source-done counter without touching Arrow IPC.
+/// into `buf`. Receivers read it as a 16-byte message and route to the channel
+/// buffer's source-done counter without touching Arrow IPC.
 ///
-/// Used when a producer fragment's per-partition stream exhausts, so the
-/// receiver's `(stage_id, partition)` channel buffer transitions to `Eof` even
-/// though the multiplexed underlying queue stays attached for other channels.
+/// Emit when a producer fragment's per-partition stream exhausts: the receiver's
+/// `(stage_id, partition)` channel transitions to `Eof` while the multiplexed
+/// underlying queue stays attached for other channels.
 pub fn encode_eof_frame_into(
     stage_id: u32,
     partition: u32,
@@ -210,9 +204,9 @@ pub fn encode_eof_frame_into(
     Ok(())
 }
 
-/// Inverse of [`encode_frame_into`]. Parses the 16-byte header and, for `Batch` frames, decodes
-/// the trailing Arrow IPC stream. `Eof` frames return `(header, None)`. Receivers branch on
-/// `header.kind()` to decide routing.
+/// Inverse of [`encode_frame_into`]. Parses the 16-byte header and, for `Batch`
+/// frames, decodes the trailing Arrow IPC stream. `Eof` frames return
+/// `(header, None)`. Branch on `header.kind()` for routing.
 pub fn decode_frame(
     bytes: &[u8],
 ) -> Result<(MultiChannelFrameHeader, Option<RecordBatch>), DataFusionError> {
@@ -298,8 +292,7 @@ mod tests {
 
     #[test]
     fn frame_rejects_bad_magic() {
-        // Explicit non-zero, non-magic prefix. Don't rely on the happenstance that
-        // 0u32 != FRAME_MAGIC.
+        // Explicit non-zero, non-magic prefix. Don't rely on `0u32 != FRAME_MAGIC` by chance.
         let mut bad = vec![0u8; MULTI_CHANNEL_FRAME_HEADER_SIZE];
         bad[0..4].copy_from_slice(&0xCAFEBABE_u32.to_le_bytes());
         let err = decode_frame(&bad).expect_err("bad magic must fail");
@@ -325,7 +318,7 @@ mod tests {
 
     #[test]
     fn frame_rejects_reserved_flag_bits() {
-        // Any bit above the low byte of `flags` is reserved-must-be-zero; setting one
+        // Any bit above the low byte of `flags` is reserved-must-be-zero. Setting one
         // should trip `kind()` before the kind byte is consulted.
         let header = MultiChannelFrameHeader {
             magic: FRAME_MAGIC,

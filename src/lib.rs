@@ -5,6 +5,7 @@ mod config_extension_ext;
 mod distributed_ext;
 mod execution_plans;
 mod metrics;
+mod multi_channel_frame;
 mod passthrough_headers;
 mod stage;
 mod worker;
@@ -23,6 +24,10 @@ pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
     DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
     TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
+};
+pub use multi_channel_frame::{
+    FrameKind, MultiChannelFrameHeader, MULTI_CHANNEL_FRAME_HEADER_SIZE, decode_frame,
+    encode_eof_frame_into, encode_frame_into,
 };
 pub use execution_plans::{
     BroadcastExec, DistributedExec, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,

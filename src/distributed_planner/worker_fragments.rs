@@ -33,8 +33,9 @@ pub struct WorkerFragment<'a> {
     pub plan: &'a Arc<dyn ExecutionPlan>,
     /// Which kind of network boundary owns this fragment. Drives the routing decision.
     /// `Shuffle` hash-partitions output partition `q` to consumer task
-    /// `q / partitions_per_consumer_task`; post-cap `Broadcast` is task-0-only;
-    /// `Coalesce` gathers to a single consumer.
+    /// `q / partitions_per_consumer_task`; `Broadcast` sends each producer's output to
+    /// every consumer task (capped to one producer when `broadcast_subtree_max_one_task`
+    /// is on); `Coalesce` gathers to a single consumer.
     pub kind: NetworkBoundaryKind,
     /// `B.properties().output_partitioning().partition_count()`, used as `P_c` in the
     /// receive-side formula `off = P_c * task_index` (see `NetworkShuffleExec::execute`).

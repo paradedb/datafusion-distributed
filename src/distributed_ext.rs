@@ -796,7 +796,12 @@ impl DistributedExt for SessionConfig {
         self.options_mut().execution.target_partitions = n_workers.max(2);
         // 2. Bootstrap DistributedConfig if the caller hasn't installed one already. The
         //    remaining setters mutate fields on this extension, so it has to exist before they run.
-        if self.options().extensions.get::<DistributedConfig>().is_none() {
+        if self
+            .options()
+            .extensions
+            .get::<DistributedConfig>()
+            .is_none()
+        {
             set_distributed_option_extension(self, DistributedConfig::default());
         }
         // 3. Flip in_process_mode and broadcast_joins on the (now-present) DistributedConfig.

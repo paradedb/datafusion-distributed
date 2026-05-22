@@ -14,9 +14,9 @@
 //!
 //! Transport-agnostic: the codec knows nothing about gRPC, `shm_mq`, or
 //! `std::sync::mpsc`. Embedders pick a transport and use these primitives to
-//! frame each payload. The fork's [`crate::FlightWorkerTransport`] doesn't use
-//! it (gRPC has its own framing); out-of-tree embedders that fold multiple
-//! logical channels onto one byte stream do.
+//! frame each payload. [`crate::FlightWorkerTransport`] doesn't use it (gRPC has
+//! its own framing); embedders that fold multiple logical channels onto one
+//! byte stream do.
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::ipc::reader::StreamReader;

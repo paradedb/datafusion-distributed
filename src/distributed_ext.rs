@@ -514,49 +514,45 @@ pub trait DistributedExt: Sized {
     /// Same as [DistributedExt::with_distributed_in_process_mode] but with an in-place mutation.
     fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
 
-    /// Apply the **opinionated recipe** for in-process MPP embedders in one shot.
+    /// Apply the opinionated recipe for in-process MPP embedders in one shot.
     ///
-    /// "Defaults" here means "what we recommend for an in-process embedder", not "values
-    /// the system would pick on its own". In particular, `broadcast_joins = true` is the
-    /// non-default-`Default` choice — every known in-process embedder wants it. If your
-    /// workload doesn't, call the individual `with_distributed_*` setters by hand.
+    /// "Defaults" here means "what we recommend for an in-process embedder," not "values
+    /// the system would pick on its own." `broadcast_joins = true` is opinionated; every
+    /// known in-process embedder wants it. If yours doesn't, set the individual knobs
+    /// by hand.
     ///
     /// The four pieces, all required for `_distribute_plan` to actually emit
     /// `NetworkShuffleExec` over an embedder's leaf scans:
     ///
-    /// 1. `target_partitions(max(n_workers, 2))` — without this, `EnforceDistribution`
-    ///    skips every `RepartitionExec`, so the plan annotator never sees a Shuffle. The
-    ///    `max(_, 2)` is the same minimum the planner uses internally.
-    /// 2. `distributed_task_estimator(n_workers)` — the blanket
-    ///    `impl TaskEstimator for usize` returns `Desired(n_workers)` for leaf nodes,
-    ///    which is what makes `_distribute_plan` actually emit a shuffle. Without it,
-    ///    leaves default to `Maximum(1)` and every shuffle gets elided.
-    /// 3. `distributed_broadcast_joins(true)` — `CollectLeft` HashJoins would otherwise
-    ///    cap their stage's `task_count` at `Maximum(1)` and propagate that cap upward,
-    ///    eliding shuffles above the join.
-    /// 4. `distributed_in_process_mode(true)` — skips the gRPC plan-send / metrics /
-    ///    work-unit-feed tasks (see [`Self::with_distributed_in_process_mode`]).
+    /// 1. `target_partitions(max(n_workers, 2))`. Without it, `EnforceDistribution` skips
+    ///    every `RepartitionExec`, so the annotator never sees a Shuffle. The `max(_, 2)`
+    ///    matches the planner's internal minimum.
+    /// 2. `distributed_task_estimator(n_workers)`. The blanket
+    ///    `impl TaskEstimator for usize` returns `Desired(n_workers)` for leaves, which
+    ///    is what makes `_distribute_plan` actually emit shuffles. Without it, leaves
+    ///    default to `Maximum(1)` and every shuffle gets elided.
+    /// 3. `distributed_broadcast_joins(true)`. Otherwise `CollectLeft` HashJoins cap their
+    ///    stage's `task_count` at `Maximum(1)` and propagate the cap upward, eliding
+    ///    shuffles above the join.
+    /// 4. `distributed_in_process_mode(true)`. Skips the gRPC plan-send / metrics /
+    ///    work-unit-feed tasks. See [`Self::with_distributed_in_process_mode`].
     ///
-    /// The broadcast-subtree cap (`broadcast_subtree_max_one_task = true`) is already a
-    /// default in [crate::DistributedConfig], so it's automatically applied.
-    ///
-    /// `n_workers` is the number of producer tasks the embedder will route to; for a
+    /// `n_workers` is the number of producer tasks the embedder will route to. For a
     /// Postgres-style "leader proc 0 + N parallel workers" topology, this is the count
     /// of parallel workers.
     ///
-    /// **Bootstrap behavior:** if a [crate::DistributedConfig] is already installed on
-    /// the session, the helper updates only the three fields it owns (`in_process_mode`,
-    /// `broadcast_joins`, and the task-estimator chain) and leaves the rest alone. If
-    /// none is installed, it inserts a default one first. Pre-existing custom field
-    /// values (e.g. `files_per_task`) are preserved. If a future [crate::DistributedConfig]
-    /// field's `Default` value isn't right for in-process mode, this helper must be
-    /// updated to flip it explicitly.
+    /// Bootstrap behavior: if a [crate::DistributedConfig] is already on the session, the
+    /// helper updates only the three fields it owns (`in_process_mode`, `broadcast_joins`,
+    /// task-estimator chain) and leaves the rest alone. If none is installed, it inserts
+    /// a default first. Custom field values like `files_per_task` are preserved. If a
+    /// future [crate::DistributedConfig] field's `Default` isn't right for in-process
+    /// mode, update this helper to flip it explicitly.
     fn with_distributed_in_process_defaults(
         self,
         n_workers: usize,
     ) -> Result<Self, DataFusionError>;
 
-    /// Same as [DistributedExt::with_distributed_in_process_defaults] but with an in-place mutation.
+    /// In-place version of [DistributedExt::with_distributed_in_process_defaults].
     fn set_distributed_in_process_defaults(
         &mut self,
         n_workers: usize,
@@ -789,13 +785,12 @@ impl DistributedExt for SessionConfig {
         n_workers: usize,
     ) -> Result<(), DataFusionError> {
         // 1. Bump target_partitions so EnforceDistribution actually emits shuffles. The
-        //    `max(_, 2)` matches the planner's internal minimum for a multi-partition plan.
-        //    Direct field write because DataFusion 53's `SessionConfig::with_target_partitions`
-        //    is consuming-only and applies a `n == 0 → default` substitution we don't want
-        //    here. No `set_target_partitions` in-place setter exists upstream.
+        //    `max(_, 2)` matches the planner's internal minimum. Direct field write because
+        //    `SessionConfig::with_target_partitions` is consuming-only and substitutes
+        //    `n == 0` with a default we don't want here. No in-place setter exists upstream.
         self.options_mut().execution.target_partitions = n_workers.max(2);
-        // 2. Bootstrap DistributedConfig if the caller hasn't installed one already. The
-        //    remaining setters mutate fields on this extension, so it has to exist before they run.
+        // 2. Bootstrap DistributedConfig if the caller hasn't installed one. The setters
+        //    below mutate fields on it, so it has to exist first.
         if self
             .options()
             .extensions
@@ -804,12 +799,12 @@ impl DistributedExt for SessionConfig {
         {
             set_distributed_option_extension(self, DistributedConfig::default());
         }
-        // 3. Flip in_process_mode and broadcast_joins on the (now-present) DistributedConfig.
+        // 3. Flip in_process_mode and broadcast_joins on the DistributedConfig.
         let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
         d_cfg.in_process_mode = true;
         d_cfg.broadcast_joins = true;
-        // 4. Register the leaf-task estimator (`impl TaskEstimator for usize`) so leaves
-        //    report `Desired(n_workers)` and the annotator propagates that upward.
+        // 4. Register the leaf-task estimator so leaves report `Desired(n_workers)` and
+        //    the annotator propagates that upward.
         set_distributed_task_estimator(self, n_workers);
         Ok(())
     }
@@ -1361,8 +1356,8 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::empty::EmptyExec;
 
-    /// Drive the leaf-task estimator chain on a fresh `EmptyExec` and assert the resulting
-    /// `task_count` annotation matches `expected`.
+    /// Run the leaf-task estimator chain on a fresh `EmptyExec` and assert the resulting
+    /// `task_count` matches `expected`.
     fn assert_leaf_task_count(cfg: &SessionConfig, expected: usize) {
         let d_cfg = cfg
             .options()
@@ -1386,10 +1381,10 @@ mod tests {
         let mut cfg = SessionConfig::new();
         cfg.set_distributed_in_process_defaults(5).expect("ok");
 
-        // (1) target_partitions bumped to max(n_workers, 2)
+        // target_partitions bumped to max(n_workers, 2).
         assert_eq!(cfg.options().execution.target_partitions, 5);
 
-        // (2)+(3)+(4): DistributedConfig is installed and the three relevant fields are set.
+        // DistributedConfig installed; in_process_mode and broadcast_joins flipped on.
         let d_cfg = cfg
             .options()
             .extensions
@@ -1398,15 +1393,14 @@ mod tests {
         assert!(d_cfg.in_process_mode, "in_process_mode should be true");
         assert!(d_cfg.broadcast_joins, "broadcast_joins should be true");
 
-        // (5) Leaf-task estimator is registered: `impl TaskEstimator for usize` produces
-        // Desired(n) for leaves.
+        // Leaf-task estimator registered: `impl TaskEstimator for usize` produces Desired(n).
         assert_leaf_task_count(&cfg, 5);
     }
 
     #[test]
     fn in_process_defaults_floor_target_partitions_at_two() {
-        // Even with `n_workers = 1`, target_partitions stays at 2 — DataFusion's planner
-        // treats `target_partitions = 1` as "force serial" and elides every shuffle.
+        // Even at `n_workers = 1`, target_partitions stays at 2. DataFusion treats
+        // `target_partitions = 1` as "force serial" and elides every shuffle.
         let mut cfg = SessionConfig::new();
         cfg.set_distributed_in_process_defaults(1).expect("ok");
         assert_eq!(cfg.options().execution.target_partitions, 2);
@@ -1414,8 +1408,8 @@ mod tests {
 
     #[test]
     fn in_process_defaults_does_not_clobber_preexisting_distributed_config() {
-        // If the caller has already installed a DistributedConfig with a non-default field set,
-        // the helper must update only the three fields it owns and leave the rest alone.
+        // If the caller already installed a DistributedConfig with a non-default field, the
+        // helper must update only the three fields it owns and leave the rest alone.
         let mut cfg = SessionConfig::new();
         let initial = DistributedConfig {
             files_per_task: 42, // a field the helper does NOT touch
@@ -1441,9 +1435,8 @@ mod tests {
     #[test]
     fn in_process_defaults_is_idempotent() {
         // Calling the helper twice with the same n_workers should yield the same end state
-        // as calling it once. Protects against future changes that, e.g., chain estimators
-        // non-idempotently (so the second call would double-register and downstream lookups
-        // would see two Desired(n) hits).
+        // as calling it once. Regression guard against future changes that, say, chain
+        // estimators non-idempotently and end up with two Desired(n) hits downstream.
         let mut cfg = SessionConfig::new();
         cfg.set_distributed_in_process_defaults(3).expect("first");
         cfg.set_distributed_in_process_defaults(3).expect("second");
@@ -1456,16 +1449,16 @@ mod tests {
             .expect("DistributedConfig present");
         assert!(d_cfg.in_process_mode);
         assert!(d_cfg.broadcast_joins);
-        // The leaf estimator still resolves correctly. Double-registration would NOT change
-        // the leaf-task count (first user-provided estimator wins, both are Desired(3)), so
-        // this test is a regression guard rather than a value check.
+        // Leaf estimator still resolves. Double-registration wouldn't change the count
+        // (first user-provided estimator wins, both Desired(3)), so this is a regression
+        // guard rather than a value check.
         assert_leaf_task_count(&cfg, 3);
     }
 
     #[test]
     fn in_process_defaults_overwrites_explicitly_disabled_mode() {
-        // If the caller has explicitly disabled in_process_mode and broadcast_joins, the
-        // helper must flip them back to true. The implementation must use `=` not `|=` /
+        // If the caller explicitly disabled in_process_mode and broadcast_joins, the
+        // helper must flip them back to true. Implementation must use `=`, not `|=` or
         // `||=`-style merging.
         let mut cfg = SessionConfig::new();
         let initial = DistributedConfig {
@@ -1494,9 +1487,9 @@ mod tests {
 
     #[test]
     fn in_process_defaults_propagates_through_session_context() {
-        // Smoke test on the highest-level receiver — the `SessionContext` delegate uses the
-        // most-different `delegate!` shape (owned `self`), so the propagation is the most
-        // likely place to drift.
+        // Smoke test on the highest-level receiver. The `SessionContext` delegate uses
+        // the most-different `delegate!` shape (owned `self`), so it's where propagation
+        // is most likely to drift.
         use datafusion::prelude::SessionContext;
 
         let ctx = SessionContext::new()

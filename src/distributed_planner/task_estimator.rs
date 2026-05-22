@@ -1,5 +1,5 @@
 use crate::config_extension_ext::set_distributed_option_extension;
-use crate::{DistributedConfig, PartitionIsolatorExec};
+use crate::{BroadcastExec, DistributedConfig, PartitionIsolatorExec};
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::exec_err;
 use datafusion::config::ConfigOptions;
@@ -290,6 +290,45 @@ impl TaskEstimator for FileScanConfigTaskEstimator {
     }
 }
 
+/// Built-in [TaskEstimator] that caps any [BroadcastExec] subtree at `Maximum(1)`.
+///
+/// Without the cap, the default leaf-task estimator returns `Desired(n_workers)`, every
+/// producer task re-emits the full build side, and `select_all` on the consumer over-counts
+/// by `n_workers`. Capping the [BroadcastExec] node itself (not the leaf) is what makes this
+/// robust to HashJoin's build/probe reorder; the broadcast always sits above whichever side
+/// becomes the build, so the cap lands in the right place.
+///
+/// Opt-in via [DistributedConfig::broadcast_subtree_max_one_task] (default `false`).
+#[derive(Debug)]
+struct BroadcastSubtreeMaxOneTaskEstimator;
+
+impl TaskEstimator for BroadcastSubtreeMaxOneTaskEstimator {
+    fn task_estimation(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        cfg: &ConfigOptions,
+    ) -> Option<TaskEstimation> {
+        let d_cfg = cfg.extensions.get::<DistributedConfig>()?;
+        if !d_cfg.broadcast_subtree_max_one_task {
+            return None;
+        }
+        if plan.as_any().downcast_ref::<BroadcastExec>().is_some() {
+            Some(TaskEstimation::maximum(1))
+        } else {
+            None
+        }
+    }
+
+    fn scale_up_leaf_node(
+        &self,
+        _: &Arc<dyn ExecutionPlan>,
+        _: usize,
+        _: &ConfigOptions,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+}
+
 /// Tries multiple user-provided [TaskEstimator]s until one returns an estimation. If none
 /// returns an estimation, a set of default [TaskEstimation] implementations is tried. Right
 /// now the only default [TaskEstimation] is [FileScanConfigTaskEstimator].
@@ -312,7 +351,10 @@ impl TaskEstimator for CombinedTaskEstimator {
         // We want to execute the default estimators last so that the user-provided ones have
         // a chance of providing an estimation.
         // If none of the user-provided returned an estimation, the default ones are used.
-        for default_estimator in [&FileScanConfigTaskEstimator as &dyn TaskEstimator] {
+        for default_estimator in [
+            &BroadcastSubtreeMaxOneTaskEstimator as &dyn TaskEstimator,
+            &FileScanConfigTaskEstimator as &dyn TaskEstimator,
+        ] {
             if let Some(result) = default_estimator.task_estimation(plan, cfg) {
                 return Some(result);
             }
@@ -334,7 +376,10 @@ impl TaskEstimator for CombinedTaskEstimator {
         // We want to execute the default estimators last so that the user-provided ones have
         // a chance of providing an estimation.
         // If none of the user-provided returned an estimation, the default ones are used.
-        for default_estimator in [&FileScanConfigTaskEstimator as &dyn TaskEstimator] {
+        for default_estimator in [
+            &BroadcastSubtreeMaxOneTaskEstimator as &dyn TaskEstimator,
+            &FileScanConfigTaskEstimator as &dyn TaskEstimator,
+        ] {
             if let Some(result) = default_estimator.scale_up_leaf_node(plan, task_count, cfg) {
                 return Some(result);
             }
@@ -391,6 +436,46 @@ mod tests {
         let node = make_data_source_exec().await?;
         assert_eq!(combined.task_count(node, |cfg| cfg), 3);
         Ok(())
+    }
+
+    #[test]
+    fn broadcast_subtree_max_one_when_opted_in_caps_broadcast_exec() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let broadcast: Arc<dyn ExecutionPlan> = Arc::new(BroadcastExec::new(inner, 1));
+
+        let mut cfg = ConfigOptions::default();
+        cfg.extensions.insert(DistributedConfig {
+            broadcast_subtree_max_one_task: true,
+            ..Default::default()
+        });
+
+        let combined = CombinedTaskEstimator::default();
+        let out = combined
+            .task_estimation(&broadcast, &cfg)
+            .expect("opt-in chain should cap BroadcastExec");
+        assert!(matches!(out.task_count, TaskCountAnnotation::Maximum(1)));
+    }
+
+    #[test]
+    fn broadcast_subtree_max_one_default_off_does_not_cap() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let broadcast: Arc<dyn ExecutionPlan> = Arc::new(BroadcastExec::new(inner, 1));
+
+        let mut cfg = ConfigOptions::default();
+        cfg.extensions.insert(DistributedConfig::default());
+
+        let combined = CombinedTaskEstimator::default();
+        // Default off, no user estimator. BroadcastExec isn't a FileScanConfig, so the default
+        // chain returns None.
+        assert!(combined.task_estimation(&broadcast, &cfg).is_none());
     }
 
     impl CombinedTaskEstimator {

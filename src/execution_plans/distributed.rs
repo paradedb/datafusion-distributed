@@ -217,18 +217,11 @@ impl DistributedExec {
 
             let task_estimator = get_distributed_task_estimator(ctx.session_config())?;
 
-            // When `in_process_mode = true` the embedder ships the worker plan over its own
-            // side channel (e.g. a shared-memory queue in an embedded Postgres extension) and
-            // exposes a `WorkerTransport` that consumes it. None of the coordinator → worker
-            // gRPC plumbing runs in that mode (see the `if in_process { continue; }` guard in
-            // the per-worker loop below), and the only side-effect of `Spawner::new` that
-            // matters across modes is the eager
-            // `PhysicalPlanNode::try_from_physical_plan(stage.plan, codec).encode_to_vec()` it
-            // performs to build `plan_proto` — bytes that are otherwise pushed onto the gRPC
-            // stream by `send_plan_task`. Under `in_process` those bytes are never observed,
-            // so the encode is pure overhead AND it forces embedders to maintain a physical
-            // codec for every custom exec they ship even though decode is unreachable. Guard
-            // the spawner construction to lift that requirement.
+            // In `in_process_mode` the gRPC loop below skips via `if in_process { continue; }`,
+            // so the only observable side effect of `Spawner::new` is the eager
+            // `try_from_physical_plan(...).encode_to_vec()` it does to build `plan_proto`.
+            // Those bytes go nowhere in-process, but the encode still forces embedders to
+            // keep a physical codec for every custom exec. Skip the spawner to lift that.
             let mut spawner = if in_process {
                 None
             } else {

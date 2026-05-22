@@ -41,15 +41,10 @@ extensions_options! {
         /// use broadcasting like checking build side size.
         /// For now, broadcasting all CollectLeft joins is not always beneficial.
         pub broadcast_joins: bool, default = false
-        /// Opt-in: cap any `BroadcastExec` subtree at `task_count = Maximum(1)`. Without the
-        /// cap, the default leaf-task estimator returns `Desired(n_workers)`, every producer
-        /// re-emits the full build side, and `select_all` on the consumer over-counts by
-        /// `n_workers`. Capping the `BroadcastExec` node itself (not the leaf) is what makes
-        /// it robust to HashJoin's build/probe reorder.
-        ///
-        /// Defaults to `false` so existing fork users see no behavior change. Embedders whose
-        /// `WorkerTransport` doesn't deduplicate broadcast frames before `select_all` should
-        /// turn this on.
+        /// Opt-in cap of every `BroadcastExec` subtree at `task_count = Maximum(1)`. Turn
+        /// this on when your `WorkerTransport` doesn't deduplicate broadcast frames before
+        /// the consumer's `select_all`; otherwise leave at the default. The built-in
+        /// `BroadcastSubtreeMaxOneTaskEstimator` reads this flag.
         pub broadcast_subtree_max_one_task: bool, default = false
         /// When set, `DistributedExec::prepare_plan` skips the gRPC plan-send / metrics-collection
         /// / work-unit-feed tasks. Tasks are still assigned to URLs (so input stages are still

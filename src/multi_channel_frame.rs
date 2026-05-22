@@ -40,9 +40,15 @@ pub const MULTI_CHANNEL_FRAME_HEADER_SIZE: usize = 16;
 /// containing one `RecordBatch`. `Eof` carries no payload. It signals the
 /// receiver that the named `(stage_id, partition)` channel is done, even
 /// though the underlying byte queue may still carry frames for other channels.
+///
+/// Crate-private because external callers don't currently introspect the
+/// discriminant — `encode_*_frame_into` accepts a `MultiChannelFrameHeader`
+/// directly, and `decode_frame` returns the typed payload via
+/// `Option<RecordBatch>`. Promote to `pub` if a future caller needs to
+/// branch on the kind without going through `decode_frame`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameKind {
+pub(crate) enum FrameKind {
     Batch = 0,
     Eof = 1,
 }
@@ -102,7 +108,7 @@ impl MultiChannelFrameHeader {
     /// Read the kind out of `flags`. Returns an error if the kind byte is
     /// unknown or if any reserved upper bit is set, which catches wire-format
     /// drift early.
-    pub fn kind(&self) -> Result<FrameKind, DataFusionError> {
+    pub(crate) fn kind(&self) -> Result<FrameKind, DataFusionError> {
         let reserved = self.flags & !FRAME_KIND_MASK;
         if reserved != 0 {
             return Err(DataFusionError::Internal(format!(
@@ -292,6 +298,8 @@ mod tests {
 
     #[test]
     fn frame_rejects_bad_magic() {
+        // Explicit non-zero, non-magic prefix. Don't rely on the happenstance that
+        // 0u32 != FRAME_MAGIC.
         let mut bad = vec![0u8; MULTI_CHANNEL_FRAME_HEADER_SIZE];
         bad[0..4].copy_from_slice(&0xCAFEBABE_u32.to_le_bytes());
         let err = decode_frame(&bad).expect_err("bad magic must fail");
@@ -305,7 +313,7 @@ mod tests {
     fn frame_rejects_unknown_kind() {
         let header = MultiChannelFrameHeader {
             magic: FRAME_MAGIC,
-            flags: 0x42,
+            flags: 0x42, // unknown kind byte, no reserved bits set
             stage_id: 0,
             partition: 0,
         };
@@ -317,9 +325,11 @@ mod tests {
 
     #[test]
     fn frame_rejects_reserved_flag_bits() {
+        // Any bit above the low byte of `flags` is reserved-must-be-zero; setting one
+        // should trip `kind()` before the kind byte is consulted.
         let header = MultiChannelFrameHeader {
             magic: FRAME_MAGIC,
-            flags: 0x0000_0100,
+            flags: 0x0000_0100, // bit 8 set, kind byte 0 (would be Batch)
             stage_id: 0,
             partition: 0,
         };
@@ -333,7 +343,7 @@ mod tests {
     fn frame_eof_with_payload_is_rejected() {
         let mut buf = Vec::with_capacity(32);
         encode_eof_frame_into(0, 0, &mut buf).expect("encode_eof");
-        buf.push(0xAB);
+        buf.push(0xAB); // smuggle a payload byte after the Eof header
         let err = decode_frame(&buf).expect_err("Eof+payload must fail");
         assert!(format!("{err}").contains("Eof frame carries payload"));
     }

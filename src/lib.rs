@@ -25,10 +25,6 @@ pub use distributed_planner::{
     DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
     TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
 };
-pub use multi_channel_frame::{
-    MultiChannelFrameHeader, MULTI_CHANNEL_FRAME_HEADER_SIZE, decode_frame, encode_eof_frame_into,
-    encode_frame_into,
-};
 pub use execution_plans::{
     BroadcastExec, DistributedExec, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,
     PartitionIsolatorExec,
@@ -38,6 +34,10 @@ pub use metrics::{
     DistributedMetricsFormat, FirstLatencyMetric, LatencyMetricExt, MaxLatencyMetric,
     MinLatencyMetric, P50LatencyMetric, P75LatencyMetric, P95LatencyMetric, P99LatencyMetric,
     rewrite_distributed_plan_with_metrics,
+};
+pub use multi_channel_frame::{
+    MULTI_CHANNEL_FRAME_HEADER_SIZE, MultiChannelFrameHeader, decode_frame, encode_eof_frame_into,
+    encode_frame_into,
 };
 pub use networking::{
     BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, WorkerResolver,

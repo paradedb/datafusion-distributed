@@ -1,7 +1,8 @@
-# Cooperative Drain — Symmetric-Send Deadlock Mitigation
+# Symmetric-Send Deadlock in Bounded In-Process Transports
 
-A design pattern for in-process embedders running multi-stage MPP plans on a
-single-threaded executor with a bounded byte transport.
+A failure mode that hits in-process embedders running multi-stage MPP plans
+over a bounded byte transport, and the **cooperative-drain** pattern that
+resolves it.
 
 ## When this applies
 
@@ -11,21 +12,26 @@ This pattern is relevant if **all three** of these hold:
    with a fixed capacity per edge (e.g. Postgres `shm_mq` slots, a fixed-size
    shared-memory ring, a `bounded` `std::sync::mpsc`). A full outbound queue
    causes the sender to block or report "would block".
-2. **Single-threaded executor.** Producer and consumer tasks for a given proc
-   run on the same thread (e.g. `tokio::runtime::Builder::new_current_thread`).
-   The embedder cannot rely on a separate OS thread to drain inbound traffic
-   while a producer task is blocked on outbound.
-3. **N-to-N peer-mesh traffic.** Each proc both produces frames for peers AND
-   consumes frames from peers in the same query (the canonical example: a
-   distributed shuffle where every proc reads from every other proc). Each
-   producer's outbound queue is a peer's inbound queue.
+2. **No spare thread available to consume.** Producer and consumer tasks for a
+   given proc compete for the same execution resources. The canonical case is
+   a `tokio::runtime::Builder::new_current_thread` runtime — producer and
+   consumer tasks run on one OS thread, so a blocked producer can't be
+   preempted in favor of a consumer that would unblock it. A `multi_thread`
+   runtime hits a degenerate form of the same pathology when every worker
+   thread is simultaneously parked in `send_bytes` (the failure surfaces less
+   often there, but the underlying invariant is the same: no thread is free to
+   drain inbound).
+3. **Bidirectional peer traffic.** At least two procs both send to and
+   receive from each other in the same stage. The canonical example is a
+   distributed shuffle where every proc reads from every other proc, but a
+   2-peer topology is sufficient to deadlock.
 
-The fork's default `FlightWorkerTransport` is **not** affected: gRPC streams are
-backed by unbounded tokio channels per partition, with a global memory budget
-([`worker_connection_buffer_budget_bytes`](task-estimator.md)) that gates the
-upstream pull rather than the downstream send. The deadlock below cannot occur
-on that transport — but it can on any in-process transport that maps logical
-channels onto a fixed-capacity byte queue.
+The fork's default `FlightWorkerTransport` is **not** affected: gRPC streams
+are backed by unbounded tokio channels per partition, with a global memory
+budget ([`worker_connection_buffer_budget_bytes`](../user-guide/task-estimator.md))
+that gates the upstream pull rather than the downstream send. The deadlock
+below cannot occur on that transport — but it can on any in-process transport
+that maps logical channels onto a fixed-capacity byte queue.
 
 ## The deadlock
 
@@ -41,11 +47,12 @@ Nobody makes progress.
 
 The blocker is symmetric: each proc waits for the peer to drain its outbound,
 but the peer is itself waiting for *its* outbound to drain. On a multi-threaded
-runtime the consumer task on a different OS thread can step in and pull from
-inbound. On a single-threaded current-thread runtime there's no such thread —
-the producer task holds the executor while it spins on `would_block`.
+runtime with spare capacity, the consumer task on a different OS thread can
+step in and pull from inbound. On a single-threaded current-thread runtime
+there's no such thread — the producer task holds the executor while it spins
+on `would_block`.
 
-## The fix
+## The fix: cooperative drain
 
 The producer side, while waiting for outbound space, must **pump inbound
 traffic** on the same thread. That frees up the peer's outbound-to-us, which
@@ -61,8 +68,8 @@ Concretely, every retry iteration of the send loop:
 
 The pattern is a per-fragment producer-side spin, not a separate drain thread.
 Drain work happens on the same OS thread as the send. This matches the
-single-thread invariant most in-process embedders are subject to (e.g. Postgres
-parallel workers, where FFI into the engine is backend-thread-only).
+single-thread invariant most in-process embedders are subject to (e.g.
+Postgres parallel workers, where FFI into the engine is backend-thread-only).
 
 The "drain inbound" hook is supplied by the embedder, not the fork — the
 embedder owns the proc-to-peer routing topology and knows how to enumerate
@@ -79,20 +86,21 @@ loop something to call at each retry.
 
 ## Reference implementation
 
-paradedb/paradedb pg_search's MPP layer uses this pattern with Postgres `shm_mq`
-as the bounded transport, the current-thread tokio runtime pinned to the
-backend thread, and a peer-mesh shuffle across N parallel workers. See:
-
-- [`MppSender::send_batch_traced`](https://github.com/paradedb/paradedb/blob/main/pg_search/src/postgres/customscan/mpp/transport.rs)
-  — the producer-side spin that calls `try_drain_pass` inside the retry loop.
-- The `CooperativeDrainSet` trait + `MppMesh::drain_all_inbound` impl that
-  enumerate every inbound `shm_mq` for the current proc.
+paradedb/paradedb pg_search's MPP layer uses this pattern with Postgres
+`shm_mq` as the bounded transport, the current-thread tokio runtime pinned to
+the backend thread, and a peer-mesh shuffle across N parallel workers. The
+producer-side spin lives in
+[`MppSender::send_batch_traced`](https://github.com/paradedb/paradedb/blob/d6b8b9036/pg_search/src/postgres/customscan/mpp/transport.rs#L299)
+and calls `try_drain_pass` on a `CooperativeDrainSet` injected at sender
+construction time. The mesh-level impl (`impl CooperativeDrainSet for
+MppMesh`) enumerates every inbound `shm_mq` for the current proc — see
+[`MppMesh::drain_all_inbound`](https://github.com/paradedb/paradedb/blob/d6b8b9036/pg_search/src/postgres/customscan/mpp/runtime.rs#L133).
 
 `pgrx::check_for_interrupts!()` is also called inside the spin so a user
 CANCEL or query timeout `longjmp`s out before the next drain pass — a
 Postgres-specific safety net that doesn't have a fork-level equivalent.
 
-## Why the fork doesn't ship this pattern
+## Why the fork doesn't ship this pattern as code
 
 Two reasons:
 

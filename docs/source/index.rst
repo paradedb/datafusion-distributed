@@ -19,7 +19,6 @@ how to contribute changes to the library yourself.
    user-guide/worker-resolver
    user-guide/channel-resolver
    user-guide/task-estimator
-   user-guide/cooperative-drain
    user-guide/how-a-distributed-plan-is-built
 
 .. _toc.contributor-guide:
@@ -31,3 +30,4 @@ how to contribute changes to the library yourself.
    contributor-guide/setup
    contributor-guide/tests
    contributor-guide/benchmarks
+   contributor-guide/cooperative-drain

@@ -1,5 +1,5 @@
 use crate::distributed_planner::network_boundary::{NetworkBoundaryExt, NetworkBoundaryKind};
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 
 /// Description of a single producer-side fragment within a distributed plan,
@@ -109,8 +109,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionStateBuilderExt;
     use crate::test_utils::plans::{base_session_builder, context_with_query};
-    use crate::{DistributedExt, SessionStateBuilderExt};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::empty::EmptyExec;
 
@@ -145,7 +145,10 @@ mod tests {
         let plan = df.create_physical_plan().await.unwrap();
 
         // Collect each fragment so we can assert on the shape AFTER the walk completes.
+        // All fields are read by `Debug` in assertion-failure messages even if some are not
+        // directly inspected by an `assert!` line — `#[allow(dead_code)]` keeps clippy happy.
         #[derive(Debug, Clone, Copy)]
+        #[allow(dead_code)]
         struct CapturedFrag {
             stage_id: u32,
             task_idx: usize,
@@ -183,7 +186,7 @@ mod tests {
         );
 
         // For each stage_id, task_count is consistent across its fragments.
-        let mut by_stage: std::collections::HashMap<u32, (usize, usize)> = Default::default();
+        let mut by_stage: datafusion::common::HashMap<u32, (usize, usize)> = Default::default();
         for f in &frags {
             let entry = by_stage.entry(f.stage_id).or_insert((0, f.task_count));
             entry.0 = entry.0.max(f.task_idx + 1);

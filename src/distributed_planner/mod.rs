@@ -13,4 +13,4 @@ pub use network_boundary::{NetworkBoundary, NetworkBoundaryExt, NetworkBoundaryK
 pub use session_state_builder_ext::SessionStateBuilderExt;
 pub use task_estimator::{TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext};
 pub(crate) use task_estimator::{get_distributed_task_estimator, set_distributed_task_estimator};
-pub use worker_fragments::{for_each_worker_fragment, WorkerFragment};
+pub use worker_fragments::{WorkerFragment, for_each_worker_fragment};

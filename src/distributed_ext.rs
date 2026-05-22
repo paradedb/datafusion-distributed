@@ -517,9 +517,8 @@ pub trait DistributedExt: Sized {
     /// Apply the opinionated recipe for in-process MPP embedders in one shot.
     ///
     /// "Defaults" here means "what we recommend for an in-process embedder," not "values
-    /// the system would pick on its own." `broadcast_joins = true` is opinionated; every
-    /// known in-process embedder wants it. If yours doesn't, set the individual knobs
-    /// by hand.
+    /// the system would pick on its own." `broadcast_joins = true` is opinionated. If
+    /// that's not right for your embedder, set the individual knobs by hand instead.
     ///
     /// The four pieces, all required for `_distribute_plan` to actually emit
     /// `NetworkShuffleExec` over an embedder's leaf scans:
@@ -537,16 +536,14 @@ pub trait DistributedExt: Sized {
     /// 4. `distributed_in_process_mode(true)`. Skips the gRPC plan-send / metrics /
     ///    work-unit-feed tasks. See [`Self::with_distributed_in_process_mode`].
     ///
-    /// `n_workers` is the number of producer tasks the embedder will route to. For a
-    /// Postgres-style "leader proc 0 + N parallel workers" topology, this is the count
-    /// of parallel workers.
+    /// `n_workers` is the number of producer tasks the embedder will route to.
     ///
-    /// Bootstrap behavior: if a [crate::DistributedConfig] is already on the session, the
-    /// helper updates only the three fields it owns (`in_process_mode`, `broadcast_joins`,
-    /// task-estimator chain) and leaves the rest alone. If none is installed, it inserts
-    /// a default first. Custom field values like `files_per_task` are preserved. If a
-    /// future [crate::DistributedConfig] field's `Default` isn't right for in-process
-    /// mode, update this helper to flip it explicitly.
+    /// Bootstrap: if a [crate::DistributedConfig] is already on the session, this updates
+    /// only the three fields it owns (`in_process_mode`, `broadcast_joins`, task-estimator
+    /// chain) and leaves the rest alone. If none is installed, inserts a default first.
+    /// Pre-existing field values like `files_per_task` are preserved. New
+    /// `DistributedConfig` fields whose `Default` isn't right for in-process mode must be
+    /// flipped here explicitly.
     fn with_distributed_in_process_defaults(
         self,
         n_workers: usize,

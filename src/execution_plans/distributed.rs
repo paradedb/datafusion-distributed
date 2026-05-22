@@ -264,15 +264,13 @@ impl DistributedExec {
             for (i, routed_url) in routed_urls.into_iter().enumerate() {
                 workers.push(routed_url.clone());
                 let Some(spawner) = spawner.as_mut() else {
-                    // `in_process_mode = true`: the embedder ships the worker plan over a
-                    // side channel and exposes its own `WorkerTransport`. None of the
-                    // coordinator → worker gRPC plumbing runs. The URL is still recorded on
-                    // the `RemoteStage` so the transport can key off `target_task` (the
-                    // index into `RemoteStage::workers`).
+                    // In-process: embedder ships the worker plan over a side channel and uses
+                    // its own `WorkerTransport`, so we skip the gRPC send. The URL still goes
+                    // on `RemoteStage` because the transport keys off `target_task` (the index
+                    // into `RemoteStage::workers`).
                     continue;
                 };
-                // Spawn a task that sends the subplan to the chosen URL. There will be as
-                // many spawned tasks as workers.
+                // One spawned task per worker URL.
                 let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;
                 spawner.metrics_collection_task(i, worker_rx);
                 spawner.work_unit_feed_task(Arc::clone(ctx), i, tx)?;

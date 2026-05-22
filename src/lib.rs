@@ -23,6 +23,7 @@ pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
     DistributedConfig, NetworkBoundary, NetworkBoundaryExt, NetworkBoundaryKind,
     SessionStateBuilderExt, TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
+    WorkerFragment, for_each_worker_fragment,
 };
 pub use execution_plans::{
     BroadcastExec, DistributedExec, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,

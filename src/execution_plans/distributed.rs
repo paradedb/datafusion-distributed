@@ -188,15 +188,11 @@ impl DistributedExec {
             .map(|c| c.in_process_mode)
             .unwrap_or(false);
 
-        // Under `in_process_mode = true` the embedder ships worker plans through its own
-        // side channel and reads `target_task` (the index into `RemoteStage::workers`) off
-        // the boundary at execute time — the URL string itself is never resolved or
-        // dereferenced (only the vec length, `=stage.tasks`, is read downstream to size
-        // partition iteration). So we skip the `WorkerResolver::get_urls()?` call (which
-        // would otherwise force every in-process embedder to register a resolver that
-        // returns N copies of a placeholder URL just to satisfy the contract) and
-        // substitute a single placeholder here. The estimator's round-robin fallback below
-        // indexes modulo `available_urls.len()`, so a 1-element vec is sufficient.
+        // In-process embedders ship worker plans over their own side channel and key off
+        // `target_task` at execute time. The URL itself is never resolved, only the vec
+        // length matters downstream (it sizes partition iteration). Substituting a single
+        // placeholder lifts the resolver requirement; the round-robin fallback below
+        // indexes modulo `available_urls.len()`, so a 1-element vec is enough.
         let available_urls = if in_process {
             vec![Url::parse("inproc://embedded/").expect("hardcoded url parses")]
         } else {

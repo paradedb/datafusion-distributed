@@ -4,25 +4,20 @@ use std::sync::Arc;
 
 /// Discriminator for the concrete [NetworkBoundary] kinds the planner produces.
 ///
-/// Exposed so embedders (and any caller that needs to branch on the boundary's routing
-/// semantics) can do a typed enum match instead of comparing against `ExecutionPlan::name()`
-/// strings. The latter couples the embedder to internal type-name choices in this crate; a
-/// future rename of `NetworkShuffleExec` would silently break consumers doing
-/// `if plan.name() == "NetworkShuffleExec" { ... }`.
+/// Callers that need to branch on routing semantics can match on this instead of comparing
+/// `ExecutionPlan::name()` strings. A string match couples consumers to internal type-name
+/// choices here; a rename would silently break them.
 ///
-/// Marked `#[non_exhaustive]` so adding a new variant in a future release of this crate is
-/// not a breaking change for downstream consumers — they're still required to keep a `_`
-/// arm in their `match`. Each existing variant continues to map 1:1 to one of the three
-/// concrete `Network*Exec` types and is stable.
+/// `#[non_exhaustive]` so adding a variant later isn't a breaking change. Consumers keep a
+/// `_` arm. Existing variants map 1:1 to the three concrete `Network*Exec` types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum NetworkBoundaryKind {
-    /// Hash-partitioned mesh — [`NetworkShuffleExec`].
+    /// Hash-partitioned mesh. See [`NetworkShuffleExec`].
     Shuffle,
-    /// Broadcast (one producer task, every consumer task receives every partition) —
-    /// [`NetworkBroadcastExec`].
+    /// One producer task, every consumer task gets every partition. See [`NetworkBroadcastExec`].
     Broadcast,
-    /// Gather to a single consumer task — [`NetworkCoalesceExec`].
+    /// Gather to a single consumer task. See [`NetworkCoalesceExec`].
     Coalesce,
 }
 
@@ -30,9 +25,9 @@ pub enum NetworkBoundaryKind {
 /// The distributed planner, upon stepping into one of these, will break the plan and build a stage
 /// out of it.
 pub trait NetworkBoundary: ExecutionPlan {
-    /// Returns the boundary's [`NetworkBoundaryKind`]. Embedders use this to switch on routing
-    /// semantics (shuffle hash-partitions, broadcast replicates, coalesce gathers) without
-    /// matching on `ExecutionPlan::name()` strings.
+    /// Returns the boundary's [`NetworkBoundaryKind`]. Use this to branch on routing
+    /// (shuffle hash-partitions, broadcast replicates, coalesce gathers) without matching
+    /// on `ExecutionPlan::name()`.
     fn kind(&self) -> NetworkBoundaryKind;
 
     /// Called when a [Stage] is correctly formed. The [NetworkBoundary] can use this

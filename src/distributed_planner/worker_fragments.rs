@@ -145,44 +145,93 @@ mod tests {
         let plan = df.create_physical_plan().await.unwrap();
 
         // Collect each fragment so we can assert on the shape AFTER the walk completes.
-        let mut frags: Vec<(u32, usize, usize, NetworkBoundaryKind, bool)> = Vec::new();
+        #[derive(Debug, Clone, Copy)]
+        struct CapturedFrag {
+            stage_id: u32,
+            task_idx: usize,
+            task_count: usize,
+            kind: NetworkBoundaryKind,
+            nested: bool,
+            partitions_per_consumer_task: usize,
+        }
+        let mut frags: Vec<CapturedFrag> = Vec::new();
         for_each_worker_fragment(&plan, |frag| {
-            frags.push((
-                frag.stage_id,
-                frag.task_idx,
-                frag.task_count,
-                frag.kind,
-                frag.nested,
-            ));
+            frags.push(CapturedFrag {
+                stage_id: frag.stage_id,
+                task_idx: frag.task_idx,
+                task_count: frag.task_count,
+                kind: frag.kind,
+                nested: frag.nested,
+                partitions_per_consumer_task: frag.partitions_per_consumer_task,
+            });
         });
 
         assert!(
             !frags.is_empty(),
-            "visitor must yield at least one fragment for a real distributed plan"
+            "visitor must yield at least one fragment for a real distributed plan; got {frags:?}"
         );
 
         // Every (stage_id, task_idx) pair is unique — no double-yielding.
-        let mut keys: Vec<_> = frags.iter().map(|(s, t, _, _, _)| (*s, *t)).collect();
+        let mut keys: Vec<_> = frags.iter().map(|f| (f.stage_id, f.task_idx)).collect();
         keys.sort();
         let n = keys.len();
         keys.dedup();
-        assert_eq!(keys.len(), n, "fragments must have unique (stage_id, task_idx)");
+        assert_eq!(
+            keys.len(),
+            n,
+            "fragments must have unique (stage_id, task_idx); got {frags:?}"
+        );
 
         // For each stage_id, task_count is consistent across its fragments.
         let mut by_stage: std::collections::HashMap<u32, (usize, usize)> = Default::default();
-        for &(stage_id, task_idx, task_count, _, _) in &frags {
-            let entry = by_stage.entry(stage_id).or_insert((0, task_count));
-            entry.0 = entry.0.max(task_idx + 1);
+        for f in &frags {
+            let entry = by_stage.entry(f.stage_id).or_insert((0, f.task_count));
+            entry.0 = entry.0.max(f.task_idx + 1);
             assert_eq!(
-                entry.1, task_count,
-                "task_count for stage {stage_id} must be consistent across fragments"
+                entry.1, f.task_count,
+                "task_count for stage {} must be consistent across fragments",
+                f.stage_id,
             );
         }
         // Task indices fill `0..task_count` exactly.
-        for (stage_id, (max_seen, task_count)) in by_stage {
+        for (stage_id, (max_seen, task_count)) in &by_stage {
             assert_eq!(
-                max_seen, task_count,
+                *max_seen, *task_count,
                 "stage {stage_id} should yield fragments task_idx=0..{task_count}, max seen {max_seen}"
+            );
+        }
+
+        // The plan has multiple stages: at least one top-level (`nested = false`) and one
+        // nested (`nested = true`). The 3-worker GROUP BY produces a Coalesce stage at the
+        // top + a Shuffle stage feeding it.
+        assert!(
+            frags.iter().any(|f| !f.nested),
+            "expected at least one top-level (nested=false) fragment in a multi-stage plan; got {frags:?}"
+        );
+        assert!(
+            frags.iter().any(|f| f.nested),
+            "expected at least one nested (nested=true) fragment in a multi-stage plan; got {frags:?}"
+        );
+
+        // Iteration order: depth-first pre-order. The visitor must yield the top-level
+        // stage's fragments BEFORE descending into nested stages. So the first emitted
+        // fragment must have nested=false and the last fragment must be nested (otherwise
+        // the visitor either failed to recurse or recursed before yielding).
+        assert!(
+            !frags.first().expect("non-empty").nested,
+            "first yielded fragment must be top-level (depth-first pre-order); got {frags:?}"
+        );
+        assert!(
+            frags.last().expect("non-empty").nested,
+            "last yielded fragment must be from a nested stage (depth-first pre-order); got {frags:?}"
+        );
+
+        // `partitions_per_consumer_task` is propagated as a u32-castable count > 0 for every
+        // fragment (`output_partitioning().partition_count()` is at least 1).
+        for f in &frags {
+            assert!(
+                f.partitions_per_consumer_task > 0,
+                "partitions_per_consumer_task must be > 0; got {f:?}"
             );
         }
     }

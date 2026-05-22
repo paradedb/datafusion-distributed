@@ -514,6 +514,41 @@ pub trait DistributedExt: Sized {
     /// Same as [DistributedExt::with_distributed_in_process_mode] but with an in-place mutation.
     fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
 
+    /// Apply the recommended defaults for in-process MPP embedders in one shot.
+    ///
+    /// The four pieces, all required for `_distribute_plan` to actually emit
+    /// `NetworkShuffleExec` over an embedder's leaf scans:
+    ///
+    /// 1. `target_partitions(max(n_workers, 2))` — without this, `EnforceDistribution`
+    ///    skips every `RepartitionExec`, so the plan annotator never sees a Shuffle. The
+    ///    `max(_, 2)` is the same minimum the planner uses internally.
+    /// 2. `distributed_task_estimator(n_workers)` — the blanket
+    ///    `impl TaskEstimator for usize` returns `Desired(n_workers)` for leaf nodes,
+    ///    which is what makes `_distribute_plan` actually emit a shuffle. Without it,
+    ///    leaves default to `Maximum(1)` and every shuffle gets elided.
+    /// 3. `distributed_broadcast_joins(true)` — `CollectLeft` HashJoins would otherwise
+    ///    cap their stage's `task_count` at `Maximum(1)` and propagate that cap upward,
+    ///    eliding shuffles above the join.
+    /// 4. `distributed_in_process_mode(true)` — skips the gRPC plan-send / metrics /
+    ///    work-unit-feed tasks (see [`Self::with_distributed_in_process_mode`]).
+    ///
+    /// The broadcast-subtree cap (`broadcast_subtree_max_one_task = true`) is already a
+    /// default in [crate::DistributedConfig], so it's automatically applied.
+    ///
+    /// `n_workers` is the number of producer tasks the embedder will route to; for a
+    /// Postgres-style "leader proc 0 + N parallel workers" topology, this is the count
+    /// of parallel workers.
+    fn with_distributed_in_process_defaults(
+        self,
+        n_workers: usize,
+    ) -> Result<Self, DataFusionError>;
+
+    /// Same as [DistributedExt::with_distributed_in_process_defaults] but with an in-place mutation.
+    fn set_distributed_in_process_defaults(
+        &mut self,
+        n_workers: usize,
+    ) -> Result<(), DataFusionError>;
+
     /// The compression type to use for sending data over the wire.
     ///
     /// The default is [CompressionType::LZ4_FRAME].
@@ -736,6 +771,28 @@ impl DistributedExt for SessionConfig {
         Ok(())
     }
 
+    fn set_distributed_in_process_defaults(
+        &mut self,
+        n_workers: usize,
+    ) -> Result<(), DataFusionError> {
+        // 1. Bump target_partitions so EnforceDistribution actually emits shuffles. The
+        //    `max(_, 2)` matches the planner's internal minimum for a multi-partition plan.
+        self.options_mut().execution.target_partitions = n_workers.max(2);
+        // 2. Bootstrap DistributedConfig if the caller hasn't installed one already. The
+        //    remaining setters mutate fields on this extension, so it has to exist before they run.
+        if self.options().extensions.get::<DistributedConfig>().is_none() {
+            set_distributed_option_extension(self, DistributedConfig::default());
+        }
+        // 3. Flip in_process_mode and broadcast_joins on the (now-present) DistributedConfig.
+        let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
+        d_cfg.in_process_mode = true;
+        d_cfg.broadcast_joins = true;
+        // 4. Register the leaf-task estimator (`impl TaskEstimator for usize`) so leaves
+        //    report `Desired(n_workers)` and the annotator propagates that upward.
+        set_distributed_task_estimator(self, n_workers);
+        Ok(())
+    }
+
     fn set_distributed_compression(
         &mut self,
         compression: Option<CompressionType>,
@@ -859,6 +916,10 @@ impl DistributedExt for SessionConfig {
             #[expr($?;Ok(self))]
             fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
+            #[call(set_distributed_in_process_defaults)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_in_process_defaults(mut self, n_workers: usize) -> Result<Self, DataFusionError>;
+
             #[call(set_distributed_compression)]
             #[expr($?;Ok(self))]
             fn with_distributed_compression(mut self, compression: Option<CompressionType>) -> Result<Self, DataFusionError>;
@@ -967,6 +1028,11 @@ impl DistributedExt for SessionStateBuilder {
             #[call(set_distributed_in_process_mode)]
             #[expr($?;Ok(self))]
             fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
+
+            fn set_distributed_in_process_defaults(&mut self, n_workers: usize) -> Result<(), DataFusionError>;
+            #[call(set_distributed_in_process_defaults)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_in_process_defaults(mut self, n_workers: usize) -> Result<Self, DataFusionError>;
 
             fn set_distributed_compression(&mut self, compression: Option<CompressionType>) -> Result<(), DataFusionError>;
             #[call(set_distributed_compression)]
@@ -1089,6 +1155,11 @@ impl DistributedExt for SessionState {
             #[expr($?;Ok(self))]
             fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
+            fn set_distributed_in_process_defaults(&mut self, n_workers: usize) -> Result<(), DataFusionError>;
+            #[call(set_distributed_in_process_defaults)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_in_process_defaults(mut self, n_workers: usize) -> Result<Self, DataFusionError>;
+
             fn set_distributed_compression(&mut self, compression: Option<CompressionType>) -> Result<(), DataFusionError>;
             #[call(set_distributed_compression)]
             #[expr($?;Ok(self))]
@@ -1210,6 +1281,11 @@ impl DistributedExt for SessionContext {
             #[expr($?;Ok(self))]
             fn with_distributed_in_process_mode(self, enabled: bool) -> Result<Self, DataFusionError>;
 
+            fn set_distributed_in_process_defaults(&mut self, n_workers: usize) -> Result<(), DataFusionError>;
+            #[call(set_distributed_in_process_defaults)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_in_process_defaults(self, n_workers: usize) -> Result<Self, DataFusionError>;
+
             fn set_distributed_compression(&mut self, compression: Option<CompressionType>) -> Result<(), DataFusionError>;
             #[call(set_distributed_compression)]
             #[expr($?;Ok(self))]
@@ -1255,5 +1331,81 @@ impl DistributedExt for SessionContext {
                 P::WorkUnit: 'static,
                 F: Fn(&T) -> Option<&WorkUnitFeed<P>> + Send + Sync + 'static;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_process_defaults_set_all_four_knobs() {
+        let mut cfg = SessionConfig::new();
+        cfg.set_distributed_in_process_defaults(5).expect("ok");
+
+        // (1) target_partitions bumped to max(n_workers, 2)
+        assert_eq!(cfg.options().execution.target_partitions, 5);
+
+        // (2)+(3)+(4): DistributedConfig is installed and the three relevant fields are set.
+        let d_cfg = cfg
+            .options()
+            .extensions
+            .get::<DistributedConfig>()
+            .expect("DistributedConfig present");
+        assert!(d_cfg.in_process_mode, "in_process_mode should be true");
+        assert!(d_cfg.broadcast_joins, "broadcast_joins should be true");
+
+        // (5) Leaf-task estimator is registered. We can't directly inspect the estimator chain
+        // from outside the crate, but we can confirm by running it on a fake leaf and observing
+        // the estimation comes back as Desired(5).
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let combined = d_cfg.__private_task_estimator.clone();
+        let est = combined
+            .task_estimation(&leaf, cfg.options())
+            .expect("estimator should produce a value for a leaf");
+        // `impl TaskEstimator for usize` produces Desired(n) for leaves.
+        match est.task_count {
+            crate::TaskCountAnnotation::Desired(n) => assert_eq!(n, 5),
+            other => panic!("expected Desired(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_process_defaults_floor_target_partitions_at_two() {
+        // Even with `n_workers = 1`, target_partitions stays at 2 — DataFusion's planner
+        // treats `target_partitions = 1` as "force serial" and elides every shuffle.
+        let mut cfg = SessionConfig::new();
+        cfg.set_distributed_in_process_defaults(1).expect("ok");
+        assert_eq!(cfg.options().execution.target_partitions, 2);
+    }
+
+    #[test]
+    fn in_process_defaults_does_not_clobber_preexisting_distributed_config() {
+        // If the caller has already installed a DistributedConfig with a non-default field set,
+        // the helper must update only the three fields it owns and leave the rest alone.
+        let mut cfg = SessionConfig::new();
+        let initial = DistributedConfig {
+            files_per_task: 42, // a field the helper does NOT touch
+            ..Default::default()
+        };
+        cfg.set_distributed_option_extension(initial);
+
+        cfg.set_distributed_in_process_defaults(4).expect("ok");
+
+        let d_cfg = cfg
+            .options()
+            .extensions
+            .get::<DistributedConfig>()
+            .expect("DistributedConfig present");
+        assert!(d_cfg.in_process_mode);
+        assert!(d_cfg.broadcast_joins);
+        assert_eq!(
+            d_cfg.files_per_task, 42,
+            "helper must not clobber pre-existing DistributedConfig fields"
+        );
     }
 }

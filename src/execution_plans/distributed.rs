@@ -217,11 +217,9 @@ impl DistributedExec {
 
             let task_estimator = get_distributed_task_estimator(ctx.session_config())?;
 
-            // In `in_process_mode` the gRPC loop below skips via `if in_process { continue; }`,
-            // so the only observable side effect of `Spawner::new` is the eager
-            // `try_from_physical_plan(...).encode_to_vec()` it does to build `plan_proto`.
-            // Those bytes go nowhere in-process, but the encode still forces embedders to
-            // keep a physical codec for every custom exec. Skip the spawner to lift that.
+            // Skip the spawner in-process: its eager `try_from_physical_plan().encode_to_vec()`
+            // in `new()` would force embedders to keep a codec for every custom exec, even
+            // though no send happens (the loop below short-circuits on `None`).
             let mut spawner = if in_process {
                 None
             } else {
@@ -264,10 +262,10 @@ impl DistributedExec {
             for (i, routed_url) in routed_urls.into_iter().enumerate() {
                 workers.push(routed_url.clone());
                 let Some(spawner) = spawner.as_mut() else {
-                    // In-process: embedder ships the worker plan over a side channel and uses
-                    // its own `WorkerTransport`, so we skip the gRPC send. The URL still goes
-                    // on `RemoteStage` because the transport keys off `target_task` (the index
-                    // into `RemoteStage::workers`).
+                    // In-process: the embedder ships the worker plan over a side channel using
+                    // its own `WorkerTransport`. Skip the per-task spawn here; the URL still
+                    // lands on `RemoteStage` because the transport keys off `target_task` (the
+                    // index into `RemoteStage::workers`).
                     continue;
                 };
                 // One spawned task per worker URL.

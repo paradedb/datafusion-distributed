@@ -66,3 +66,60 @@ impl NetworkBoundaryExt for dyn ExecutionPlan {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BroadcastExec, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_expr::{Partitioning, expressions::Column};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use uuid::Uuid;
+
+    fn empty_with_field(name: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        Arc::new(EmptyExec::new(schema))
+    }
+
+    /// Canonical dispatch pattern for [`NetworkBoundary`] consumers. The exhaustive
+    /// match also acts as a compile-time anchor: adding a [`NetworkBoundaryKind`]
+    /// variant forces every match site to update (or its `_` arm) instead of
+    /// silently drifting.
+    fn label(boundary: &dyn NetworkBoundary) -> &'static str {
+        match boundary.kind() {
+            NetworkBoundaryKind::Shuffle => "shuffle",
+            NetworkBoundaryKind::Broadcast => "broadcast",
+            NetworkBoundaryKind::Coalesce => "coalesce",
+        }
+    }
+
+    #[test]
+    fn shuffle_reports_shuffle_kind() -> datafusion::common::Result<()> {
+        let leaf = empty_with_field("a");
+        let part = Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 1);
+        let input: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(leaf, part)?);
+        let exec = NetworkShuffleExec::try_new(input, Uuid::nil(), 1, 1, 1)?;
+        assert_eq!(exec.kind(), NetworkBoundaryKind::Shuffle);
+        assert_eq!(label(&exec), "shuffle");
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_reports_broadcast_kind() -> datafusion::common::Result<()> {
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(BroadcastExec::new(empty_with_field("a"), 1));
+        let exec = NetworkBroadcastExec::try_new(input, Uuid::nil(), 1, 1, 1)?;
+        assert_eq!(exec.kind(), NetworkBoundaryKind::Broadcast);
+        assert_eq!(label(&exec), "broadcast");
+        Ok(())
+    }
+
+    #[test]
+    fn coalesce_reports_coalesce_kind() -> datafusion::common::Result<()> {
+        let exec = NetworkCoalesceExec::try_new(empty_with_field("a"), Uuid::nil(), 1, 1, 1)?;
+        assert_eq!(exec.kind(), NetworkBoundaryKind::Coalesce);
+        assert_eq!(label(&exec), "coalesce");
+        Ok(())
+    }
+}

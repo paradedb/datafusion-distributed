@@ -107,8 +107,7 @@ mod tests {
 
     #[test]
     fn broadcast_reports_broadcast_kind() -> datafusion::common::Result<()> {
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(BroadcastExec::new(empty_with_field("a"), 1));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(BroadcastExec::new(empty_with_field("a"), 1));
         let exec = NetworkBroadcastExec::try_new(input, Uuid::nil(), 1, 1, 1)?;
         assert_eq!(exec.kind(), NetworkBoundaryKind::Broadcast);
         assert_eq!(label(&exec), "broadcast");

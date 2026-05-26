@@ -1,5 +1,5 @@
 use crate::common::require_one_child;
-use crate::distributed_planner::NetworkBoundary;
+use crate::distributed_planner::{NetworkBoundary, NetworkBoundaryKind};
 use crate::stage::{LocalStage, Stage};
 use crate::worker::WorkerConnectionPool;
 use crate::{BroadcastExec, DistributedTaskContext};
@@ -173,6 +173,10 @@ impl NetworkBroadcastExec {
 }
 
 impl NetworkBoundary for NetworkBroadcastExec {
+    fn kind(&self) -> NetworkBoundaryKind {
+        NetworkBoundaryKind::Broadcast
+    }
+
     fn with_input_stage(&self, input_stage: Stage) -> Result<Arc<dyn ExecutionPlan>> {
         let mut self_clone = self.clone();
         self_clone.worker_connections = WorkerConnectionPool::new(input_stage.task_count());

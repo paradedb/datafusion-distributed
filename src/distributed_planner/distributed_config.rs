@@ -49,6 +49,10 @@ extensions_options! {
         /// own [crate::WorkerTransport] (e.g. a shared-memory mesh inside a single process). The
         /// transport receives the assigned URLs but is free to ignore them and route by
         /// `target_task` directly.
+        ///
+        /// No [crate::WorkerResolver] registration is required in this mode. The planner
+        /// substitutes a single internal placeholder URL, which the transport never
+        /// dereferences.
         pub in_process_mode: bool, default = false
         /// The compression used for sending data over the network between workers.
         /// It can be set to either `zstd`, `lz4` or `none`.

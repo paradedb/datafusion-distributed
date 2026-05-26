@@ -16,6 +16,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use rand::Rng;
 use std::sync::Arc;
+use url::Url;
 
 /// Prepares the distributed plan for execution, which implies:
 /// 1. Perform some worker URL assignation, choosing either:
@@ -37,9 +38,17 @@ pub(super) fn prepare_static_plan(
         .map(|c| c.in_process_mode)
         .unwrap_or(false);
 
-    let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
-
-    let available_urls = worker_resolver.get_urls()?;
+    // In-process embedders ship worker plans over their own side channel and key off
+    // `target_task` at execute time. The URL itself is never resolved, only the vec
+    // length matters downstream (it sizes partition iteration). Substituting a single
+    // placeholder lifts the resolver requirement; the round-robin fallback below
+    // indexes modulo `available_urls.len()`, so a 1-element vec is enough.
+    let available_urls = if in_process {
+        vec![Url::parse("inproc://embedded/").expect("hardcoded url parses")]
+    } else {
+        let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
+        worker_resolver.get_urls()?
+    };
 
     let metrics = CoordinatorToWorkerMetrics::new(metrics);
 

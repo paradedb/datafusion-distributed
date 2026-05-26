@@ -91,6 +91,22 @@ impl DistributedExec {
             .await;
     }
 
+    /// Runs the lazy plan-prep step and returns the prepared inner plan, discarding the `JoinSet`
+    /// of coordinator-to-worker gRPC tasks. Intended for embedders running with
+    /// `in_process_mode = true`: the gRPC tasks are no-ops (see
+    /// [`crate::coordinator::prepare_static_plan`]), and the embedder owns its own dispatcher, so
+    /// it only needs the post-prepare plan tree with all `Stage::Local` boundaries converted to
+    /// `Stage::Remote`. Calling this with `in_process_mode = false` still works but spawns the
+    /// gRPC tasks and drops them, which is almost certainly not what the caller wants.
+    pub fn prepare_in_process_plan(
+        &self,
+        ctx: &Arc<TaskContext>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let PreparedPlan { head_stage, .. } =
+            prepare_static_plan(&self.plan, &self.metrics, &self.task_metrics, ctx)?;
+        Ok(head_stage)
+    }
+
     /// Returns the plan which is lazily prepared on `execute()` and actually gets executed.
     /// It is updated on every call to `execute()`. Returns an error if `.execute()` has not been
     /// called.

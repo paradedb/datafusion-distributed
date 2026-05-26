@@ -7,10 +7,13 @@ mod spawn_select_all;
 mod task_data;
 #[cfg(any(test, feature = "integration"))]
 pub(crate) mod test_utils;
+pub(crate) mod transport;
 mod worker_connection_pool;
 mod worker_service;
 
 pub(crate) use single_write_multi_read::SingleWriteMultiRead;
+pub use transport::{WorkerConnection, WorkerPartitionStream, WorkerTransport};
+pub use worker_connection_pool::FlightWorkerTransport;
 pub(crate) use worker_connection_pool::{LocalWorkerContext, WorkerConnectionPool};
 
 pub use session_builder::{

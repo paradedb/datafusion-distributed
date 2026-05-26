@@ -33,6 +33,10 @@ pub(super) fn prepare_static_plan(
     task_metrics: &Option<Arc<MetricsStore>>,
     ctx: &Arc<TaskContext>,
 ) -> Result<PreparedPlan> {
+    let in_process = DistributedConfig::from_config_options(ctx.session_config().options())
+        .map(|c| c.in_process_mode)
+        .unwrap_or(false);
+
     let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
 
     let available_urls = worker_resolver.get_urls()?;
@@ -85,6 +89,13 @@ pub(super) fn prepare_static_plan(
         let mut workers = Vec::with_capacity(stage.tasks);
         for (i, routed_url) in routed_urls.into_iter().enumerate() {
             workers.push(routed_url.clone());
+            if in_process {
+                // Skip the coordinator -> worker gRPC plumbing: the embedder ships the
+                // worker plan over a side channel and exposes its own `WorkerTransport`.
+                // The URL still lands on `RemoteStage` because the transport keys off
+                // `target_task` (the index into `RemoteStage::workers`).
+                continue;
+            }
             // Spawn a task that sends the subplan to the chosen URL.
             // There will be as many spawned tasks as workers.
             let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;

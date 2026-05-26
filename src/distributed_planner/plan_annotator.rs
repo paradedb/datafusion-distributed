@@ -175,6 +175,13 @@ async fn _annotate_plan(
     let broadcast_joins = d_cfg.broadcast_joins;
     let estimator = &d_cfg.__private_task_estimator;
     let max_tasks = match d_cfg.max_tasks_per_stage {
+        0 if d_cfg.in_process_mode => {
+            // In-process embedders don't address workers by URL, so we don't need a
+            // `WorkerResolver` to derive the cap. `usize::MAX` lets the estimator alone
+            // decide per-stage task counts. An explicit `max_tasks_per_stage` still falls
+            // through to the `v => v` arm.
+            usize::MAX
+        }
         0 => d_cfg.__private_worker_resolver.0.get_urls()?.len().max(1),
         v => v,
     };

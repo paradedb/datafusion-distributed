@@ -183,13 +183,22 @@ impl DistributedExec {
     /// 4. Spawn a background task per worker that waits for the worker to finish and collects
     ///    its metrics into [DistributedExec::task_metrics] via the coordinator channel.
     fn prepare_plan(&self, ctx: &Arc<TaskContext>) -> Result<PreparedPlan> {
-        let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
         let codec = DistributedCodec::new_combined_with_user(ctx.session_config());
         let in_process = DistributedConfig::from_config_options(ctx.session_config().options())
             .map(|c| c.in_process_mode)
             .unwrap_or(false);
 
-        let available_urls = worker_resolver.get_urls()?;
+        // In-process embedders ship worker plans over their own side channel and key off
+        // `target_task` at execute time. The URL itself is never resolved, only the vec
+        // length matters downstream (it sizes partition iteration). Substituting a single
+        // placeholder lifts the resolver requirement; the round-robin fallback below
+        // indexes modulo `available_urls.len()`, so a 1-element vec is enough.
+        let available_urls = if in_process {
+            vec![Url::parse("inproc://embedded/").expect("hardcoded url parses")]
+        } else {
+            let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
+            worker_resolver.get_urls()?
+        };
 
         let metrics = CoordinatorToWorkerMetrics {
             // Metric that measures to total sum of bytes worth of subplans sent.

@@ -16,6 +16,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use rand::Rng;
 use std::sync::Arc;
+use url::Url;
 
 /// Prepares the distributed plan for execution, which implies:
 /// 1. Perform some worker URL assignation, choosing either:
@@ -33,9 +34,21 @@ pub(super) fn prepare_static_plan(
     task_metrics: &Option<Arc<MetricsStore>>,
     ctx: &Arc<TaskContext>,
 ) -> Result<PreparedPlan> {
-    let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
+    let in_process = DistributedConfig::from_config_options(ctx.session_config().options())
+        .map(|c| c.in_process_mode)
+        .unwrap_or(false);
 
-    let available_urls = worker_resolver.get_urls()?;
+    // In-process embedders ship worker plans over their own side channel and key off
+    // `target_task` at execute time. The URL itself is never resolved, only the vec
+    // length matters downstream (it sizes partition iteration). Substituting a single
+    // placeholder lifts the resolver requirement; the round-robin fallback below
+    // indexes modulo `available_urls.len()`, so a 1-element vec is enough.
+    let available_urls = if in_process {
+        vec![Url::parse("inproc://embedded/").expect("hardcoded url parses")]
+    } else {
+        let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
+        worker_resolver.get_urls()?
+    };
 
     let metrics = CoordinatorToWorkerMetrics::new(metrics);
 
@@ -85,6 +98,13 @@ pub(super) fn prepare_static_plan(
         let mut workers = Vec::with_capacity(stage.tasks);
         for (i, routed_url) in routed_urls.into_iter().enumerate() {
             workers.push(routed_url.clone());
+            if in_process {
+                // Skip the coordinator -> worker gRPC plumbing: the embedder ships the
+                // worker plan over a side channel and exposes its own `WorkerTransport`.
+                // The URL still lands on `RemoteStage` because the transport keys off
+                // `target_task` (the index into `RemoteStage::workers`).
+                continue;
+            }
             // Spawn a task that sends the subplan to the chosen URL.
             // There will be as many spawned tasks as workers.
             let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;

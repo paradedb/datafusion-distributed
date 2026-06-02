@@ -1,12 +1,13 @@
 use crate::common::{OnceLockResult, on_drop_stream, serialize_uuid};
 use crate::metrics::LatencyMetricExt;
-use crate::networking::get_distributed_channel_resolver;
+use crate::networking::{get_distributed_channel_resolver, get_distributed_worker_transport};
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::protobuf::{datafusion_error_to_tonic_status, map_flight_to_datafusion_error};
 use crate::stage::RemoteStage;
 use crate::worker::generated::worker::FlightAppMetadata;
 use crate::worker::generated::worker::{ExecuteTaskRequest, TaskKey};
 use crate::worker::impl_execute_task::execute_local_task;
+use crate::worker::transport::{WorkerConnection, WorkerTransport};
 use crate::worker::worker_service::TaskDataEntries;
 use crate::{BytesMetricExt, ChannelResolver, DistributedConfig};
 use arrow_flight::FlightData;
@@ -98,32 +99,15 @@ impl WorkerConnectionPool {
         };
 
         let conn = worker_connection.get_or_init(|| {
-            let Some(target_url) = input_stage.workers.get(target_task) else {
-                internal_err!("input_stage.workers[{target_task}] out of range.")?
-            };
-            if let Some(lw_ctx) = ctx.session_config().get_extension::<LocalWorkerContext>()
-                && &lw_ctx.self_url == target_url
-            {
-                // Instead of making a gRPC call to ourselves, better to just use local comms.
-                Ok(Box::new(LocalWorkerConnection::init(
-                    input_stage,
-                    target_partitions,
-                    target_task,
-                    lw_ctx,
-                    &self.metrics,
-                )) as Box<_>)
-            } else {
-                // We are trying to reach a URL different from ours, so use normal gRPC streams.
-                RemoteWorkerConnection::init(
+            get_distributed_worker_transport(ctx)
+                .open(
                     input_stage,
                     target_partitions,
                     target_task,
                     ctx,
                     &self.metrics,
                 )
-                .map(|v| Box::new(v) as Box<_>)
                 .map_err(Arc::new)
-            }
         });
 
         match conn {
@@ -135,12 +119,39 @@ impl WorkerConnectionPool {
 
 type WorkerMsg = Result<(FlightData, FlightAppMetadata), Status>;
 
-/// Abstraction that allows treating remote and local comms as equal. Network boundaries do not
-/// care if the stream comes over the wire or locally.
-pub(crate) trait WorkerConnection {
-    /// Streams the specified partition. Consumers do not care if the implementation pulls data
-    /// from in-memory or from local comms.
-    fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>>;
+/// The default [WorkerTransport]: opens an Arrow-Flight gRPC stream per remote task, or bypasses
+/// gRPC with local comms when the target worker happens to be the current process.
+#[derive(Clone, Default)]
+pub struct FlightWorkerTransport;
+
+impl WorkerTransport for FlightWorkerTransport {
+    fn open(
+        &self,
+        input_stage: &RemoteStage,
+        target_partitions: Range<usize>,
+        target_task: usize,
+        ctx: &Arc<TaskContext>,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
+        let Some(target_url) = input_stage.workers.get(target_task) else {
+            return internal_err!("input_stage.workers[{target_task}] out of range.");
+        };
+        if let Some(lw_ctx) = ctx.session_config().get_extension::<LocalWorkerContext>()
+            && &lw_ctx.self_url == target_url
+        {
+            // Reach ourselves through local comms instead of a gRPC call.
+            Ok(Box::new(LocalWorkerConnection::init(
+                input_stage,
+                target_partitions,
+                target_task,
+                lw_ctx,
+                metrics,
+            )))
+        } else {
+            RemoteWorkerConnection::init(input_stage, target_partitions, target_task, ctx, metrics)
+                .map(|v| Box::new(v) as Box<dyn WorkerConnection + Send + Sync>)
+        }
+    }
 }
 
 /// Represents a connection to one [Worker]. Network boundaries will use this for streaming

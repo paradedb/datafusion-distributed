@@ -13,7 +13,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use rand::Rng;
 use std::sync::Arc;
-use url::Url;
 
 /// Prepares the distributed plan for execution, which implies:
 /// 1. Perform some worker URL assignation, choosing either:
@@ -31,26 +30,12 @@ pub(super) fn prepare_static_plan(
     task_metrics: &Option<Arc<MetricsStore>>,
     ctx: &Arc<TaskContext>,
 ) -> Result<PreparedPlan> {
-    let in_process = DistributedConfig::from_config_options(ctx.session_config().options())
-        .map(|c| c.in_process_mode)
-        .unwrap_or(false);
+    let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
 
-    // In-process embedders ship worker plans over their own side channel and key off
-    // `target_task` at execute time. The URL itself is never resolved, only the vec
-    // length matters downstream (it sizes partition iteration). Substituting a single
-    // placeholder lifts the resolver requirement; the round-robin fallback below
-    // indexes modulo `available_urls.len()`, so a 1-element vec is enough.
-    let available_urls = if in_process {
-        vec![Url::parse("inproc://embedded/").expect("hardcoded url parses")]
-    } else {
-        let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
-        worker_resolver.get_urls()?
-    };
+    let available_urls = worker_resolver.get_urls()?;
     // One dispatcher per query: it carries per-query state (plan-send metrics, the query start
-    // timestamp) across every stage's dispatch. In-process embedders deliver plans over their
-    // own side channel, so no dispatcher is created for them.
-    let dispatcher =
-        (!in_process).then(|| get_distributed_worker_transport(ctx.session_config()).dispatcher());
+    // timestamp) across every stage's dispatch.
+    let dispatcher = get_distributed_worker_transport(ctx.session_config()).dispatcher();
 
     let mut join_set = JoinSet::new();
     let prepared = Arc::clone(base_plan).transform_up(|plan| {
@@ -100,19 +85,15 @@ pub(super) fn prepare_static_plan(
 
         // Hand each task's plan to its assigned worker. The transport owns the delivery (Flight
         // ships a `SetPlanRequest` over gRPC; an embedded transport routes by `target_task`), so
-        // the coordinator no longer special-cases the gRPC send. In-process embedders deliver
-        // plans over their own side channel; the URLs still land on `RemoteStage` because the
-        // transport keys off `target_task` (the index into `RemoteStage::workers`).
-        if let Some(dispatcher) = &dispatcher {
-            dispatcher.dispatch(WorkerDispatchRequest {
-                stage,
-                routed_urls: &routed_urls,
-                task_ctx: ctx,
-                metrics,
-                metrics_store: task_metrics.as_ref(),
-                join_set: &mut join_set,
-            })?;
-        }
+        // the coordinator no longer special-cases the gRPC send.
+        dispatcher.dispatch(WorkerDispatchRequest {
+            stage,
+            routed_urls: &routed_urls,
+            task_ctx: ctx,
+            metrics,
+            metrics_store: task_metrics.as_ref(),
+            join_set: &mut join_set,
+        })?;
 
         Ok(Transformed::yes(plan.with_input_stage(Stage::Remote(
             RemoteStage {

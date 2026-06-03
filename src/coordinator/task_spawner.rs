@@ -43,14 +43,14 @@ use uuid::Uuid;
 /// Metrics that measure network details about communications between [DistributedExec] and a
 /// worker.
 #[derive(Clone)]
-pub(super) struct CoordinatorToWorkerMetrics {
+pub(crate) struct CoordinatorToWorkerMetrics {
     pub(super) plan_bytes_sent: Count,
     pub(super) plan_send_latency: Arc<LatencyMetric>,
     pub(super) instantiation_time: u64,
 }
 
 impl CoordinatorToWorkerMetrics {
-    pub(super) fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
+    pub(crate) fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
         Self {
             // Metric that measures to total sum of bytes worth of subplans sent.
             plan_bytes_sent: MetricBuilder::new(metrics)
@@ -75,7 +75,7 @@ impl CoordinatorToWorkerMetrics {
 /// - Building tasks that communicate a serialized plan to multiple workers for further execution.
 /// - Building tasks that stream partition feeds from local [WorkUnitFeedExec] nodes to their
 ///   remote counterparts.
-pub(super) struct CoordinatorToWorkerTaskSpawner<'a> {
+pub(crate) struct CoordinatorToWorkerTaskSpawner<'a> {
     plan: &'a Arc<dyn ExecutionPlan>,
     query_id: Uuid,
     stage_id: usize,
@@ -89,7 +89,7 @@ pub(super) struct CoordinatorToWorkerTaskSpawner<'a> {
 impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
     /// Builds a new [CoordinatorToWorkerTaskSpawner] based on the [Stage] that needs to be
     /// fanned out to multiple workers.
-    pub(super) fn new(
+    pub(crate) fn new(
         stage: &'a LocalStage,
         metrics: &'a CoordinatorToWorkerMetrics,
         task_metrics: &'a Option<Arc<MetricsStore>>,
@@ -111,7 +111,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
     /// Sends a serialized plan to a specific worker and sets up the bidirectional gRPC stream.
     /// Returns the sender for outbound coordinator-to-worker messages and the receiver for
     /// inbound worker-to-coordinator messages.
-    pub(super) fn send_plan_task(
+    pub(crate) fn send_plan_task(
         &mut self,
         ctx: Arc<TaskContext>,
         task_i: usize,
@@ -223,7 +223,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         Ok((coordinator_to_worker_tx, worker_to_coordinator_rx))
     }
 
-    pub(super) fn metrics_collection_task(
+    pub(crate) fn metrics_collection_task(
         &mut self,
         task_i: usize,
         mut worker_to_coordinator_rx: UnboundedReceiver<pb::WorkerToCoordinatorMsg>,
@@ -254,7 +254,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
     /// inner [WorkUnitFeeds] over the network to their remote counterparts.
     ///
     /// Once this function is called, all the [WorkUnitFeedExec]s feeds will be consumed.
-    pub(super) fn work_unit_feed_task(
+    pub(crate) fn work_unit_feed_task(
         &mut self,
         ctx: Arc<TaskContext>,
         task_i: usize,
@@ -338,7 +338,7 @@ impl Drop for LatencyMetric {
 }
 
 impl LatencyMetric {
-    pub(super) fn new(
+    pub(crate) fn new(
         name: impl Display,
         builder: impl Fn(MetricBuilder) -> MetricBuilder,
         metrics: &ExecutionPlanMetricsSet,

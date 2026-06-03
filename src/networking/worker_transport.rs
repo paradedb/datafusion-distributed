@@ -63,6 +63,10 @@ pub(crate) struct WorkerTransportExtension(
 struct UnsetWorkerTransport;
 
 #[cfg(not(feature = "flight"))]
+const UNSET_TRANSPORT_MSG: &str = "no WorkerTransport registered: the crate was built without the `flight` feature, so register \
+     one via DistributedExt::with_distributed_worker_transport";
+
+#[cfg(not(feature = "flight"))]
 impl WorkerTransport for UnsetWorkerTransport {
     fn open(
         &self,
@@ -72,9 +76,20 @@ impl WorkerTransport for UnsetWorkerTransport {
         _ctx: &Arc<TaskContext>,
         _metrics: &datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet,
     ) -> datafusion::common::Result<Box<dyn crate::WorkerConnection + Send + Sync>> {
-        datafusion::common::internal_err!(
-            "no WorkerTransport registered: the crate was built without the `flight` feature, \
-             so register one via DistributedExt::with_distributed_worker_transport"
-        )
+        datafusion::common::internal_err!("{UNSET_TRANSPORT_MSG}")
+    }
+
+    fn dispatch(&self) -> &dyn crate::WorkerDispatch {
+        self
+    }
+}
+
+#[cfg(not(feature = "flight"))]
+impl crate::WorkerDispatch for UnsetWorkerTransport {
+    fn dispatch(
+        &self,
+        _request: crate::WorkerDispatchRequest<'_>,
+    ) -> datafusion::common::Result<()> {
+        datafusion::common::internal_err!("{UNSET_TRANSPORT_MSG}")
     }
 }

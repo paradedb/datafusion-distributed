@@ -21,7 +21,7 @@ mod worker_service;
 pub use flight::FlightWorkerTransport;
 #[cfg(feature = "flight")]
 pub(crate) use single_write_multi_read::SingleWriteMultiRead;
-pub use transport::{WorkerConnection, WorkerTransport};
+pub use transport::{WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerTransport};
 #[cfg(feature = "flight")]
 pub(crate) use worker_connection_pool::LocalWorkerContext;
 pub(crate) use worker_connection_pool::WorkerConnectionPool;

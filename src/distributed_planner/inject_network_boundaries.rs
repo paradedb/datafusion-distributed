@@ -158,13 +158,6 @@ struct Context<'a> {
 impl<'a> Context<'a> {
     fn max_tasks(&self) -> Result<usize> {
         Ok(match self.d_cfg.max_tasks_per_stage {
-            0 if self.d_cfg.in_process_mode => {
-                // In-process embedders don't address workers by URL, so we don't need a
-                // `WorkerResolver` to derive the cap. `usize::MAX` lets the estimator alone
-                // decide per-stage task counts. An explicit `max_tasks_per_stage` still falls
-                // through to the `v => v` arm.
-                usize::MAX
-            }
             0 => self
                 .d_cfg
                 .__private_worker_resolver

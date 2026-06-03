@@ -103,13 +103,14 @@ impl DistributedExec {
             .await;
     }
 
-    /// Runs the lazy plan-prep step and returns the prepared inner plan, discarding the `JoinSet`
-    /// of coordinator-to-worker gRPC tasks. Intended for embedders running with
-    /// `in_process_mode = true`: the gRPC tasks are no-ops (see
-    /// [`crate::coordinator::prepare_static_plan`]), and the embedder owns its own dispatcher, so
-    /// it only needs the post-prepare plan tree with all `Stage::Local` boundaries converted to
-    /// `Stage::Remote`. Calling this with `in_process_mode = false` still works but spawns the
-    /// gRPC tasks and drops them, which is almost certainly not what the caller wants.
+    /// Prepares the plan for in-process execution through the registered [`crate::WorkerTransport`]
+    /// and returns the head stage, ready to `execute()`.
+    ///
+    /// For embedders that drive worker fragments themselves (PG parallel workers, threads) instead
+    /// of dispatching plans over the wire. Each network boundary is converted to a remote stage so
+    /// it routes through the transport's `open()`; the transport's `dispatch()` does whatever the
+    /// embedder needs (a no-op when its workers already hold the plan). The background metrics
+    /// tasks are dropped, since an embedded transport has no coordinator channel to collect from.
     pub fn prepare_in_process_plan(
         &self,
         ctx: &Arc<TaskContext>,

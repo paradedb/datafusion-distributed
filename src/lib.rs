@@ -1,4 +1,9 @@
 #![deny(clippy::all)]
+// With `flight` off there is no built-in transport, so the worker-side serve/execute path and the
+// coordinator metrics back-channel are compiled but dormant until an embedder registers its own
+// transport. Keep that machinery in the crate (a non-Flight transport builds on it) without warning
+// about it being unreached in this configuration.
+#![cfg_attr(not(feature = "flight"), allow(dead_code))]
 
 mod common;
 mod config_extension_ext;
@@ -11,6 +16,7 @@ mod worker;
 
 mod distributed_planner;
 mod networking;
+#[cfg(feature = "flight")]
 mod observability;
 mod protobuf;
 pub use protobuf::DistributedCodec;
@@ -36,17 +42,21 @@ pub use metrics::{
     MinLatencyMetric, P50LatencyMetric, P75LatencyMetric, P95LatencyMetric, P99LatencyMetric,
     rewrite_distributed_plan_with_metrics,
 };
+#[cfg(feature = "flight")]
 pub use networking::{
-    BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, WorkerResolver,
-    create_worker_client, get_distributed_channel_resolver, get_distributed_worker_resolver,
+    BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, create_worker_client,
+    get_distributed_channel_resolver,
 };
+pub use networking::{WorkerResolver, get_distributed_worker_resolver};
 pub use stage::{
     DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
 };
 pub use work_unit_feed::{
     DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
 };
+#[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
+#[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
 pub use worker::{
@@ -54,6 +64,7 @@ pub use worker::{
     Worker, WorkerQueryContext, WorkerSessionBuilder,
 };
 
+#[cfg(feature = "flight")]
 pub use observability::{
     GetClusterWorkersRequest, GetClusterWorkersResponse, GetTaskProgressRequest,
     GetTaskProgressResponse, ObservabilityService, ObservabilityServiceClient,
@@ -61,7 +72,7 @@ pub use observability::{
     TaskStatus, WorkerMetrics,
 };
 
-#[cfg(any(feature = "integration", test))]
+#[cfg(all(feature = "flight", any(feature = "integration", test)))]
 pub use execution_plans::benchmarks::{
     LocalRepartitionBench, LocalRepartitionFixture, LocalRepartitionMode, ShuffleBench,
     ShuffleFixture, TransportBench, TransportBenchMode, TransportFixture,

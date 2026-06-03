@@ -5,6 +5,7 @@ mod work_unit_feed;
 mod work_unit_feed_provider;
 mod work_unit_feed_registry;
 
+#[cfg(feature = "flight")]
 pub(crate) use remote_work_unit_feed::{
     RemoteWorkUnitFeedRegistry, build_work_unit_msg, set_work_unit_received_time,
     set_work_unit_send_time,

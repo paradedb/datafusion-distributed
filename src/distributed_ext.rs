@@ -1,15 +1,16 @@
+#[cfg(feature = "flight")]
+use crate::ChannelResolver;
 use crate::config_extension_ext::{
     set_distributed_option_extension, set_distributed_option_extension_from_headers,
 };
 use crate::distributed_planner::set_distributed_task_estimator;
-use crate::networking::{set_distributed_channel_resolver, set_distributed_worker_resolver};
+#[cfg(feature = "flight")]
+use crate::networking::set_distributed_channel_resolver;
+use crate::networking::set_distributed_worker_resolver;
 use crate::passthrough_headers::set_passthrough_headers;
 use crate::protobuf::{set_distributed_user_codec, set_distributed_user_codec_arc};
 use crate::work_unit_feed::set_distributed_work_unit_feed;
-use crate::{
-    ChannelResolver, DistributedConfig, TaskEstimator, WorkUnitFeed, WorkUnitFeedProvider,
-    WorkerResolver,
-};
+use crate::{DistributedConfig, TaskEstimator, WorkUnitFeed, WorkUnitFeedProvider, WorkerResolver};
 use arrow_ipc::CompressionType;
 use datafusion::common::DataFusionError;
 use datafusion::config::ConfigExtension;
@@ -273,12 +274,14 @@ pub trait DistributedExt: Sized {
     ///         .build())
     /// }
     /// ```
+    #[cfg(feature = "flight")]
     fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(
         self,
         resolver: T,
     ) -> Self;
 
     /// Same as [DistributedExt::with_distributed_channel_resolver] but with an in-place mutation.
+    #[cfg(feature = "flight")]
     fn set_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(
         &mut self,
         resolver: T,
@@ -612,6 +615,7 @@ impl DistributedExt for SessionConfig {
         set_distributed_worker_resolver(self, resolver);
     }
 
+    #[cfg(feature = "flight")]
     fn set_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(
         &mut self,
         resolver: T,
@@ -752,6 +756,7 @@ impl DistributedExt for SessionConfig {
             #[expr($;self)]
             fn with_distributed_worker_resolver<T: WorkerResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
 
+            #[cfg(feature = "flight")]
             #[call(set_distributed_channel_resolver)]
             #[expr($;self)]
             fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
@@ -844,7 +849,9 @@ impl DistributedExt for SessionStateBuilder {
             #[expr($;self)]
             fn with_distributed_worker_resolver<T: WorkerResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
 
+            #[cfg(feature = "flight")]
             fn set_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(&mut self, resolver: T);
+            #[cfg(feature = "flight")]
             #[call(set_distributed_channel_resolver)]
             #[expr($;self)]
             fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
@@ -955,7 +962,9 @@ impl DistributedExt for SessionState {
             #[expr($;self)]
             fn with_distributed_worker_resolver<T: WorkerResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
 
+            #[cfg(feature = "flight")]
             fn set_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(&mut self, resolver: T);
+            #[cfg(feature = "flight")]
             #[call(set_distributed_channel_resolver)]
             #[expr($;self)]
             fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
@@ -1066,7 +1075,9 @@ impl DistributedExt for SessionContext {
             #[expr($;self)]
             fn with_distributed_worker_resolver<T: WorkerResolver + Send + Sync + 'static>(self, resolver: T) -> Self;
 
+            #[cfg(feature = "flight")]
             fn set_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(&mut self, resolver: T);
+            #[cfg(feature = "flight")]
             #[call(set_distributed_channel_resolver)]
             #[expr($;self)]
             fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(self, resolver: T) -> Self;

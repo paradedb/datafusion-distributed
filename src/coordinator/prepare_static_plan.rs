@@ -1,5 +1,6 @@
 use crate::coordinator::MetricsStore;
 use crate::coordinator::distributed::PreparedPlan;
+#[cfg(feature = "flight")]
 use crate::coordinator::task_spawner::{
     CoordinatorToWorkerMetrics, CoordinatorToWorkerTaskSpawner,
 };
@@ -37,8 +38,14 @@ pub(super) fn prepare_static_plan(
 
     let available_urls = worker_resolver.get_urls()?;
 
+    // `metrics` / `task_metrics` only feed the gRPC plan-send and metrics-collection tasks.
+    #[cfg(not(feature = "flight"))]
+    let _ = (metrics, task_metrics);
+    #[cfg(feature = "flight")]
     let metrics = CoordinatorToWorkerMetrics::new(metrics);
 
+    // `join_set` only receives the gRPC dispatch tasks, so it is mutated only under `flight`.
+    #[cfg_attr(not(feature = "flight"), allow(unused_mut))]
     let mut join_set = JoinSet::new();
     let prepared = Arc::clone(base_plan).transform_up(|plan| {
         // The following logic is just applied on network boundaries.
@@ -53,6 +60,7 @@ pub(super) fn prepare_static_plan(
         let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
         let task_estimator = &d_cfg.__private_task_estimator;
 
+        #[cfg(feature = "flight")]
         let mut spawner =
             CoordinatorToWorkerTaskSpawner::new(stage, &metrics, task_metrics, ctx, &mut join_set)?;
 
@@ -85,11 +93,17 @@ pub(super) fn prepare_static_plan(
         let mut workers = Vec::with_capacity(stage.tasks);
         for (i, routed_url) in routed_urls.into_iter().enumerate() {
             workers.push(routed_url.clone());
-            // Spawn a task that sends the subplan to the chosen URL.
-            // There will be as many spawned tasks as workers.
-            let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;
-            spawner.metrics_collection_task(i, worker_rx);
-            spawner.work_unit_feed_task(Arc::clone(ctx), i, tx)?;
+            // Dispatch the subplan to the chosen worker over gRPC, one task per worker. Absent when
+            // Flight is compiled out; the URL still lands on `RemoteStage` because a transport keys
+            // off `target_task` (the index into `RemoteStage::workers`).
+            #[cfg(feature = "flight")]
+            {
+                let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;
+                spawner.metrics_collection_task(i, worker_rx);
+                spawner.work_unit_feed_task(Arc::clone(ctx), i, tx)?;
+            }
+            #[cfg(not(feature = "flight"))]
+            let _ = i;
         }
 
         Ok(Transformed::yes(plan.with_input_stage(Stage::Remote(

@@ -1,5 +1,6 @@
 use crate::DistributedConfig;
 use crate::config_extension_ext::set_distributed_option_extension;
+use crate::networking::ChannelResolverExtension;
 use crate::worker::generated::worker::worker_service_client::WorkerServiceClient;
 use async_trait::async_trait;
 use datafusion::common::{DataFusionError, config_datafusion_err, exec_datafusion_err};
@@ -100,9 +101,6 @@ pub type BoxCloneSyncChannel = tower::util::BoxCloneSyncService<
 >;
 
 type ChannelCacheValue = Shared<BoxFuture<BoxCloneSyncChannel, Arc<DataFusionError>>>;
-
-#[derive(Clone, Default)]
-pub(crate) struct ChannelResolverExtension(Option<Arc<dyn ChannelResolver + Send + Sync>>);
 
 /// Default implementation of a [ChannelResolver] that connects to the workers given the URL once
 /// and stores the connection instance in a TTI cache.

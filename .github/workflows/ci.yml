@@ -60,7 +60,9 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: testdata/tpcds/main.zip
-          key: "main.zip"
+          # Key off the source that pins the data URL, so a re-pin re-downloads instead of
+          # serving a stale main.zip.
+          key: tpcds-data-${{ hashFiles('benchmarks/src/datasets/tpcds.rs') }}
       - run: cargo test --features tpcds --test tpcds_correctness_test shard${{ matrix.shard }}
 
   tpcds-plans-test:
@@ -71,7 +73,9 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: testdata/tpcds/main.zip
-          key: "main.zip"
+          # Key off the source that pins the data URL, so a re-pin re-downloads instead of
+          # serving a stale main.zip.
+          key: tpcds-data-${{ hashFiles('benchmarks/src/datasets/tpcds.rs') }}
       - run: cargo test --features tpcds --test tpcds_plans_test
 
   clickbench-test:

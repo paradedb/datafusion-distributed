@@ -15,7 +15,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const URL: &str = "https://github.com/apache/datafusion-benchmarks/archive/refs/heads/main.zip";
+// Pin to a commit so the TPC-DS schema stays fixed. An unpinned `main` lets the upstream
+// data change column types and break the plan snapshots without a code change on our side.
+const URL: &str = "https://github.com/apache/datafusion-benchmarks/archive/cb12c981e6608e0f2dcf919956ada8f1f1622d72.zip";
 
 pub fn get_queries() -> Vec<String> {
     common::get_queries("testdata/tpcds/queries")

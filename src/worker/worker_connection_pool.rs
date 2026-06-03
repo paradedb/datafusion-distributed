@@ -1,7 +1,9 @@
 use crate::common::{OnceLockResult, serialize_uuid};
+use crate::networking::get_distributed_worker_transport;
 use crate::stage::RemoteStage;
 use crate::worker::generated::worker::{ExecuteTaskRequest, TaskKey};
 use crate::worker::impl_execute_task::execute_local_task;
+use crate::worker::transport::{WorkerConnection, WorkerTransport};
 use crate::worker::worker_service::TaskDataEntries;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::runtime::SpawnedTask;
@@ -133,42 +135,15 @@ impl WorkerConnectionPool {
         };
 
         let conn = worker_connection.get_or_init(|| {
-            let Some(target_url) = input_stage.workers.get(target_task) else {
-                internal_err!("input_stage.workers[{target_task}] out of range.")?
-            };
-            if let Some(lw_ctx) = ctx.session_config().get_extension::<LocalWorkerContext>()
-                && &lw_ctx.self_url == target_url
-            {
-                // Instead of making a gRPC call to ourselves, better to just use local comms.
-                Ok(Box::new(LocalWorkerConnection::init(
+            get_distributed_worker_transport(ctx)
+                .open(
                     input_stage,
                     target_partitions,
                     target_task,
-                    lw_ctx,
+                    ctx,
                     &self.metrics,
-                )) as Box<_>)
-            } else {
-                // We are trying to reach a URL different from ours, so use normal gRPC streams.
-                #[cfg(feature = "flight")]
-                {
-                    RemoteWorkerConnection::init(
-                        input_stage,
-                        target_partitions,
-                        target_task,
-                        ctx,
-                        &self.metrics,
-                    )
-                    .map(|v| Box::new(v) as Box<_>)
-                    .map_err(Arc::new)
-                }
-                // Without the `flight` feature there is no remote transport, so any
-                // cross-worker route fails here.
-                #[cfg(not(feature = "flight"))]
-                internal_err!(
-                    "cannot reach worker at {target_url}: built without the `flight` feature"
                 )
                 .map_err(Arc::new)
-            }
         });
 
         match conn {
@@ -180,14 +155,6 @@ impl WorkerConnectionPool {
 
 #[cfg(feature = "flight")]
 type WorkerMsg = Result<(FlightData, FlightAppMetadata), Status>;
-
-/// Abstraction that allows treating remote and local comms as equal. Network boundaries do not
-/// care if the stream comes over the wire or locally.
-pub(crate) trait WorkerConnection {
-    /// Streams the specified partition. Consumers do not care if the implementation pulls data
-    /// from in-memory or from local comms.
-    fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>>;
-}
 
 /// Represents a connection to one [Worker]. Network boundaries will use this for streaming
 /// data from single partitions while the actual network communication is handling all the partitions
@@ -201,7 +168,7 @@ pub(crate) trait WorkerConnection {
 /// partition VS a single gRPC stream interleaving multiple partitions. The whole serialized plan
 /// needs to be sent over the wire on every gRPC call, so the less gRPC calls we do the better.
 #[cfg(feature = "flight")]
-struct RemoteWorkerConnection {
+pub(super) struct RemoteWorkerConnection {
     task: Arc<SpawnedTask<()>>,
     not_consumed_streams: Arc<AtomicUsize>,
     cancel_token: CancellationToken,
@@ -218,7 +185,7 @@ struct RemoteWorkerConnection {
 
 #[cfg(feature = "flight")]
 impl RemoteWorkerConnection {
-    fn init(
+    pub(super) fn init(
         input_stage: &RemoteStage,
         target_partition_range: Range<usize>,
         target_task: usize,
@@ -496,7 +463,7 @@ pub(crate) struct LocalWorkerConnection {
 }
 
 impl LocalWorkerConnection {
-    fn init(
+    pub(super) fn init(
         input_stage: &RemoteStage,
         target_partition_range: Range<usize>,
         target_task: usize,

@@ -31,6 +31,10 @@
 // and an in-process instantiation in a follow-up, which is when they become reachable from the
 // rest of the crate.
 #[allow(dead_code)]
+mod dsm;
+#[allow(dead_code)]
+mod mesh;
+#[allow(dead_code)]
 mod mpsc_ring;
 #[allow(dead_code)]
 mod transport;

@@ -27,7 +27,10 @@
 //! distributed queries through the transport in this crate's CI, so an upstream rebase that
 //! breaks the `WorkerTransport` contract fails here, before any downstream embedder rebuilds.
 
-// The ring's API is exercised by its own tests; it gets wired into the transport (mesh, drain,
-// `WorkerTransport` impl) in a follow-up, which is when these become reachable from the crate.
+// These layers are exercised by their own tests; they get wired into the `WorkerTransport` impl
+// and an in-process instantiation in a follow-up, which is when they become reachable from the
+// rest of the crate.
 #[allow(dead_code)]
 mod mpsc_ring;
+#[allow(dead_code)]
+mod transport;

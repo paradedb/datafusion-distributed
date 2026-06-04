@@ -517,7 +517,7 @@ impl MppSender {
         }
     }
 
-    /// Attach a [`CooperativeDrainSet`] so [`Self::send_batch_traced`]'s spin
+    /// Attach a [`CooperativeDrainSet`] so `Self::send_batch_traced`'s spin
     /// can drain inbound peer traffic while waiting for outbound space.
     /// Required for peer-mesh fragments where every worker is both sender and
     /// consumer; without it, symmetric full-queue stalls deadlock the

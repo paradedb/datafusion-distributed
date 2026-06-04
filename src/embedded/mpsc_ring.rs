@@ -74,7 +74,7 @@ use std::sync::Arc;
 /// Wakes the ring's single consumer after a producer publishes a frame.
 ///
 /// The ring is transport-agnostic: the consumer registers an opaque `u64` token via
-/// [`DsmMpscReceiver::set_receiver`], and each publishing producer hands that token to this
+/// `DsmMpscReceiver::set_receiver`, and each publishing producer hands that token to this
 /// hook. An embedder over PostgreSQL shared memory packs `(pgprocno, pid)` into the token and
 /// `SetLatch`es the backend; an in-process embedder packs a registry key and unparks the
 /// consumer thread. The token is stored in the ring header (shared memory), so the hook must be
@@ -84,7 +84,7 @@ pub trait Wakeup: Send + Sync {
 }
 
 /// Sentinel token meaning "no consumer registered". Producers skip the wake when the stored
-/// token equals this; [`create_at`] initializes the ring to it.
+/// token equals this; `create_at` initializes the ring to it.
 pub const NO_RECEIVER_TOKEN: u64 = u64::MAX;
 
 /// Reserved byte at the start of every slot. Sized so payload + header fits in

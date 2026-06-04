@@ -27,19 +27,19 @@
 //! distributed queries through the transport in this crate's CI, so an upstream rebase that
 //! breaks the `WorkerTransport` contract fails here, before any downstream embedder rebuilds.
 
-// These layers are exercised by their own tests; they get wired into the `WorkerTransport` impl
-// and an in-process instantiation in a follow-up, which is when they become reachable from the
-// rest of the crate.
-#[allow(dead_code)]
 mod dsm;
-#[allow(dead_code)]
 mod mesh;
-#[allow(dead_code)]
 mod mpsc_ring;
-#[allow(dead_code)]
 mod runtime;
-#[allow(dead_code)]
+mod setup;
 mod transport;
+
+// Curated public surface an embedder consumes. The embedder allocates the shared buffer and
+// supplies the two seams (`Wakeup`, `Interrupt`); everything else is built here.
+pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
+pub use runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
+pub use setup::{dsm_region_bytes, leader_setup, run_worker_fragment, worker_setup};
+pub use transport::{CooperativeDrainSet, Interrupt, MppFrameHeader, MppSender, NoInterrupt};
 
 // In-process instantiation + the end-to-end test that runs a real distributed query through the
 // transport with no Postgres. Test-only: it's how an upstream rebase that breaks the transport

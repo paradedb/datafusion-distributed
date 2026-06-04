@@ -880,7 +880,7 @@ mod tests {
     /// injected seam carries a real cross-thread notification with no PG / `SetLatch`.
     #[derive(Default)]
     struct ThreadWakeup {
-        threads: std::sync::Mutex<std::collections::HashMap<u64, std::thread::Thread>>,
+        threads: std::sync::Mutex<datafusion::common::HashMap<u64, std::thread::Thread>>,
         wakes: AtomicUsize,
     }
     impl ThreadWakeup {

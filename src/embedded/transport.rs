@@ -429,6 +429,21 @@ pub trait CooperativeDrainSet: Send + Sync {
     }
 }
 
+/// Cancellation seam, checked at the transport's block points (the send spin and the consumer
+/// pull loop). An in-process embedder uses the default no-op or a cancellation token; a Postgres
+/// embedder runs `check_for_interrupts!`, which longjmps out of the backend on cancel.
+pub trait Interrupt: Send + Sync {
+    fn check(&self) -> Result<(), DataFusionError>;
+}
+
+/// No-op interrupt for embedders that have no external cancellation source.
+pub struct NoInterrupt;
+impl Interrupt for NoInterrupt {
+    fn check(&self) -> Result<(), DataFusionError> {
+        Ok(())
+    }
+}
+
 impl CooperativeDrainSet for DrainHandle {
     fn try_drain_pass(&self) -> Result<(), DataFusionError> {
         DrainHandle::try_drain_pass(self)

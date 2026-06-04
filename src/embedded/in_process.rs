@@ -1,0 +1,681 @@
+// Copyright (c) 2023-2026 ParadeDB, Inc.
+//
+// This file is part of ParadeDB - Postgres for Search and Analytics
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+//! In-process instantiation of the embedded transport, plus an end-to-end test.
+//!
+//! A real distributed query runs through [`ShmMqWorkerTransport`] with no Postgres and no Flight.
+//! This is the rebase-safety payoff: a single process plays every role that production splits
+//! across the leader (build and slice the plan), Postgres (allocate the DSM region, launch the
+//! workers), and each worker (run a producer fragment and push it through the mesh). If an upstream
+//! change breaks the `WorkerTransport` contract, the boundary routing API, or
+//! `prepare_in_process_plan`, the test below fails here, before any downstream embedder rebuilds.
+//!
+//! What's faithful vs. simplified relative to the Postgres path:
+//! - Faithful: the DSM ring mesh, the framing, the cooperative drain, `ShmMqWorkerTransport::open`,
+//!   the per-fragment routing (`collect_dispatched_stages`), `run_worker_fragment`, and the leader
+//!   consuming via `prepare_in_process_plan`.
+//! - Simplified: the producer subplans are shared as `Arc`s rather than bincode-serialized through
+//!   the DSM plan region (all roles live in one address space), the wakeup is a no-op (the
+//!   cooperative consumer yields rather than parking), and there's no cancellation source.
+
+use std::alloc::Layout;
+use std::ffi::c_void;
+use std::sync::Arc;
+
+use datafusion::arrow::array::{Int32Array, RecordBatch};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::runtime::JoinSet;
+use datafusion::common::{DataFusionError, Result};
+use datafusion::config::ConfigOptions;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::{SessionStateBuilder, TaskContext};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::prelude::{SessionConfig, SessionContext};
+use futures::stream::StreamExt;
+
+use crate::{
+    DistributedConfig, DistributedExec, DistributedExt, DistributedLeafExec, DistributedTaskContext,
+    NetworkBoundaryExt, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,
+    SessionStateBuilderExt, TaskEstimation, TaskEstimator,
+};
+
+use super::dsm::{
+    DsmLayout, compute_dsm_layout, leader_init, peer_proc_for_index, worker_attach,
+};
+use super::mesh::{DsmInboxReceiver, DsmInboxSender};
+use super::mpsc_ring::{DsmMpscSender, Wakeup};
+use super::runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
+use super::transport::{
+    BatchChannelSender, CooperativeDrainSet, DrainHandle, MppFrameHeader, MppReceiver, MppSender,
+    NoInterrupt, SELF_LOOP_CAPACITY, SendBatchStats, in_proc_channel,
+};
+
+/// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
+/// batches, so backpressure never kicks in. Production sizes this from `paradedb.mpp_queue_size`.
+const IN_PROCESS_QUEUE_BYTES: usize = 1 << 20;
+
+/// No-op wakeup. The cooperative consumer in [`super::runtime::ShmMqWorkerConnection`] yields rather
+/// than parking, so a publish never needs to wake a blocked thread. The real cross-thread wakeup
+/// seam is covered by `mpsc_ring`'s `injected_wakeup_unparks_blocked_consumer`.
+struct NoopWakeup;
+impl Wakeup for NoopWakeup {
+    fn wake(&self, _token: u64) {}
+}
+
+/// Owns the single heap buffer that stands in for the PG DSM segment. Every proc (leader + workers)
+/// reads and writes the same region through raw pointers; the lock-free rings make concurrent
+/// access sound. Kept alive in the harness until after all producer tasks join.
+struct HeapRegion {
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+impl HeapRegion {
+    fn new(bytes: usize) -> Self {
+        // 64-byte alignment so each per-inbox ring (repr(C, align(64))) lands on a cache line; the
+        // dsm layout aligns the offsets within the region, but only if the base is aligned too.
+        let layout = Layout::from_size_align(bytes, 64).expect("dsm region layout");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "dsm region alloc failed");
+        Self { ptr, layout }
+    }
+
+    fn base(&self) -> *mut c_void {
+        self.ptr as *mut c_void
+    }
+}
+
+impl Drop for HeapRegion {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+/// Send wrapper so the leader-init / worker-attach raw base pointer can be handed to the per-proc
+/// setup. All setup runs on the harness thread, so the pointer never crosses into a spawned task;
+/// only the resulting `Send` meshes and senders do.
+#[derive(Clone, Copy)]
+struct SharedBase(*mut c_void);
+unsafe impl Send for SharedBase {}
+
+/// Wrap each peer-indexed `DsmMpscSender` into an outbound `MppSender` keyed by destination proc.
+/// The dispatcher `clone_with_header`s these per output partition before sending, so the placeholder
+/// header is never observed on the wire. Slot `this_proc` stays `None` until the self-loop install.
+fn build_outbound_senders(
+    this_proc: u32,
+    total_procs: u32,
+    peer_senders: Vec<DsmMpscSender>,
+) -> Vec<Option<MppSender>> {
+    let mut senders: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
+    for (peer_idx, dsm_send) in peer_senders.into_iter().enumerate() {
+        let target_proc = peer_proc_for_index(this_proc, peer_idx as u32);
+        let shared: Arc<dyn BatchChannelSender> = Arc::new(DsmInboxSender::new(dsm_send));
+        senders[target_proc as usize] =
+            Some(MppSender::with_header(shared, MppFrameHeader::batch(0, 0, this_proc)));
+    }
+    senders
+}
+
+/// Initialize the DSM region as the leader (proc 0) and return its consumer-only mesh.
+///
+/// # Safety
+/// `base` must point at an uninitialized region of at least `layout.region_total` bytes.
+unsafe fn leader_setup(
+    base: *mut c_void,
+    layout: &DsmLayout,
+    wakeup: Arc<dyn Wakeup>,
+) -> Arc<MppMesh> {
+    let total_procs = layout.n_procs;
+    let attach = unsafe { leader_init(base, layout, &[], Arc::clone(&wakeup)) }
+        .expect("leader_init");
+    let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
+    inbox.set_receiver(receiver_token(0));
+    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(inbox))]));
+    // The leader is consumer-only; it never hosts a producer fragment.
+    drop(attach.outbound_senders);
+    Arc::new(MppMesh::new(0, total_procs, inbound, Arc::new(NoInterrupt)))
+}
+
+/// Attach to the leader-initialized region as a worker proc and return its mesh + outbound senders.
+///
+/// # Safety
+/// `base`/`region_total` must match the region the leader initialized.
+unsafe fn worker_setup(
+    base: *mut c_void,
+    region_total: u64,
+    proc_idx: u32,
+    wakeup: Arc<dyn Wakeup>,
+) -> (Arc<MppMesh>, Vec<Option<MppSender>>) {
+    let (header, _plan_bytes, attach) =
+        unsafe { worker_attach(base, region_total, proc_idx, Arc::clone(&wakeup)) }
+            .expect("worker_attach");
+    let total_procs = header.n_procs;
+
+    let mut outbound = build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
+
+    // Self-loop in-proc channel: peer-mesh routing can land a producer and its consumer on the same
+    // proc, and an MPSC inbox has no slot for a proc sending to itself. The unified drain pulls from
+    // both the DSM inbox and this channel.
+    let (self_tx, self_rx) = in_proc_channel(SELF_LOOP_CAPACITY);
+    let self_tx_arc: Arc<dyn BatchChannelSender> = Arc::new(self_tx);
+    outbound[proc_idx as usize] =
+        Some(MppSender::with_header(self_tx_arc, MppFrameHeader::batch(0, 0, proc_idx)));
+
+    let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
+    inbox.set_receiver(receiver_token(proc_idx));
+    let inbound = Arc::new(DrainHandle::cooperative(vec![
+        MppReceiver::new(Box::new(inbox)),
+        MppReceiver::new(Box::new(self_rx)),
+    ]));
+    let mesh = Arc::new(MppMesh::new(proc_idx, total_procs, inbound, Arc::new(NoInterrupt)));
+    (mesh, outbound)
+}
+
+/// Opaque, non-sentinel receiver token. `NoopWakeup` ignores the value; this just exercises the
+/// `set_receiver` path with something the producer won't skip as "no consumer registered".
+fn receiver_token(proc_idx: u32) -> u64 {
+    proc_idx as u64 + 1
+}
+
+// ---------------------------------------------------------------------------------------------
+// Leader-side producer-stage discovery (in-process port of pg_search's `collect_dispatched_stages`).
+// The crate's gRPC path keys dispatch on resolver URLs and never decides this; the shm_mq peers are
+// push-driven without URLs, so the embedder classifies each boundary's routing here.
+// ---------------------------------------------------------------------------------------------
+
+/// Routing rule for a producer fragment's output partitions.
+#[derive(Clone, Debug)]
+enum FragmentRouting {
+    /// Every output partition goes to one destination proc (a `NetworkCoalesceExec`, or the
+    /// top-level gather to the leader).
+    Coalesce { dest_proc: u32 },
+    /// Hash-partitioned mesh (`NetworkShuffleExec` / `NetworkBroadcastExec`): output partition `q`
+    /// goes to the consumer task the crate's `route_partition(q)` selects.
+    Hashed {
+        consumer_task: Vec<u32>,
+        broadcast: bool,
+    },
+}
+
+/// One producer stage to run, captured from a network boundary before `prepare_in_process_plan`
+/// converts its input stage to `Remote`.
+struct StageEntry {
+    stage_num: u32,
+    task_count: usize,
+    routing: FragmentRouting,
+    plan: Arc<dyn ExecutionPlan>,
+}
+
+/// Walk the distributed physical plan and collect every producer stage, once per boundary.
+fn collect_dispatched_stages(root: &Arc<dyn ExecutionPlan>, n_workers: u32) -> Vec<StageEntry> {
+    let mut out = Vec::new();
+    collect_stages(root, n_workers, /* nested = */ false, &mut out);
+    out
+}
+
+fn collect_stages(
+    plan: &Arc<dyn ExecutionPlan>,
+    n_workers: u32,
+    nested: bool,
+    out: &mut Vec<StageEntry>,
+) {
+    if let Some(nb) = plan.as_ref().as_network_boundary() {
+        let stage = nb.input_stage();
+        let stage_id = stage.num() as u32;
+        let route_consumer_tasks = || {
+            let n_out = stage
+                .local_plan()
+                .map_or(0, |p| p.properties().partitioning.partition_count());
+            (0..n_out)
+                .map(|q| nb.route_partition(q).consumer_task as u32)
+                .collect::<Vec<u32>>()
+        };
+        let plan_any = plan.as_ref().as_any();
+        let routing = if plan_any.is::<NetworkCoalesceExec>() {
+            if nested {
+                FragmentRouting::Coalesce {
+                    dest_proc: proc_for_task(n_workers, 0),
+                }
+            } else {
+                FragmentRouting::Coalesce { dest_proc: 0 }
+            }
+        } else if plan_any.is::<NetworkShuffleExec>() {
+            assert!(nested, "top-level NetworkShuffleExec is unsupported");
+            FragmentRouting::Hashed {
+                consumer_task: route_consumer_tasks(),
+                broadcast: false,
+            }
+        } else if plan_any.is::<NetworkBroadcastExec>() {
+            assert!(nested, "top-level NetworkBroadcastExec is unsupported");
+            FragmentRouting::Hashed {
+                consumer_task: route_consumer_tasks(),
+                broadcast: true,
+            }
+        } else {
+            panic!("unrecognized network boundary {}", plan.name());
+        };
+
+        let task_count = stage.task_count();
+        if let Some(stage_plan) = stage.local_plan() {
+            out.push(StageEntry {
+                stage_num: stage_id,
+                task_count,
+                routing,
+                plan: Arc::clone(stage_plan),
+            });
+            // The boundary's children() returns [stage.plan], so descending here would double-count
+            // every nested stage. Recurse through the stage plan directly with nested = true.
+            collect_stages(stage_plan, n_workers, true, out);
+        }
+        return;
+    }
+    for child in plan.children() {
+        collect_stages(child, n_workers, nested, out);
+    }
+}
+
+/// One producer fragment assigned to a worker proc: a single task of a producer stage.
+struct FragmentAssignment {
+    stage_id: u32,
+    task_idx: usize,
+    task_count: usize,
+    plan: Arc<dyn ExecutionPlan>,
+    routing: FragmentRouting,
+}
+
+/// Expand the dispatched stages into the fragments `this_proc` owns under `proc_for_task`.
+fn fragments_for_proc(
+    entries: &[StageEntry],
+    this_proc: u32,
+    n_workers: u32,
+) -> Vec<FragmentAssignment> {
+    let mut out = Vec::new();
+    for entry in entries {
+        for task_idx in 0..entry.task_count {
+            if proc_for_task(n_workers, task_idx as u32) != this_proc {
+                continue;
+            }
+            // Broadcast caps its build subtree at task 0; the other tasks would re-emit the same
+            // canonical replica and the consumer's select_all would over-count.
+            if matches!(entry.routing, FragmentRouting::Hashed { broadcast: true, .. })
+                && task_idx != 0
+            {
+                continue;
+            }
+            out.push(FragmentAssignment {
+                stage_id: entry.stage_num,
+                task_idx,
+                task_count: entry.task_count,
+                plan: Arc::clone(&entry.plan),
+                routing: entry.routing.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Run a producer fragment plan to exhaustion, pushing every output batch through the matching
+/// per-partition sender (in-process port of pg_search's `run_worker_fragment`).
+async fn run_worker_fragment(
+    plan: Arc<dyn ExecutionPlan>,
+    senders: Vec<MppSender>,
+    ctx: Arc<TaskContext>,
+) -> Result<()> {
+    let n_partitions = plan.output_partitioning().partition_count();
+    if n_partitions != senders.len() {
+        return Err(DataFusionError::Internal(format!(
+            "run_worker_fragment: plan has {n_partitions} output partitions but {} senders",
+            senders.len()
+        )));
+    }
+    let senders: Vec<Arc<MppSender>> = senders.into_iter().map(Arc::new).collect();
+    let mut futures = Vec::with_capacity(n_partitions);
+    for (partition, sender) in senders.iter().enumerate() {
+        let plan = Arc::clone(&plan);
+        let ctx = Arc::clone(&ctx);
+        let sender = Arc::clone(sender);
+        futures.push(async move {
+            let mut stats = SendBatchStats::default();
+            let stream_result: Result<()> = async {
+                let mut stream = plan.execute(partition, ctx)?;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    sender.as_ref().send_batch_traced(&batch, &mut stats).await?;
+                }
+                Ok(())
+            }
+            .await;
+            // The shm_mq queue is shared across fragments, so dropping the sender doesn't end the
+            // channel; only the per-channel EOF frame does. Send it regardless of how the stream
+            // ended so the consumer's pull loop terminates.
+            let eof_result = sender.as_ref().send_eof_traced(&mut stats).await;
+            stream_result.and(eof_result)
+        });
+    }
+    let results = futures::future::join_all(futures).await;
+    drop(senders);
+    for r in results {
+        r?;
+    }
+    Ok(())
+}
+
+/// Build a fragment's `TaskContext`, carrying the right `DistributedTaskContext` so nested boundary
+/// nodes know their `(task_index, task_count)` and the worker session's resolver/transport ride
+/// along for `prepare_in_process_plan`.
+fn fragment_task_ctx(session: &SessionContext, task_index: usize, task_count: usize) -> Arc<TaskContext> {
+    let cfg = session
+        .state()
+        .config()
+        .clone()
+        .with_extension(Arc::new(DistributedTaskContext {
+            task_index,
+            task_count,
+        }));
+    Arc::new(TaskContext::default().with_session_config(cfg))
+}
+
+/// Run all fragments owned by one worker proc, then signal completion. Mirrors the body of
+/// pg_search's `run_mpp_worker`: build per-partition senders by routing, wrap each fragment in a
+/// fresh `DistributedExec` + `prepare_in_process_plan` (converting nested boundaries), and join.
+async fn run_worker_proc(
+    fragments: Vec<FragmentAssignment>,
+    outbound: Vec<Option<MppSender>>,
+    mesh: Arc<MppMesh>,
+    session: SessionContext,
+    n_workers: u32,
+) -> Result<()> {
+    let mut futures = Vec::with_capacity(fragments.len());
+    for fragment in &fragments {
+        let task_ctx = fragment_task_ctx(&session, fragment.task_idx, fragment.task_count);
+        let prepared = {
+            let dist = Arc::new(DistributedExec::new(Arc::clone(&fragment.plan)));
+            dist.prepare_in_process_plan(&task_ctx)?
+        };
+        let n_out = prepared.output_partitioning().partition_count();
+        let mut senders = Vec::with_capacity(n_out);
+        for q in 0..n_out {
+            let dest_proc = match &fragment.routing {
+                FragmentRouting::Coalesce { dest_proc } => *dest_proc,
+                FragmentRouting::Hashed { consumer_task, .. } => {
+                    proc_for_task(n_workers, consumer_task[q])
+                }
+            };
+            let base = outbound[dest_proc as usize]
+                .as_ref()
+                .expect("outbound sender for dest proc");
+            senders.push(
+                base.clone_with_header(MppFrameHeader::batch(
+                    fragment.stage_id,
+                    q as u32,
+                    mesh.this_proc,
+                ))
+                .with_cooperative_drain(Arc::clone(&mesh) as Arc<dyn CooperativeDrainSet>),
+            );
+        }
+        futures.push(run_worker_fragment(prepared, senders, task_ctx));
+    }
+    // Drop the originals so the only senders left are the per-partition clones owned by the
+    // fragment futures; otherwise the rings never observe the last-sender detach.
+    drop(outbound);
+    for r in futures::future::join_all(futures).await {
+        r?;
+    }
+    Ok(())
+}
+
+/// Splits an in-memory `DataSourceExec` leaf across tasks, the in-memory analog of the crate's
+/// `FileScanConfigTaskEstimator` (which only handles file scans). Each task reads a disjoint subset
+/// of the source's partitions, so a gather over the tasks reproduces the serial result exactly.
+#[derive(Debug)]
+struct MemShardEstimator {
+    n_tasks: usize,
+}
+
+impl MemShardEstimator {
+    fn mem_source(plan: &Arc<dyn ExecutionPlan>) -> Option<&MemorySourceConfig> {
+        plan.as_any()
+            .downcast_ref::<DataSourceExec>()?
+            .data_source()
+            .as_any()
+            .downcast_ref::<MemorySourceConfig>()
+    }
+}
+
+impl TaskEstimator for MemShardEstimator {
+    fn task_estimation(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        _cfg: &ConfigOptions,
+    ) -> Option<TaskEstimation> {
+        Self::mem_source(plan).map(|_| TaskEstimation::desired(self.n_tasks))
+    }
+
+    fn scale_up_leaf_node(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        task_count: usize,
+        _cfg: &ConfigOptions,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        if task_count <= 1 {
+            return None;
+        }
+        let mem = Self::mem_source(plan)?;
+        let parts = mem.partitions().to_vec();
+        let n_part = parts.len();
+        // The stored batches are unprojected; reuse the source's exact schema + projection so each
+        // variant's projected output schema matches the original leaf.
+        let unprojected_schema: SchemaRef = parts
+            .iter()
+            .flatten()
+            .next()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| plan.schema());
+        let projection = mem.projection().clone();
+        let variants = (0..task_count).map(|i| {
+            // Keep every variant at the original partition count (pad with empties) so
+            // DistributedLeafExec's same-partition-count contract holds; round-robin the
+            // non-empty partitions so each task reads a disjoint slice.
+            let per_task: Vec<Vec<RecordBatch>> = (0..n_part)
+                .map(|j| {
+                    if j % task_count == i {
+                        parts[j].clone()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            MemorySourceConfig::try_new_exec(&per_task, unprojected_schema.clone(), projection.clone())
+                .expect("memory variant") as Arc<dyn ExecutionPlan>
+        });
+        Some(Arc::new(DistributedLeafExec::new(Arc::clone(plan), variants)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::datasource::MemTable;
+    use futures::TryStreamExt;
+
+    /// Total procs = leader (proc 0) + `N_WORKERS` producers. With round-robin `proc_for_task`,
+    /// worker proc `p` runs producer task `p - 1`.
+    const N_WORKERS: u32 = 3;
+
+    fn table_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]))
+    }
+
+    /// `N_WORKERS` partitions, two rows each, so the shard estimator hands one partition per task.
+    fn table_partitions() -> Vec<Vec<RecordBatch>> {
+        let schema = table_schema();
+        (0..N_WORKERS as i32)
+            .map(|p| {
+                let ids = Int32Array::from(vec![p * 2, p * 2 + 1]);
+                let vals = Int32Array::from(vec![p * 20, p * 20 + 10]);
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vals)])
+                        .unwrap();
+                vec![batch]
+            })
+            .collect()
+    }
+
+    fn register_table(ctx: &SessionContext) {
+        let table = MemTable::try_new(table_schema(), table_partitions()).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+    }
+
+    fn build_session(mesh: Arc<MppMesh>) -> SessionContext {
+        let config = SessionConfig::new().with_target_partitions(N_WORKERS as usize);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_distributed_option_extension(DistributedConfig::default())
+            .with_distributed_worker_resolver(InProcessWorkerResolver::new(N_WORKERS as usize))
+            .with_distributed_worker_transport(ShmMqWorkerTransport::new(mesh))
+            .with_distributed_task_estimator(MemShardEstimator {
+                n_tasks: N_WORKERS as usize,
+            })
+            .with_distributed_planner()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_table(&ctx);
+        ctx
+    }
+
+    /// Collect the `id` column out of a batch list, in row order.
+    fn ids_of(batches: &[RecordBatch]) -> Vec<i32> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id column");
+            out.extend((0..col.len()).map(|i| col.value(i)));
+        }
+        out
+    }
+
+    /// A real distributed query runs end-to-end through the shm_mq transport with no Postgres and
+    /// no Flight: producer fragments push through the heap-backed mesh while the leader gathers via
+    /// `prepare_in_process_plan`. The gathered, ordered result must match the serial reference.
+    ///
+    /// Single-threaded runtime on purpose: it mirrors the per-process current-thread runtime each
+    /// PG worker runs, and it's exactly the cooperative model the transport is built for (the
+    /// producer send spin and the consumer pull loop interleave by yielding, not by parallelism).
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_distributed_query_matches_serial() {
+        let query = "SELECT id, val FROM t ORDER BY id";
+
+        // Serial reference: same query, no distribution.
+        let serial_ctx = SessionContext::new();
+        register_table(&serial_ctx);
+        let expected = serial_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let expected_ids = ids_of(&expected);
+        assert_eq!(expected_ids, vec![0, 1, 2, 3, 4, 5]);
+
+        // One heap region stands in for the DSM segment; size it for n_procs = leader + workers.
+        let n_procs = N_WORKERS + 1;
+        let layout = compute_dsm_layout(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
+        let region = HeapRegion::new(layout.region_total);
+        let base = SharedBase(region.base());
+        let region_total = layout.region_total as u64;
+        let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
+
+        // Leader first (it initializes the rings), then each worker attaches.
+        let leader_mesh = unsafe { leader_setup(base.0, &layout, Arc::clone(&wakeup)) };
+        let mut worker_setups = Vec::new();
+        for proc_idx in 1..n_procs {
+            let (mesh, outbound) =
+                unsafe { worker_setup(base.0, region_total, proc_idx, Arc::clone(&wakeup)) };
+            worker_setups.push((proc_idx, mesh, outbound));
+        }
+
+        // Build the distributed plan once on the leader session; producers and consumer share it.
+        let leader_ctx = build_session(Arc::clone(&leader_mesh));
+        let physical = leader_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert!(
+            physical.as_any().is::<DistributedExec>(),
+            "expected a DistributedExec root, got {}",
+            physical.name()
+        );
+
+        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+        // Guard against a planner change that silently collapses the query to a trivial one-task
+        // gather: the producer stage must actually fan across every worker, or the transport's
+        // multi-task routing never gets exercised.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.task_count == N_WORKERS as usize),
+            "expected a producer stage with task_count = {N_WORKERS}; got {:?}",
+            entries.iter().map(|e| e.task_count).collect::<Vec<_>>()
+        );
+
+        // Launch the producer fragments before the leader pulls, so the mesh has data flowing while
+        // the consumer drains. On the current-thread runtime the spawned tasks interleave with the
+        // consumer by yielding, the same cooperative model each PG worker runs.
+        let mut workers = JoinSet::new();
+        for (proc_idx, mesh, outbound) in worker_setups {
+            let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
+            let session = build_session(Arc::clone(&mesh));
+            workers.spawn(run_worker_proc(fragments, outbound, mesh, session, N_WORKERS));
+        }
+
+        // Leader consumer: prepare the head stage and execute it; the network boundary nodes pull
+        // from the mesh through ShmMqWorkerTransport::open.
+        let leader_task_ctx = leader_ctx.task_ctx();
+        let dist = physical
+            .as_any()
+            .downcast_ref::<DistributedExec>()
+            .expect("DistributedExec");
+        let head = dist.prepare_in_process_plan(&leader_task_ctx).unwrap();
+        let stream = head.execute(0, leader_task_ctx).unwrap();
+        let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        while let Some(res) = workers.join_next().await {
+            res.expect("worker task panicked").expect("worker proc");
+        }
+
+        let got_ids = ids_of(&got);
+        assert_eq!(got_ids, expected_ids, "distributed gather != serial");
+
+        // Keep the region alive until every producer has finished writing into it.
+        drop(region);
+    }
+}

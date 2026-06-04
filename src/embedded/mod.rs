@@ -40,3 +40,9 @@ mod mpsc_ring;
 mod runtime;
 #[allow(dead_code)]
 mod transport;
+
+// In-process instantiation + the end-to-end test that runs a real distributed query through the
+// transport with no Postgres. Test-only: it's how an upstream rebase that breaks the transport
+// contract fails in this crate's CI.
+#[cfg(test)]
+mod in_process;

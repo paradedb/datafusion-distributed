@@ -64,7 +64,7 @@ pub fn proc_for_task(n_workers: u32, task_idx: u32) -> u32 {
 ///
 /// Each process owns one MPSC inbox in DSM that receives frames from every peer.
 /// `inbound_receiver` consolidates that inbox plus the in-proc self-loop channel (for
-/// producer-and-consumer-on-same-worker fragments) into a single [`DrainHandle`]. Frames
+/// producer-and-consumer-on-same-worker fragments) into a single `DrainHandle`. Frames
 /// carry `(sender_proc, stage_id, partition)` in their header so the routing registry
 /// inside the handle delivers each frame to the matching consumer.
 ///
@@ -114,7 +114,7 @@ impl MppMesh {
     /// The embedder must guarantee `n_procs >= 3` (one consumer-only leader plus at least two
     /// producer workers) before constructing an `MppMesh`; the subtraction is otherwise unsound.
     /// Asserted in debug builds so a future misuse fails loudly.
-    pub(super) fn n_workers(&self) -> u32 {
+    pub fn n_workers(&self) -> u32 {
         debug_assert!(
             self.n_procs >= 3,
             "MppMesh::n_workers() called with n_procs={} (< 3); the embedder must gate on \

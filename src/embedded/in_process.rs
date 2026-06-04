@@ -39,14 +39,13 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int32Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::Result;
 use datafusion::common::runtime::JoinSet;
-use datafusion::common::{DataFusionError, Result};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use futures::stream::StreamExt;
 
 use crate::{
     DistributedConfig, DistributedExec, DistributedExt, DistributedLeafExec, DistributedTaskContext,
@@ -54,16 +53,10 @@ use crate::{
     SessionStateBuilderExt, TaskEstimation, TaskEstimator,
 };
 
-use super::dsm::{
-    DsmLayout, compute_dsm_layout, leader_init, peer_proc_for_index, worker_attach,
-};
-use super::mesh::{DsmInboxReceiver, DsmInboxSender};
-use super::mpsc_ring::{DsmMpscSender, Wakeup};
+use super::mpsc_ring::Wakeup;
 use super::runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
-use super::transport::{
-    BatchChannelSender, CooperativeDrainSet, DrainHandle, MppFrameHeader, MppReceiver, MppSender,
-    NoInterrupt, SELF_LOOP_CAPACITY, SendBatchStats, in_proc_channel,
-};
+use super::setup::{dsm_region_bytes, leader_setup, run_worker_fragment, worker_setup};
+use super::transport::{CooperativeDrainSet, MppFrameHeader, MppSender, NoInterrupt};
 
 /// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
 /// batches, so backpressure never kicks in. Production sizes this from `paradedb.mpp_queue_size`.
@@ -112,79 +105,6 @@ impl Drop for HeapRegion {
 #[derive(Clone, Copy)]
 struct SharedBase(*mut c_void);
 unsafe impl Send for SharedBase {}
-
-/// Wrap each peer-indexed `DsmMpscSender` into an outbound `MppSender` keyed by destination proc.
-/// The dispatcher `clone_with_header`s these per output partition before sending, so the placeholder
-/// header is never observed on the wire. Slot `this_proc` stays `None` until the self-loop install.
-fn build_outbound_senders(
-    this_proc: u32,
-    total_procs: u32,
-    peer_senders: Vec<DsmMpscSender>,
-) -> Vec<Option<MppSender>> {
-    let mut senders: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
-    for (peer_idx, dsm_send) in peer_senders.into_iter().enumerate() {
-        let target_proc = peer_proc_for_index(this_proc, peer_idx as u32);
-        let shared: Arc<dyn BatchChannelSender> = Arc::new(DsmInboxSender::new(dsm_send));
-        senders[target_proc as usize] =
-            Some(MppSender::with_header(shared, MppFrameHeader::batch(0, 0, this_proc)));
-    }
-    senders
-}
-
-/// Initialize the DSM region as the leader (proc 0) and return its consumer-only mesh.
-///
-/// # Safety
-/// `base` must point at an uninitialized region of at least `layout.region_total` bytes.
-unsafe fn leader_setup(
-    base: *mut c_void,
-    layout: &DsmLayout,
-    wakeup: Arc<dyn Wakeup>,
-) -> Arc<MppMesh> {
-    let total_procs = layout.n_procs;
-    let attach = unsafe { leader_init(base, layout, &[], Arc::clone(&wakeup)) }
-        .expect("leader_init");
-    let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
-    inbox.set_receiver(receiver_token(0));
-    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(inbox))]));
-    // The leader is consumer-only; it never hosts a producer fragment.
-    drop(attach.outbound_senders);
-    Arc::new(MppMesh::new(0, total_procs, inbound, Arc::new(NoInterrupt)))
-}
-
-/// Attach to the leader-initialized region as a worker proc and return its mesh + outbound senders.
-///
-/// # Safety
-/// `base`/`region_total` must match the region the leader initialized.
-unsafe fn worker_setup(
-    base: *mut c_void,
-    region_total: u64,
-    proc_idx: u32,
-    wakeup: Arc<dyn Wakeup>,
-) -> (Arc<MppMesh>, Vec<Option<MppSender>>) {
-    let (header, _plan_bytes, attach) =
-        unsafe { worker_attach(base, region_total, proc_idx, Arc::clone(&wakeup)) }
-            .expect("worker_attach");
-    let total_procs = header.n_procs;
-
-    let mut outbound = build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
-
-    // Self-loop in-proc channel: peer-mesh routing can land a producer and its consumer on the same
-    // proc, and an MPSC inbox has no slot for a proc sending to itself. The unified drain pulls from
-    // both the DSM inbox and this channel.
-    let (self_tx, self_rx) = in_proc_channel(SELF_LOOP_CAPACITY);
-    let self_tx_arc: Arc<dyn BatchChannelSender> = Arc::new(self_tx);
-    outbound[proc_idx as usize] =
-        Some(MppSender::with_header(self_tx_arc, MppFrameHeader::batch(0, 0, proc_idx)));
-
-    let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
-    inbox.set_receiver(receiver_token(proc_idx));
-    let inbound = Arc::new(DrainHandle::cooperative(vec![
-        MppReceiver::new(Box::new(inbox)),
-        MppReceiver::new(Box::new(self_rx)),
-    ]));
-    let mesh = Arc::new(MppMesh::new(proc_idx, total_procs, inbound, Arc::new(NoInterrupt)));
-    (mesh, outbound)
-}
 
 /// Opaque, non-sentinel receiver token. `NoopWakeup` ignores the value; this just exercises the
 /// `set_receiver` path with something the producer won't skip as "no consumer registered".
@@ -327,55 +247,6 @@ fn fragments_for_proc(
         }
     }
     out
-}
-
-/// Run a producer fragment plan to exhaustion, pushing every output batch through the matching
-/// per-partition sender (in-process port of pg_search's `run_worker_fragment`).
-async fn run_worker_fragment(
-    plan: Arc<dyn ExecutionPlan>,
-    senders: Vec<MppSender>,
-    ctx: Arc<TaskContext>,
-) -> Result<()> {
-    let n_partitions = plan.output_partitioning().partition_count();
-    if n_partitions != senders.len() {
-        return Err(DataFusionError::Internal(format!(
-            "run_worker_fragment: plan has {n_partitions} output partitions but {} senders",
-            senders.len()
-        )));
-    }
-    let senders: Vec<Arc<MppSender>> = senders.into_iter().map(Arc::new).collect();
-    let mut futures = Vec::with_capacity(n_partitions);
-    for (partition, sender) in senders.iter().enumerate() {
-        let plan = Arc::clone(&plan);
-        let ctx = Arc::clone(&ctx);
-        let sender = Arc::clone(sender);
-        futures.push(async move {
-            let mut stats = SendBatchStats::default();
-            let stream_result: Result<()> = async {
-                let mut stream = plan.execute(partition, ctx)?;
-                while let Some(batch) = stream.next().await {
-                    let batch = batch?;
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    sender.as_ref().send_batch_traced(&batch, &mut stats).await?;
-                }
-                Ok(())
-            }
-            .await;
-            // The shm_mq queue is shared across fragments, so dropping the sender doesn't end the
-            // channel; only the per-channel EOF frame does. Send it regardless of how the stream
-            // ended so the consumer's pull loop terminates.
-            let eof_result = sender.as_ref().send_eof_traced(&mut stats).await;
-            stream_result.and(eof_result)
-        });
-    }
-    let results = futures::future::join_all(futures).await;
-    drop(senders);
-    for r in results {
-        r?;
-    }
-    Ok(())
 }
 
 /// Build a fragment's `TaskContext`, carrying the right `DistributedTaskContext` so nested boundary
@@ -605,19 +476,39 @@ mod tests {
 
         // One heap region stands in for the DSM segment; size it for n_procs = leader + workers.
         let n_procs = N_WORKERS + 1;
-        let layout = compute_dsm_layout(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
-        let region = HeapRegion::new(layout.region_total);
+        let region_total = dsm_region_bytes(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
+        let region = HeapRegion::new(region_total);
         let base = SharedBase(region.base());
-        let region_total = layout.region_total as u64;
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
 
-        // Leader first (it initializes the rings), then each worker attaches.
-        let leader_mesh = unsafe { leader_setup(base.0, &layout, Arc::clone(&wakeup)) };
+        // Leader first (it initializes the rings), then each worker attaches. No plan bytes travel
+        // through the region here; all roles share the producer subplans as Arcs.
+        let leader_mesh = unsafe {
+            leader_setup(
+                base.0,
+                n_procs,
+                IN_PROCESS_QUEUE_BYTES,
+                &[],
+                Arc::clone(&wakeup),
+                receiver_token(0),
+                Arc::new(NoInterrupt),
+            )
+        }
+        .unwrap();
         let mut worker_setups = Vec::new();
         for proc_idx in 1..n_procs {
-            let (mesh, outbound) =
-                unsafe { worker_setup(base.0, region_total, proc_idx, Arc::clone(&wakeup)) };
-            worker_setups.push((proc_idx, mesh, outbound));
+            let attach = unsafe {
+                worker_setup(
+                    base.0,
+                    region_total as u64,
+                    proc_idx,
+                    Arc::clone(&wakeup),
+                    receiver_token(proc_idx),
+                    Arc::new(NoInterrupt),
+                )
+            }
+            .unwrap();
+            worker_setups.push((proc_idx, attach.mesh, attach.outbound_senders));
         }
 
         // Build the distributed plan once on the leader session; producers and consumer share it.

@@ -36,7 +36,7 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::stream::StreamExt;
 
-use super::dsm::{compute_dsm_layout, leader_init, peer_proc_for_index, worker_attach};
+use super::dsm::{compute_dsm_layout, leader_init, peer_proc_for_index, read_region_total, worker_attach};
 use super::mesh::{DsmInboxReceiver, DsmInboxSender};
 use super::mpsc_ring::{DsmMpscSender, Wakeup};
 use super::runtime::MppMesh;
@@ -55,6 +55,15 @@ pub fn dsm_region_bytes(
     compute_dsm_layout(n_procs, queue_bytes, plan_len)
         .map(|l| l.region_total)
         .map_err(|e| format!("mpp: dsm_region_bytes: {e}"))
+}
+
+/// Read `region_total` out of the header a leader wrote, so a worker that just mapped the region
+/// can size its [`worker_setup`] call without knowing the header layout.
+///
+/// # Safety
+/// `base` must point at the start of a region a leader initialized via [`leader_setup`].
+pub unsafe fn region_total(base: *const c_void) -> u64 {
+    unsafe { read_region_total(base) }
 }
 
 /// Wrap each peer-indexed `DsmMpscSender` into an outbound `MppSender` keyed by destination proc.

@@ -3,6 +3,7 @@
 mod common;
 mod config_extension_ext;
 mod distributed_ext;
+mod embedded;
 mod execution_plans;
 mod metrics;
 mod passthrough_headers;

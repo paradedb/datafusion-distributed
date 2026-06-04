@@ -38,7 +38,9 @@ mod transport;
 // supplies the two seams (`Wakeup`, `Interrupt`); everything else is built here.
 pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
 pub use runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
-pub use setup::{dsm_region_bytes, leader_setup, run_worker_fragment, worker_setup};
+pub use setup::{
+    dsm_region_bytes, leader_setup, region_total, run_worker_fragment, worker_setup, WorkerAttach,
+};
 pub use transport::{CooperativeDrainSet, Interrupt, MppFrameHeader, MppSender, NoInterrupt};
 
 // In-process instantiation + the end-to-end test that runs a real distributed query through the

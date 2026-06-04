@@ -26,8 +26,10 @@
 //!   always makes forward progress on the inbound rings, so a stalled consumer can't
 //!   propagate backpressure to remote producers and cause a peer-mesh stall.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+
+use datafusion::common::HashMap;
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::RecordBatch;

@@ -36,7 +36,9 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::stream::StreamExt;
 
-use super::dsm::{compute_dsm_layout, leader_init, peer_proc_for_index, read_region_total, worker_attach};
+use super::dsm::{
+    compute_dsm_layout, leader_init, peer_proc_for_index, read_region_total, worker_attach,
+};
 use super::mesh::{DsmInboxReceiver, DsmInboxSender};
 use super::mpsc_ring::{DsmMpscSender, Wakeup};
 use super::runtime::MppMesh;
@@ -114,7 +116,9 @@ pub unsafe fn leader_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(inbox))]));
+    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
+        inbox,
+    ))]));
     // The leader is consumer-only; it never hosts a producer fragment.
     drop(attach.outbound_senders);
     Ok(Arc::new(MppMesh::new(0, n_procs, inbound, interrupt)))
@@ -154,8 +158,10 @@ pub unsafe fn worker_setup(
     // both the inbox and this channel.
     let (self_tx, self_rx) = in_proc_channel(SELF_LOOP_CAPACITY);
     let self_tx_arc: Arc<dyn BatchChannelSender> = Arc::new(self_tx);
-    outbound[proc_idx as usize] =
-        Some(MppSender::with_header(self_tx_arc, MppFrameHeader::batch(0, 0, proc_idx)));
+    outbound[proc_idx as usize] = Some(MppSender::with_header(
+        self_tx_arc,
+        MppFrameHeader::batch(0, 0, proc_idx),
+    ));
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
@@ -204,7 +210,10 @@ pub async fn run_worker_fragment(
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    sender.as_ref().send_batch_traced(&batch, &mut stats).await?;
+                    sender
+                        .as_ref()
+                        .send_batch_traced(&batch, &mut stats)
+                        .await?;
                 }
                 Ok(())
             }

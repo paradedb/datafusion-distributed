@@ -48,9 +48,9 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::{
-    DistributedConfig, DistributedExec, DistributedExt, DistributedLeafExec, DistributedTaskContext,
-    NetworkBoundaryExt, NetworkBroadcastExec, NetworkCoalesceExec, NetworkShuffleExec,
-    SessionStateBuilderExt, TaskEstimation, TaskEstimator,
+    DistributedConfig, DistributedExec, DistributedExt, DistributedLeafExec,
+    DistributedTaskContext, NetworkBoundaryExt, NetworkBroadcastExec, NetworkCoalesceExec,
+    NetworkShuffleExec, SessionStateBuilderExt, TaskEstimation, TaskEstimator,
 };
 
 use super::mpsc_ring::Wakeup;
@@ -232,8 +232,13 @@ fn fragments_for_proc(
             }
             // Broadcast caps its build subtree at task 0; the other tasks would re-emit the same
             // canonical replica and the consumer's select_all would over-count.
-            if matches!(entry.routing, FragmentRouting::Hashed { broadcast: true, .. })
-                && task_idx != 0
+            if matches!(
+                entry.routing,
+                FragmentRouting::Hashed {
+                    broadcast: true,
+                    ..
+                }
+            ) && task_idx != 0
             {
                 continue;
             }
@@ -252,7 +257,11 @@ fn fragments_for_proc(
 /// Build a fragment's `TaskContext`, carrying the right `DistributedTaskContext` so nested boundary
 /// nodes know their `(task_index, task_count)` and the worker session's resolver/transport ride
 /// along for `prepare_in_process_plan`.
-fn fragment_task_ctx(session: &SessionContext, task_index: usize, task_count: usize) -> Arc<TaskContext> {
+fn fragment_task_ctx(
+    session: &SessionContext,
+    task_index: usize,
+    task_count: usize,
+) -> Arc<TaskContext> {
     let cfg = session
         .state()
         .config()
@@ -374,10 +383,17 @@ impl TaskEstimator for MemShardEstimator {
                     }
                 })
                 .collect();
-            MemorySourceConfig::try_new_exec(&per_task, unprojected_schema.clone(), projection.clone())
-                .expect("memory variant") as Arc<dyn ExecutionPlan>
+            MemorySourceConfig::try_new_exec(
+                &per_task,
+                unprojected_schema.clone(),
+                projection.clone(),
+            )
+            .expect("memory variant") as Arc<dyn ExecutionPlan>
         });
-        Some(Arc::new(DistributedLeafExec::new(Arc::clone(plan), variants)))
+        Some(Arc::new(DistributedLeafExec::new(
+            Arc::clone(plan),
+            variants,
+        )))
     }
 }
 
@@ -531,9 +547,7 @@ mod tests {
         // gather: the producer stage must actually fan across every worker, or the transport's
         // multi-task routing never gets exercised.
         assert!(
-            entries
-                .iter()
-                .any(|e| e.task_count == N_WORKERS as usize),
+            entries.iter().any(|e| e.task_count == N_WORKERS as usize),
             "expected a producer stage with task_count = {N_WORKERS}; got {:?}",
             entries.iter().map(|e| e.task_count).collect::<Vec<_>>()
         );
@@ -545,7 +559,9 @@ mod tests {
         for (proc_idx, mesh, outbound) in worker_setups {
             let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
             let session = build_session(Arc::clone(&mesh));
-            workers.spawn(run_worker_proc(fragments, outbound, mesh, session, N_WORKERS));
+            workers.spawn(run_worker_proc(
+                fragments, outbound, mesh, session, N_WORKERS,
+            ));
         }
 
         // Leader consumer: prepare the head stage and execute it; the network boundary nodes pull

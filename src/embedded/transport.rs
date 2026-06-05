@@ -1474,7 +1474,7 @@ mod tests {
 
         sender.send_batch(&sample_batch(2)).unwrap();
         std::mem::drop(sender); // detach
-                                // Pop the one batch
+        // Pop the one batch
         assert!(matches!(buffer.pop_front(), DrainItem::Batch(_)));
         assert!(matches!(buffer.pop_front(), DrainItem::Eof));
         // Drop drives production teardown (cancel + join). Test passes if

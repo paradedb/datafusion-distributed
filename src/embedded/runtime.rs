@@ -35,14 +35,14 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::{
+    CooperativeScheduler, RemoteStage, WorkerConnection, WorkerDispatch, WorkerDispatchRequest,
+    WorkerResolver, WorkerSink, WorkerTransport,
+};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet;
-use crate::{
-    CooperativeScheduler, RemoteStage, WorkerConnection, WorkerDispatch,
-    WorkerDispatchRequest, WorkerResolver, WorkerSink, WorkerTransport,
-};
 use futures::stream::BoxStream;
 use url::Url;
 

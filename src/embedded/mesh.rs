@@ -173,8 +173,8 @@ impl BatchChannelReceiver for DsmInboxReceiver {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mpsc_ring::{self, DsmMpscRingHeader, Wakeup};
+    use super::*;
 
     struct NoopWakeup;
     impl Wakeup for NoopWakeup {

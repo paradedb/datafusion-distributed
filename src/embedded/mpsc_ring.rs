@@ -863,8 +863,8 @@ impl Drop for DsmMpscSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering as O};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
 
     /// No-op wakeup for the busy-poll tests, which spin on `try_recv` and never rely on being
     /// woken.

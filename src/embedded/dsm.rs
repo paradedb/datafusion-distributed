@@ -48,9 +48,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use super::mesh::{align_up_maxalign_checked, aligned_queue_bytes};
-use super::mpsc_ring::{
-    self, DsmMpscReceiver, DsmMpscRingHeader, DsmMpscSender, Wakeup,
-};
+use super::mpsc_ring::{self, DsmMpscReceiver, DsmMpscRingHeader, DsmMpscSender, Wakeup};
 
 /// Number of slots in each per-receiver MPSC ring. With operator-visible
 /// `paradedb.mpp_queue_size` divided across `RING_SLOTS` slots, each slot holds
@@ -135,7 +133,7 @@ impl MppDsmHeader {
         match self.plan_offset.checked_add(self.plan_len) {
             None => return Err("mpp: plan_offset + plan_len overflow"),
             Some(end) if end > self.queues_offset => {
-                return Err("mpp: plan would overlap queues area")
+                return Err("mpp: plan would overlap queues area");
             }
             _ => {}
         }
@@ -329,7 +327,9 @@ pub(super) unsafe fn leader_init(
         unsafe { mpsc_ring::create_at(inbox_addr, ring_slots, slot_capacity) };
     }
 
-    let attach = unsafe { attach_proc(base, &header, 0, /* attach_senders */ false, wakeup) };
+    let attach = unsafe {
+        attach_proc(base, &header, 0, /* attach_senders */ false, wakeup)
+    };
     Ok(attach)
 }
 
@@ -425,8 +425,11 @@ pub(super) unsafe fn worker_attach(
         .to_vec()
     };
 
-    let attach =
-        unsafe { attach_proc(base, &header, proc_idx, /* attach_senders */ true, wakeup) };
+    let attach = unsafe {
+        attach_proc(
+            base, &header, proc_idx, /* attach_senders */ true, wakeup,
+        )
+    };
     Ok((header, plan_bytes, attach))
 }
 

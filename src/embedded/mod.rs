@@ -39,7 +39,7 @@ mod transport;
 pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
 pub use runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
 pub use setup::{
-    dsm_region_bytes, leader_setup, region_total, run_worker_fragment, worker_setup, WorkerAttach,
+    WorkerAttach, dsm_region_bytes, leader_setup, region_total, run_worker_fragment, worker_setup,
 };
 pub use transport::{CooperativeDrainSet, Interrupt, MppFrameHeader, MppSender, NoInterrupt};
 

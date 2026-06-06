@@ -44,8 +44,9 @@ use super::mpsc_ring::{DsmMpscSender, Wakeup};
 use super::runtime::MppMesh;
 use super::transport::{
     BatchChannelSender, DrainHandle, Interrupt, MppFrameHeader, MppReceiver, MppSender,
-    SELF_LOOP_CAPACITY, SendBatchStats, in_proc_channel,
+    SELF_LOOP_CAPACITY, in_proc_channel,
 };
+use crate::PartitionSink;
 
 /// Total bytes the shared region needs for `n_procs` inboxes plus `plan_len` plan bytes, with
 /// `queue_bytes` per inbox. The embedder reserves exactly this much before [`leader_setup`].
@@ -177,32 +178,30 @@ pub unsafe fn worker_setup(
     })
 }
 
-/// Run a producer fragment plan to exhaustion, pushing every output batch through the matching
-/// per-partition sender. The output partition count of `plan` must equal `senders.len()`.
+/// Run a producer fragment plan to exhaustion, pushing every output batch into the matching
+/// per-partition [`PartitionSink`]. The output partition count of `plan` must equal `sinks.len()`;
+/// `sinks[partition]` is the send end the caller routed for that output partition.
 ///
-/// Each partition sends a per-channel EOF when its stream ends, regardless of how it ended: the
-/// shared queue is multiplexed across fragments, so dropping a sender doesn't end the channel, only
-/// the EOF frame does.
+/// Each partition's [`PartitionSink::finish`] sends a per-channel EOF when its stream ends,
+/// regardless of how it ended: the shared queue is multiplexed across fragments, so dropping a sink
+/// doesn't end the channel, only the EOF frame does.
 pub async fn run_worker_fragment(
     plan: Arc<dyn ExecutionPlan>,
-    senders: Vec<MppSender>,
+    sinks: Vec<Box<dyn PartitionSink>>,
     ctx: Arc<TaskContext>,
 ) -> Result<()> {
     let n_partitions = plan.output_partitioning().partition_count();
-    if n_partitions != senders.len() {
+    if n_partitions != sinks.len() {
         return Err(DataFusionError::Internal(format!(
-            "run_worker_fragment: plan has {n_partitions} output partitions but {} senders",
-            senders.len()
+            "run_worker_fragment: plan has {n_partitions} output partitions but {} sinks",
+            sinks.len()
         )));
     }
-    let senders: Vec<Arc<MppSender>> = senders.into_iter().map(Arc::new).collect();
     let mut futures = Vec::with_capacity(n_partitions);
-    for (partition, sender) in senders.iter().enumerate() {
+    for (partition, mut sink) in sinks.into_iter().enumerate() {
         let plan = Arc::clone(&plan);
         let ctx = Arc::clone(&ctx);
-        let sender = Arc::clone(sender);
         futures.push(async move {
-            let mut stats = SendBatchStats::default();
             let stream_result: Result<()> = async {
                 let mut stream = plan.execute(partition, ctx)?;
                 while let Some(batch) = stream.next().await {
@@ -210,23 +209,19 @@ pub async fn run_worker_fragment(
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    sender
-                        .as_ref()
-                        .send_batch_traced(&batch, &mut stats)
-                        .await?;
+                    sink.send(&batch).await?;
                 }
                 Ok(())
             }
             .await;
-            let eof_result = sender.as_ref().send_eof_traced(&mut stats).await;
+            let eof_result = sink.finish().await;
             // Surface the stream error first, then any EOF-send error, so neither disappears.
             stream_result.and(eof_result)
         });
     }
     // `join_all`, not `try_join_all`: fail-fast would cancel sibling partitions mid-await before
-    // they reach `send_eof_traced`, leaving the consumer's channel buffer stuck.
+    // they reach `finish`, leaving the consumer's channel buffer stuck.
     let results = futures::future::join_all(futures).await;
-    drop(senders);
     for r in results {
         r?;
     }

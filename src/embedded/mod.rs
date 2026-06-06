@@ -41,7 +41,9 @@ pub use runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_f
 pub use setup::{
     WorkerAttach, dsm_region_bytes, leader_setup, region_total, run_worker_fragment, worker_setup,
 };
-pub use transport::{CooperativeDrainSet, Interrupt, MppFrameHeader, MppSender, NoInterrupt};
+pub use transport::{
+    CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
+};
 
 // In-process instantiation + the end-to-end test that runs a real distributed query through the
 // transport with no Postgres. Test-only: it's how an upstream rebase that breaks the transport

@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use crate::{
     CooperativeScheduler, RemoteStage, WorkerConnection, WorkerDispatch, WorkerDispatchRequest,
-    WorkerResolver, WorkerSink, WorkerTransport,
+    WorkerResolver, WorkerTransport,
 };
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
@@ -210,17 +210,6 @@ impl WorkerTransport for ShmMqWorkerTransport {
     /// the old `in_process_mode` flag.
     fn dispatch(&self) -> &dyn WorkerDispatch {
         self
-    }
-
-    /// MPP produces inside `run_worker_fragment` on each PG worker, pushing through the shm_mq
-    /// senders, so there is no free-standing sink to hand back. Same shape as Flight, which
-    /// produces inside its gRPC worker service and also declines `sink()`.
-    fn sink(&self, _ctx: &Arc<TaskContext>) -> Result<Arc<dyn WorkerSink>> {
-        Err(DataFusionError::Internal(
-            "ShmMqWorkerTransport has no free-standing WorkerSink; MPP produces inside \
-             run_worker_fragment via shm_mq senders"
-                .to_string(),
-        ))
     }
 
     /// The mesh drains its inbound queues cooperatively. Advertise it so the crate can pump

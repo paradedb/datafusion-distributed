@@ -26,6 +26,7 @@
 //!   always makes forward progress on the inbound rings, so a stalled consumer can't
 //!   propagate backpressure to remote producers and cause a peer-mesh stall.
 
+use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -706,6 +707,35 @@ pub(super) struct SendBatchStats {
     pub(super) coop_drain_in_spin: Duration,
     /// Count of `try_send_bytes` calls that returned `Ok(false)` (full).
     pub(super) spin_iters: u64,
+}
+
+/// A [`crate::PartitionSink`] over one [`MppSender`]: the produce loop's per-partition send end.
+/// `send` runs the cooperative-drain spin and `finish` flushes the channel EOF the same way, so a
+/// non-Flight embedder (the in-process harness, pg_search's worker loop) wraps each routed sender
+/// in one of these and pushes batches through the trait instead of touching `MppSender` directly.
+pub struct MppPartitionSink {
+    sender: MppSender,
+    stats: SendBatchStats,
+}
+
+impl MppPartitionSink {
+    pub fn new(sender: MppSender) -> Self {
+        Self {
+            sender,
+            stats: SendBatchStats::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::PartitionSink for MppPartitionSink {
+    async fn send(&mut self, batch: &RecordBatch) -> datafusion::common::Result<()> {
+        self.sender.send_batch_traced(batch, &mut self.stats).await
+    }
+
+    async fn finish(mut self: Box<Self>) -> datafusion::common::Result<()> {
+        self.sender.send_eof_traced(&mut self.stats).await
+    }
 }
 
 /// High-level receiver: pulls bytes via the underlying channel and decodes them

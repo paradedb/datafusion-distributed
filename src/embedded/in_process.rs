@@ -39,8 +39,8 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int32Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::memory::DataSourceExec;
-use datafusion::common::Result;
 use datafusion::common::runtime::JoinSet;
+use datafusion::common::{DataFusionError, HashMap, Result};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::{SessionStateBuilder, TaskContext};
@@ -50,13 +50,16 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use crate::{
     DistributedConfig, DistributedExec, DistributedExt, DistributedLeafExec,
     DistributedTaskContext, NetworkBoundaryExt, NetworkBroadcastExec, NetworkCoalesceExec,
-    NetworkShuffleExec, SessionStateBuilderExt, TaskEstimation, TaskEstimator,
+    NetworkShuffleExec, PartitionSink, SessionStateBuilderExt, TaskEstimation, TaskEstimator,
+    WorkerSink,
 };
 
 use super::mpsc_ring::Wakeup;
 use super::runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
 use super::setup::{dsm_region_bytes, leader_setup, run_worker_fragment, worker_setup};
-use super::transport::{CooperativeDrainSet, MppFrameHeader, MppSender, NoInterrupt};
+use super::transport::{
+    CooperativeDrainSet, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
+};
 
 /// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
 /// batches, so backpressure never kicks in. Production sizes this from `paradedb.mpp_queue_size`.
@@ -274,8 +277,9 @@ fn fragment_task_ctx(
 }
 
 /// Run all fragments owned by one worker proc, then signal completion. Mirrors the body of
-/// pg_search's `run_mpp_worker`: build per-partition senders by routing, wrap each fragment in a
-/// fresh `DistributedExec` + `prepare_in_process_plan` (converting nested boundaries), and join.
+/// pg_search's `run_mpp_worker`: build a [`WorkerSink`] that routes by partition, open a
+/// [`PartitionSink`] per output partition, wrap each fragment in a fresh `DistributedExec` +
+/// `prepare_in_process_plan` (converting nested boundaries), and join.
 async fn run_worker_proc(
     fragments: Vec<FragmentAssignment>,
     outbound: Vec<Option<MppSender>>,
@@ -283,43 +287,83 @@ async fn run_worker_proc(
     session: SessionContext,
     n_workers: u32,
 ) -> Result<()> {
-    let mut futures = Vec::with_capacity(fragments.len());
+    let mut routing = HashMap::new();
+    for fragment in &fragments {
+        routing.insert(fragment.stage_id, fragment.routing.clone());
+    }
+    // One sink serves every stage this proc produces; it owns the base outbound senders and routes
+    // each (stage, partition) to the destination proc's send end.
+    let worker_sink = ShmMqWorkerSink {
+        outbound,
+        mesh: Arc::clone(&mesh),
+        n_workers,
+        routing,
+    };
+
+    let mut prepared = Vec::with_capacity(fragments.len());
     for fragment in &fragments {
         let task_ctx = fragment_task_ctx(&session, fragment.task_idx, fragment.task_count);
-        let prepared = {
+        let plan = {
             let dist = Arc::new(DistributedExec::new(Arc::clone(&fragment.plan)));
             dist.prepare_in_process_plan(&task_ctx)?
         };
-        let n_out = prepared.output_partitioning().partition_count();
-        let mut senders = Vec::with_capacity(n_out);
+        let n_out = plan.output_partitioning().partition_count();
+        let mut sinks: Vec<Box<dyn PartitionSink>> = Vec::with_capacity(n_out);
         for q in 0..n_out {
-            let dest_proc = match &fragment.routing {
-                FragmentRouting::Coalesce { dest_proc } => *dest_proc,
-                FragmentRouting::Hashed { consumer_task, .. } => {
-                    proc_for_task(n_workers, consumer_task[q])
-                }
-            };
-            let base = outbound[dest_proc as usize]
-                .as_ref()
-                .expect("outbound sender for dest proc");
-            senders.push(
-                base.clone_with_header(MppFrameHeader::batch(
-                    fragment.stage_id,
-                    q as u32,
-                    mesh.this_proc,
-                ))
-                .with_cooperative_drain(Arc::clone(&mesh) as Arc<dyn CooperativeDrainSet>),
-            );
+            sinks.push(worker_sink.open_partition(fragment.stage_id as usize, q)?);
         }
-        futures.push(run_worker_fragment(prepared, senders, task_ctx));
+        prepared.push((plan, sinks, task_ctx));
     }
-    // Drop the originals so the only senders left are the per-partition clones owned by the
-    // fragment futures; otherwise the rings never observe the last-sender detach.
-    drop(outbound);
+    // Drop the base senders so the only senders left are the per-partition clones the fragment
+    // futures own; otherwise the rings never observe the last-sender detach.
+    drop(worker_sink);
+
+    let mut futures = Vec::with_capacity(prepared.len());
+    for (plan, sinks, task_ctx) in prepared {
+        futures.push(run_worker_fragment(plan, sinks, task_ctx));
+    }
     for r in futures::future::join_all(futures).await {
         r?;
     }
     Ok(())
+}
+
+/// Test-harness [`WorkerSink`]: routes each `(stage, partition)` to the destination proc's outbound
+/// send end, the in-process analog of what pg_search builds on a real backend. Holds the base
+/// senders plus the per-stage routing so `open_partition` reproduces the header + cooperative-drain
+/// wiring the produce loop used to apply inline.
+struct ShmMqWorkerSink {
+    outbound: Vec<Option<MppSender>>,
+    mesh: Arc<MppMesh>,
+    n_workers: u32,
+    routing: HashMap<u32, FragmentRouting>,
+}
+
+impl WorkerSink for ShmMqWorkerSink {
+    fn open_partition(&self, stage: usize, partition: usize) -> Result<Box<dyn PartitionSink>> {
+        let routing = self.routing.get(&(stage as u32)).ok_or_else(|| {
+            DataFusionError::Internal(format!("run_worker_proc: no routing for stage {stage}"))
+        })?;
+        let dest_proc = match routing {
+            FragmentRouting::Coalesce { dest_proc } => *dest_proc,
+            FragmentRouting::Hashed { consumer_task, .. } => {
+                proc_for_task(self.n_workers, consumer_task[partition])
+            }
+        };
+        let base = self.outbound[dest_proc as usize].as_ref().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "run_worker_proc: no outbound sender for dest proc {dest_proc}"
+            ))
+        })?;
+        let sender = base
+            .clone_with_header(MppFrameHeader::batch(
+                stage as u32,
+                partition as u32,
+                self.mesh.this_proc,
+            ))
+            .with_cooperative_drain(Arc::clone(&self.mesh) as Arc<dyn CooperativeDrainSet>);
+        Ok(Box::new(MppPartitionSink::new(sender)))
+    }
 }
 
 /// Splits an in-memory `DataSourceExec` leaf across tasks, the in-memory analog of the crate's

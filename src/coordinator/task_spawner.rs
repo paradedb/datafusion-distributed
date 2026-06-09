@@ -82,7 +82,7 @@ pub(crate) struct CoordinatorToWorkerTaskSpawner<'a> {
     task_count: usize,
     task_ctx: &'a TaskContext,
     metrics: &'a CoordinatorToWorkerMetrics,
-    task_metrics: &'a Option<Arc<MetricsStore>>,
+    task_metrics: Option<&'a Arc<MetricsStore>>,
     join_set: &'a mut JoinSet<Result<()>>,
 }
 
@@ -92,7 +92,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
     pub(crate) fn new(
         stage: &'a LocalStage,
         metrics: &'a CoordinatorToWorkerMetrics,
-        task_metrics: &'a Option<Arc<MetricsStore>>,
+        task_metrics: Option<&'a Arc<MetricsStore>>,
         task_ctx: &'a TaskContext,
         join_set: &'a mut JoinSet<Result<()>>,
     ) -> Result<Self> {
@@ -233,7 +233,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             stage_id: self.stage_id as u64,
             task_number: task_i as u64,
         };
-        let task_metrics = self.task_metrics.clone();
+        let task_metrics = self.task_metrics.cloned();
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             while let Some(msg) = worker_to_coordinator_rx.recv().await {

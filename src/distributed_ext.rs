@@ -290,20 +290,15 @@ pub trait DistributedExt: Sized {
         resolver: T,
     );
 
-    /// Overrides the [WorkerTransport] used by [crate::worker::WorkerConnectionPool] when opening
-    /// connections to remote workers. The default transport is the Arrow-Flight gRPC implementation
-    /// shipped in this crate; embedded executors can plug in their own (e.g. shared-memory queues)
-    /// without forking the per-operator code paths.
-    fn with_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(
-        self,
-        transport: T,
-    ) -> Self;
+    /// Overrides the [WorkerTransport] this crate uses to talk to workers: opening read
+    /// connections from the worker connection pool and delivering each stage's plans at prepare
+    /// time. The default is the Arrow-Flight gRPC implementation shipped in this crate; an
+    /// embedded executor registers its own (e.g. shared-memory queues) without forking the
+    /// per-operator code paths.
+    fn with_distributed_worker_transport<T: WorkerTransport + 'static>(self, transport: T) -> Self;
 
     /// Same as [DistributedExt::with_distributed_worker_transport] but with an in-place mutation.
-    fn set_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(
-        &mut self,
-        transport: T,
-    );
+    fn set_distributed_worker_transport<T: WorkerTransport + 'static>(&mut self, transport: T);
 
     /// Adds a distributed task count estimator. [TaskEstimator]s are executed on each node
     /// sequentially until one returns an estimation on the number of tasks that should be
@@ -641,10 +636,7 @@ impl DistributedExt for SessionConfig {
         set_distributed_channel_resolver(self, resolver);
     }
 
-    fn set_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(
-        &mut self,
-        transport: T,
-    ) {
+    fn set_distributed_worker_transport<T: WorkerTransport + 'static>(&mut self, transport: T) {
         set_distributed_worker_transport(self, transport);
     }
 
@@ -788,7 +780,7 @@ impl DistributedExt for SessionConfig {
 
             #[call(set_distributed_worker_transport)]
             #[expr($;self)]
-            fn with_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(mut self, transport: T) -> Self;
+            fn with_distributed_worker_transport<T: WorkerTransport + 'static>(mut self, transport: T) -> Self;
 
             #[call(set_distributed_task_estimator)]
             #[expr($;self)]
@@ -885,10 +877,10 @@ impl DistributedExt for SessionStateBuilder {
             #[expr($;self)]
             fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
 
-            fn set_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(&mut self, transport: T);
+            fn set_distributed_worker_transport<T: WorkerTransport + 'static>(&mut self, transport: T);
             #[call(set_distributed_worker_transport)]
             #[expr($;self)]
-            fn with_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(mut self, transport: T) -> Self;
+            fn with_distributed_worker_transport<T: WorkerTransport + 'static>(mut self, transport: T) -> Self;
 
             fn set_distributed_task_estimator<T: TaskEstimator + Send + Sync + 'static>(&mut self, estimator: T);
             #[call(set_distributed_task_estimator)]
@@ -1003,10 +995,10 @@ impl DistributedExt for SessionState {
             #[expr($;self)]
             fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(mut self, resolver: T) -> Self;
 
-            fn set_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(&mut self, transport: T);
+            fn set_distributed_worker_transport<T: WorkerTransport + 'static>(&mut self, transport: T);
             #[call(set_distributed_worker_transport)]
             #[expr($;self)]
-            fn with_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(mut self, transport: T) -> Self;
+            fn with_distributed_worker_transport<T: WorkerTransport + 'static>(mut self, transport: T) -> Self;
 
             fn set_distributed_task_estimator<T: TaskEstimator + Send + Sync + 'static>(&mut self, estimator: T);
             #[call(set_distributed_task_estimator)]
@@ -1121,10 +1113,10 @@ impl DistributedExt for SessionContext {
             #[expr($;self)]
             fn with_distributed_channel_resolver<T: ChannelResolver + Send + Sync + 'static>(self, resolver: T) -> Self;
 
-            fn set_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(&mut self, transport: T);
+            fn set_distributed_worker_transport<T: WorkerTransport + 'static>(&mut self, transport: T);
             #[call(set_distributed_worker_transport)]
             #[expr($;self)]
-            fn with_distributed_worker_transport<T: WorkerTransport + Send + Sync + 'static>(self, transport: T) -> Self;
+            fn with_distributed_worker_transport<T: WorkerTransport + 'static>(self, transport: T) -> Self;
 
             fn set_distributed_task_estimator<T: TaskEstimator + Send + Sync + 'static>(&mut self, estimator: T);
             #[call(set_distributed_task_estimator)]

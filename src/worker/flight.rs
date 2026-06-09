@@ -29,7 +29,7 @@ impl WorkerTransport for FlightWorkerTransport {
         target_task: usize,
         ctx: &Arc<TaskContext>,
         metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
+    ) -> Result<Box<dyn WorkerConnection>> {
         let Some(target_url) = input_stage.workers.get(target_task) else {
             return internal_err!("input_stage.workers[{target_task}] out of range.");
         };
@@ -46,14 +46,33 @@ impl WorkerTransport for FlightWorkerTransport {
             )))
         } else {
             RemoteWorkerConnection::init(input_stage, target_partitions, target_task, ctx, metrics)
-                .map(|v| Box::new(v) as Box<dyn WorkerConnection + Send + Sync>)
+                .map(|v| Box::new(v) as Box<dyn WorkerConnection>)
         }
     }
 
     // The gRPC dispatch lives in `coordinator::task_spawner` next to the per-task send/metrics/feed
-    // machinery it reuses; `FlightWorkerTransport` is both the read and the write side of Flight.
-    fn dispatch(&self) -> &dyn WorkerDispatch {
-        self
+    // machinery it reuses.
+    fn dispatcher(&self) -> Box<dyn WorkerDispatch> {
+        Box::new(FlightWorkerDispatcher::default())
+    }
+}
+
+/// Per-query plan-delivery state for the Flight transport.
+///
+/// One instance lives for the whole query, so the plan-send metrics and the query start
+/// timestamp are shared across every stage's dispatch instead of being re-created per stage.
+#[derive(Default)]
+pub(crate) struct FlightWorkerDispatcher {
+    metrics: std::sync::OnceLock<CoordinatorToWorkerMetrics>,
+}
+
+impl FlightWorkerDispatcher {
+    fn coordinator_metrics(
+        &self,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> &CoordinatorToWorkerMetrics {
+        self.metrics
+            .get_or_init(|| CoordinatorToWorkerMetrics::new(metrics))
     }
 }
 
@@ -61,7 +80,7 @@ impl WorkerTransport for FlightWorkerTransport {
 /// carries the work-unit feed (coordinator -> worker) and the metrics back-channel
 /// (worker -> coordinator). The per-task setup lives in [CoordinatorToWorkerTaskSpawner]; this
 /// drives it for every task of the stage.
-impl WorkerDispatch for FlightWorkerTransport {
+impl WorkerDispatch for FlightWorkerDispatcher {
     fn dispatch(&self, request: WorkerDispatchRequest<'_>) -> Result<()> {
         let WorkerDispatchRequest {
             stage,
@@ -70,15 +89,11 @@ impl WorkerDispatch for FlightWorkerTransport {
             metrics,
             metrics_store,
             join_set,
+            ..
         } = request;
-        let metrics = CoordinatorToWorkerMetrics::new(metrics);
-        let mut spawner = CoordinatorToWorkerTaskSpawner::new(
-            stage,
-            &metrics,
-            metrics_store,
-            task_ctx,
-            join_set,
-        )?;
+        let metrics = self.coordinator_metrics(metrics);
+        let mut spawner =
+            CoordinatorToWorkerTaskSpawner::new(stage, metrics, metrics_store, task_ctx, join_set)?;
         for (task, routed_url) in routed_urls.iter().enumerate() {
             let (tx, worker_rx) =
                 spawner.send_plan_task(Arc::clone(task_ctx), task, routed_url.clone())?;
@@ -86,5 +101,24 @@ impl WorkerDispatch for FlightWorkerTransport {
             spawner.work_unit_feed_task(Arc::clone(task_ctx), task, tx)?;
         }
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_reuses_query_metrics_across_stages() {
+        let set = ExecutionPlanMetricsSet::new();
+        let dispatcher = FlightWorkerDispatcher::default();
+
+        let first = dispatcher.coordinator_metrics(&set) as *const CoordinatorToWorkerMetrics;
+        let registered = set.clone_inner().iter().count();
+
+        // A second stage dispatch must reuse the query's metrics instead of registering
+        // duplicates (summed latencies) and re-stamping the query start time.
+        let second = dispatcher.coordinator_metrics(&set) as *const CoordinatorToWorkerMetrics;
+        assert_eq!(first, second);
+        assert_eq!(set.clone_inner().iter().count(), registered);
     }
 }

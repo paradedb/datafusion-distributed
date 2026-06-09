@@ -13,10 +13,10 @@ use url::Url;
 /// A live connection to a single worker that demultiplexes the underlying transport into one
 /// stream per partition.
 ///
-/// One connection handles every partition in the `target_partition_range` requested at open time,
-/// so the implementation can reuse a single underlying network/IPC stream and fan messages out to
-/// per-partition queues. Each partition can be streamed exactly once.
-pub trait WorkerConnection {
+/// One connection handles every partition in the `target_partitions` range requested at open
+/// time, so the implementation can reuse a single underlying network/IPC stream and fan messages
+/// out to per-partition queues. Each partition can be streamed exactly once.
+pub trait WorkerConnection: Send + Sync {
     /// Streams the specified partition. Consumers do not care if the implementation pulls data
     /// over the wire or from local comms. Streaming the same partition twice is an error.
     fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>>;
@@ -28,12 +28,15 @@ pub trait WorkerConnection {
 /// task `i`) and hands the transport this request; the transport delivers each task's plan and
 /// wires up whatever per-task back-channels it needs. `join_set` is the query's, so background
 /// delivery work spawned onto it propagates failures to the query head.
+#[non_exhaustive]
 pub struct WorkerDispatchRequest<'a> {
     pub stage: &'a LocalStage,
     pub routed_urls: &'a [Url],
     pub task_ctx: &'a Arc<TaskContext>,
     pub metrics: &'a ExecutionPlanMetricsSet,
-    pub metrics_store: &'a Option<Arc<MetricsStore>>,
+    /// Back-channel for task metrics. Only the Flight transport reads it (workers push
+    /// their metrics back over its gRPC stream); other transports ignore it.
+    pub metrics_store: Option<&'a Arc<MetricsStore>>,
     pub join_set: &'a mut JoinSet<Result<()>>,
 }
 
@@ -51,13 +54,15 @@ pub trait WorkerDispatch: Send + Sync {
 /// Factory that opens a [WorkerConnection] to a single worker task and delivers plans to workers.
 ///
 /// The default implementation is the Arrow-Flight gRPC transport baked into this crate
-/// ([crate::FlightWorkerTransport]). Custom transports (e.g. shared-memory queues for an embedded
+/// (`FlightWorkerTransport`). Custom transports (e.g. shared-memory queues for an embedded
 /// execution context) plug in via [crate::DistributedExt::with_distributed_worker_transport].
-pub trait WorkerTransport {
+pub trait WorkerTransport: Send + Sync {
     /// Opens a connection to the worker hosting `target_task` of `input_stage` covering the
     /// partitions in `target_partitions`. The returned [WorkerConnection] takes ownership of any
     /// background resources (gRPC streams, demux tasks, cancellation tokens, ...) and is expected
-    /// to clean them up on drop.
+    /// to clean them up on drop. Bypassing the network for a worker co-located with the
+    /// coordinator is the implementation's concern (Flight compares the target URL against its
+    /// own).
     fn open(
         &self,
         input_stage: &RemoteStage,
@@ -65,13 +70,18 @@ pub trait WorkerTransport {
         target_task: usize,
         ctx: &Arc<TaskContext>,
         metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection + Send + Sync>>;
+    ) -> Result<Box<dyn WorkerConnection>>;
 
-    /// The plan-delivery side of this transport.
-    fn dispatch(&self) -> &dyn WorkerDispatch;
+    /// Creates the plan-delivery side of this transport for one query.
+    ///
+    /// Called once per query, before any stage is dispatched, so the returned [WorkerDispatch]
+    /// can hold per-query state. Flight uses this to share one set of plan-send metrics and one
+    /// query start timestamp across every stage's dispatch; a fresh dispatcher per stage would
+    /// register duplicate metrics and skew the per-task time offsets derived from that timestamp.
+    fn dispatcher(&self) -> Box<dyn WorkerDispatch>;
 }
 
-impl WorkerTransport for Arc<dyn WorkerTransport + Send + Sync> {
+impl WorkerTransport for Arc<dyn WorkerTransport> {
     fn open(
         &self,
         input_stage: &RemoteStage,
@@ -79,12 +89,12 @@ impl WorkerTransport for Arc<dyn WorkerTransport + Send + Sync> {
         target_task: usize,
         ctx: &Arc<TaskContext>,
         metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
+    ) -> Result<Box<dyn WorkerConnection>> {
         self.as_ref()
             .open(input_stage, target_partitions, target_task, ctx, metrics)
     }
 
-    fn dispatch(&self) -> &dyn WorkerDispatch {
-        self.as_ref().dispatch()
+    fn dispatcher(&self) -> Box<dyn WorkerDispatch> {
+        self.as_ref().dispatcher()
     }
 }

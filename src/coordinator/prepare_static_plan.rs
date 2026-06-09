@@ -18,12 +18,12 @@ use std::sync::Arc;
 /// 1. Perform some worker URL assignation, choosing either:
 ///    - The URLs set by the user with [crate::TaskEstimator::route_tasks].
 ///    - Randomly otherwise
-/// 2. Sending the sliced subplans to the assigned URLs. For each URL assigned to a task, a
-///    network call feeding the subplan is necessary.
+/// 2. Handing each stage's sliced subplans to the registered [crate::WorkerTransport]'s
+///    dispatcher, which owns the delivery to the assigned workers.
 /// 3. In each network boundary, set the input plan to `None`. That way, network boundaries
 ///    become nodes without children and traversing them will not go further down in.
-/// 4. Spawn a background task per worker that waits for the worker to finish and collects
-///    its metrics into [DistributedExec::task_metrics] via the coordinator channel.
+/// 4. The dispatcher may spawn background per-worker work (plan delivery, work-unit feeds)
+///    onto the query's `JoinSet`, which propagates failures to the query head.
 pub(super) fn prepare_static_plan(
     base_plan: &Arc<dyn ExecutionPlan>,
     metrics: &ExecutionPlanMetricsSet,
@@ -33,7 +33,9 @@ pub(super) fn prepare_static_plan(
     let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
 
     let available_urls = worker_resolver.get_urls()?;
-    let transport = get_distributed_worker_transport(ctx);
+    // One dispatcher per query: it carries per-query state (plan-send metrics, the query start
+    // timestamp) across every stage's dispatch.
+    let dispatcher = get_distributed_worker_transport(ctx.session_config()).dispatcher();
 
     let mut join_set = JoinSet::new();
     let prepared = Arc::clone(base_plan).transform_up(|plan| {
@@ -59,6 +61,12 @@ pub(super) fn prepare_static_plan(
             // If the user has not defined custom routing with a `route_tasks` implementation, we
             // default to round-robin task assignation from a randomized starting point.
             Ok(None) => {
+                if available_urls.is_empty() {
+                    return exec_err!(
+                        "the worker resolver returned no URLs; default routing needs at least \
+                         one (a custom `route_tasks` implementation lifts this requirement)"
+                    );
+                }
                 let start_idx = rand::rng().random_range(0..available_urls.len());
                 (0..stage.tasks)
                     .map(|i| available_urls[(start_idx + i) % available_urls.len()].clone())
@@ -78,12 +86,12 @@ pub(super) fn prepare_static_plan(
         // Hand each task's plan to its assigned worker. The transport owns the delivery (Flight
         // ships a `SetPlanRequest` over gRPC; an embedded transport routes by `target_task`), so
         // the coordinator no longer special-cases the gRPC send.
-        transport.dispatch().dispatch(WorkerDispatchRequest {
+        dispatcher.dispatch(WorkerDispatchRequest {
             stage,
             routed_urls: &routed_urls,
             task_ctx: ctx,
             metrics,
-            metrics_store: task_metrics,
+            metrics_store: task_metrics.as_ref(),
             join_set: &mut join_set,
         })?;
 

@@ -76,9 +76,9 @@ extensions_options! {
         /// [WorkerResolver] implementation that tells the distributed planner information about
         /// the available workers ready to execute distributed tasks.
         pub(crate) __private_worker_resolver: WorkerResolverExtension, default = WorkerResolverExtension::not_implemented()
-        /// Optional [crate::WorkerTransport] override used by [crate::worker::WorkerConnectionPool]
-        /// when opening connections to remote workers. When unset, callers fall back to a process-
-        /// wide [crate::FlightWorkerTransport] (or fail loud if the `flight` feature is off).
+        /// Optional [crate::WorkerTransport] override consulted when opening connections to
+        /// remote workers and when dispatching plans. When unset, callers fall back to a process-
+        /// wide Flight transport (or fail loud if the `flight` feature is off).
         pub(crate) __private_worker_transport: WorkerTransportExtension, default = WorkerTransportExtension::default()
         /// [WorkUnitFeedRegistry] that contains a set of getters that, applied to each node in a
         /// plan, will return the [crate::WorkUnitFeed]s present in all nodes.

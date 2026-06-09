@@ -99,7 +99,7 @@ pub(crate) struct LocalWorkerContext {
 /// it will initialize the corresponding position in the vector matching the provided `target_task`
 /// index.
 pub(crate) struct WorkerConnectionPool {
-    connections: Vec<OnceLockResult<Box<dyn WorkerConnection + Sync + Send>>>,
+    connections: Vec<OnceLockResult<Box<dyn WorkerConnection>>>,
     pub(crate) metrics: ExecutionPlanMetricsSet,
 }
 
@@ -126,7 +126,7 @@ impl WorkerConnectionPool {
         target_partitions: Range<usize>,
         target_task: usize,
         ctx: &Arc<TaskContext>,
-    ) -> Result<&(dyn WorkerConnection + Sync + Send)> {
+    ) -> Result<&dyn WorkerConnection> {
         let Some(worker_connection) = self.connections.get(target_task) else {
             return internal_err!(
                 "WorkerConnections: Task index {target_task} not found, only have {} tasks",
@@ -135,7 +135,7 @@ impl WorkerConnectionPool {
         };
 
         let conn = worker_connection.get_or_init(|| {
-            get_distributed_worker_transport(ctx)
+            get_distributed_worker_transport(ctx.session_config())
                 .open(
                     input_stage,
                     target_partitions,

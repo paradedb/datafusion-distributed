@@ -83,7 +83,7 @@ struct HeapRegion {
 
 impl HeapRegion {
     fn new(bytes: usize) -> Self {
-        // 64-byte alignment so each per-inbox ring (repr(C, align(64))) lands on a cache line; the
+        // 64-byte alignment so each per-inbox ring header lands on its own cache line; the
         // dsm layout aligns the offsets within the region, but only if the base is aligned too.
         let layout = Layout::from_size_align(bytes, 64).expect("dsm region layout");
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };

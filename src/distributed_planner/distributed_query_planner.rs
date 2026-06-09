@@ -111,7 +111,7 @@ impl QueryPlanner for DistributedQueryPlanner {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver;
+    use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
     use crate::test_utils::plans::{
         BuildSideOneTaskEstimator, TestPlanOptions, base_session_builder, context_with_query,
         sql_to_physical_plan,

@@ -32,10 +32,11 @@ pub mod test_utils;
 mod work_unit_feed;
 
 pub use arrow_ipc::CompressionType;
+pub use common::get_distributed_cancellation_token;
 pub use coordinator::{DistributedExec, MetricsStore};
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
-    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
+    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, PartitionRoute, SessionStateBuilderExt,
     TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
 };
 pub use execution_plans::{
@@ -71,9 +72,9 @@ pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
 pub use worker::{
-    DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt, TaskData,
-    Worker, WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerQueryContext,
-    WorkerSessionBuilder, WorkerTransport,
+    DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt,
+    PartitionSink, TaskData, Worker, WorkerConnection, WorkerDispatch, WorkerDispatchRequest,
+    WorkerQueryContext, WorkerSessionBuilder, WorkerSink, WorkerTransport,
 };
 
 #[cfg(feature = "flight")]

@@ -1,19 +1,19 @@
-// Copyright (c) 2023-2026 ParadeDB, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// This file is part of ParadeDB - Postgres for Search and Analytics
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! Mesh construction over a caller-supplied shared buffer, the seam between an embedder's buffer
 //! allocation and the transport.
@@ -40,33 +40,34 @@ use super::dsm::{
     compute_dsm_layout, leader_init, peer_proc_for_index, read_region_total, worker_attach,
 };
 use super::mesh::{DsmInboxReceiver, DsmInboxSender};
-use super::mpsc_ring::{DsmMpscSender, Wakeup};
+use super::mpsc_ring::{DsmMpscSender, NO_RECEIVER_TOKEN, Wakeup};
 use super::runtime::MppMesh;
 use super::transport::{
     BatchChannelSender, DrainHandle, Interrupt, MppFrameHeader, MppReceiver, MppSender,
-    SELF_LOOP_CAPACITY, in_proc_channel,
+    ReceiverScope, SELF_LOOP_CAPACITY, in_proc_channel,
 };
 use crate::PartitionSink;
 
 /// Total bytes the shared region needs for `n_procs` inboxes plus `plan_len` plan bytes, with
 /// `queue_bytes` per inbox. The embedder reserves exactly this much before [`leader_setup`].
-pub fn dsm_region_bytes(
-    n_procs: u32,
-    queue_bytes: usize,
-    plan_len: usize,
-) -> Result<usize, String> {
+pub fn dsm_region_bytes(n_procs: u32, queue_bytes: usize, plan_len: usize) -> Result<usize> {
     compute_dsm_layout(n_procs, queue_bytes, plan_len)
         .map(|l| l.region_total)
-        .map_err(|e| format!("mpp: dsm_region_bytes: {e}"))
+        .map_err(|e| DataFusionError::Internal(format!("mpp: dsm_region_bytes: {e}")))
 }
 
 /// Read `region_total` out of the header a leader wrote, so a worker that just mapped the region
 /// can size its [`worker_setup`] call without knowing the header layout.
 ///
+/// A caller that derives the size from the header forfeits [`worker_setup`]'s size validation
+/// (it would compare the header against itself). Pass the mapped size from the embedder's own
+/// bookkeeping where it is available.
+///
 /// # Safety
-/// `base` must point at the start of a region a leader initialized via [`leader_setup`].
-pub unsafe fn region_total(base: *const c_void) -> u64 {
-    unsafe { read_region_total(base) }
+/// - `base` must point at the start of a region a leader initialized via [`leader_setup`].
+/// - `base` must be at least 8-byte aligned (the header holds `u64` fields).
+pub unsafe fn region_total(base: *const c_void) -> usize {
+    unsafe { read_region_total(base) as usize }
 }
 
 /// Wrap each peer-indexed `DsmMpscSender` into an outbound `MppSender` keyed by destination proc.
@@ -81,6 +82,17 @@ fn build_outbound_senders(
     let mut senders: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
     for (peer_idx, dsm_send) in peer_senders.into_iter().enumerate() {
         let target_proc = peer_proc_for_index(this_proc, peer_idx as u32);
+        // A `peer_proc_for_index` regression that maps a peer onto the self slot would be
+        // silently overwritten by the self-loop install and only surface later as a missing
+        // sender at dispatch; name the bug at its source.
+        debug_assert!(
+            target_proc != this_proc,
+            "peer index {peer_idx} mapped to the self proc {this_proc}"
+        );
+        debug_assert!(
+            target_proc < total_procs,
+            "peer index {peer_idx} mapped to proc {target_proc} >= total {total_procs}"
+        );
         let shared: Arc<dyn BatchChannelSender> = Arc::new(DsmInboxSender::new(dsm_send));
         senders[target_proc as usize] = Some(MppSender::with_header(
             shared,
@@ -101,6 +113,7 @@ fn build_outbound_senders(
 /// # Safety
 /// - `base` must point at an uninitialized region of at least `dsm_region_bytes(n_procs,
 ///   queue_bytes, plan_bytes.len())` bytes.
+/// - `base` must be at least 8-byte (MAXALIGN) aligned; the ring headers hold atomics.
 /// - The region must not be concurrently accessed until this returns.
 pub unsafe fn leader_setup(
     base: *mut c_void,
@@ -110,16 +123,25 @@ pub unsafe fn leader_setup(
     wakeup: Arc<dyn Wakeup>,
     receiver_token: u64,
     interrupt: Arc<dyn Interrupt>,
-) -> Result<Arc<MppMesh>, String> {
+) -> Result<Arc<MppMesh>> {
+    if receiver_token == NO_RECEIVER_TOKEN {
+        return Err(DataFusionError::Internal(
+            "mpp: leader_setup: receiver_token is the NO_RECEIVER_TOKEN sentinel; wakeups \
+             for this proc would be silently disabled"
+                .into(),
+        ));
+    }
     let layout = compute_dsm_layout(n_procs, queue_bytes, plan_bytes.len())
-        .map_err(|e| format!("mpp: leader_setup compute layout: {e}"))?;
-    let attach = unsafe { leader_init(base, &layout, plan_bytes, Arc::clone(&wakeup)) }?;
+        .map_err(|e| DataFusionError::Internal(format!("mpp: leader_setup compute layout: {e}")))?;
+    let attach = unsafe { leader_init(base, &layout, plan_bytes, Arc::clone(&wakeup)) }
+        .map_err(DataFusionError::Internal)?;
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
-        inbox,
-    ))]));
+    let inbound = Arc::new(DrainHandle::cooperative(
+        0,
+        vec![(ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox)))],
+    ));
     // The leader is consumer-only; it never hosts a producer fragment.
     drop(attach.outbound_senders);
     Ok(Arc::new(MppMesh::new(0, n_procs, inbound, interrupt)))
@@ -140,16 +162,25 @@ pub struct WorkerAttach {
 ///
 /// # Safety
 /// - `base`/`region_total` must match the region the leader initialized via [`leader_setup`].
+/// - `base` must be at least 8-byte (MAXALIGN) aligned; the ring headers hold atomics.
 pub unsafe fn worker_setup(
     base: *mut c_void,
-    region_total: u64,
+    region_total: usize,
     proc_idx: u32,
     wakeup: Arc<dyn Wakeup>,
     receiver_token: u64,
     interrupt: Arc<dyn Interrupt>,
-) -> Result<WorkerAttach, String> {
+) -> Result<WorkerAttach> {
+    if receiver_token == NO_RECEIVER_TOKEN {
+        return Err(DataFusionError::Internal(
+            "mpp: worker_setup: receiver_token is the NO_RECEIVER_TOKEN sentinel; wakeups \
+             for this proc would be silently disabled"
+                .into(),
+        ));
+    }
     let (header, plan_bytes, attach) =
-        unsafe { worker_attach(base, region_total, proc_idx, Arc::clone(&wakeup)) }?;
+        unsafe { worker_attach(base, region_total as u64, proc_idx, Arc::clone(&wakeup)) }
+            .map_err(DataFusionError::Internal)?;
     let total_procs = header.n_procs;
 
     let mut outbound = build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
@@ -166,10 +197,13 @@ pub unsafe fn worker_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative(vec![
-        MppReceiver::new(Box::new(inbox)),
-        MppReceiver::new(Box::new(self_rx)),
-    ]));
+    let inbound = Arc::new(DrainHandle::cooperative(
+        proc_idx,
+        vec![
+            (ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox))),
+            (ReceiverScope::SelfLoop, MppReceiver::new(Box::new(self_rx))),
+        ],
+    ));
     let mesh = Arc::new(MppMesh::new(proc_idx, total_procs, inbound, interrupt));
     Ok(WorkerAttach {
         mesh,

@@ -1,19 +1,19 @@
-// Copyright (c) 2023-2026 ParadeDB, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// This file is part of ParadeDB - Postgres for Search and Analytics
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! Mesh-multiplexed DSM layout: one MPSC inbox per receiver process.
 //!
@@ -39,9 +39,9 @@
 //! - Each process attaches as receiver to its own inbox (one MPSC ring) and as sender
 //!   to each of N-1 peer inboxes. Senders stamp `MppFrameHeader::sender_proc` on every
 //!   frame so the receiver demuxes by source.
-//! - Self-loop frames (proc → itself) ride an in-proc channel installed in `glue.rs`,
-//!   not a DSM slot: each `DsmMpscReceiver` is owned by a single receiver process, so
-//!   there is no DSM slot for the self-loop pair.
+//! - Self-loop frames (proc → itself) ride an in-proc channel installed by
+//!   `worker_setup`, not a DSM slot: each `DsmMpscReceiver` is owned by a single
+//!   receiver process, so there is no DSM slot for the self-loop pair.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -58,9 +58,14 @@ use super::mpsc_ring::{self, DsmMpscReceiver, DsmMpscRingHeader, DsmMpscSender, 
 /// spot.
 const RING_SLOTS: u32 = 8;
 
-/// Cache-line alignment for the per-inbox DsmMpscRing header. The ring's
-/// `#[repr(C, align(64))]` mandates 64-byte alignment at every `create_at`/`attach_at`
-/// site; both `queues_offset` and per-inbox `queue_bytes` are aligned up to this so the
+/// Floor `ring_dims_for` applies to the per-slot payload capacity. The layout minimum check
+/// uses the same floor so the constructed ring always fits its inbox region.
+const MIN_SLOT_CAPACITY: u32 = 64;
+
+/// Cache-line alignment for the per-inbox DsmMpscRing header. The ring itself is plain
+/// `#[repr(C)]` (the base address is only MAXALIGN-guaranteed), but spacing the per-inbox
+/// offsets to 64 keeps hot headers on separate cache lines when the base cooperates;
+/// both `queues_offset` and per-inbox `queue_bytes` are aligned up to this so the
 /// computed `inbox_offset(r) = queues_offset + r * queue_bytes` lands at a 64-aligned
 /// address for every `r`.
 const RING_ALIGN: usize = 64;
@@ -84,7 +89,7 @@ const MPP_DSM_MAX_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
 /// C-repr header at offset 0 of the DSM region.
 ///
-/// Layout: three `u32`s + padding, then six `u64`s.
+/// Layout: three `u32`s + padding, then five `u64`s.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct MppDsmHeader {
@@ -190,11 +195,12 @@ pub(super) fn compute_dsm_layout(
         return Err("mpp: queue_bytes too small after alignment");
     }
     let queue_bytes = align_up_ring(queue_bytes).ok_or("mpp: queue_bytes alignment overflow")?;
-    // Sanity: each inbox must have room for the ring header + at least RING_SLOTS slots
-    // of one byte each (we don't pin a minimum payload size, just that the ring is
-    // constructible).
-    if queue_bytes < DsmMpscRingHeader::region_bytes(RING_SLOTS, 1) {
-        return Err("mpp: queue_bytes too small for ring header + min slots");
+    // Each inbox must have room for the ring `ring_dims_for` will actually build:
+    // `RING_SLOTS` slots with the 64-byte capacity floor. Checking against a smaller
+    // ring here would let `create_at` write past the inbox region for tiny
+    // `queue_bytes`, overlapping the next inbox.
+    if queue_bytes < DsmMpscRingHeader::region_bytes(RING_SLOTS, MIN_SLOT_CAPACITY) {
+        return Err("mpp: queue_bytes too small for ring header + min slot capacity");
     }
     let header_end = align_up_maxalign_checked(size_of::<MppDsmHeader>())
         .ok_or("mpp: header alignment overflow")?;
@@ -233,7 +239,7 @@ fn ring_dims_for(queue_bytes: usize) -> (u32, u32) {
     // queue_bytes >= ring_dims minimum is enforced in compute_dsm_layout; we recompute
     // here without re-validating.
     let slot_total_bytes = queue_bytes.saturating_sub(header);
-    let slot_capacity = (slot_total_bytes / RING_SLOTS as usize).max(64);
+    let slot_capacity = (slot_total_bytes / RING_SLOTS as usize).max(MIN_SLOT_CAPACITY as usize);
     // Cap slot_capacity at u32::MAX (DsmMpscRing's field type) to avoid casting wrap.
     let slot_capacity = slot_capacity.min(u32::MAX as usize) as u32;
     (RING_SLOTS, slot_capacity)

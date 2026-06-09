@@ -1,19 +1,19 @@
-// Copyright (c) 2023-2026 ParadeDB, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// This file is part of ParadeDB - Postgres for Search and Analytics
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! Runtime glue between the leader's DataFusion execution and the DSM MPSC mesh.
 //!
@@ -52,9 +52,10 @@ use super::transport::{CooperativeDrainSet, DrainHandle, DrainItem, Interrupt};
 /// (consumer-only), workers are `1..n_procs` (each hosts producer fragments).
 ///
 /// A stage's task count is set by the DF-D task estimator chain, not by the worker proc count.
-/// With the natural-shape plan's `distributed_task_estimator(n_workers)`, `task_count` equals
-/// `n_workers` in every stage we emit today, so the modulo is a no-op. The wrap is defensive for
-/// future shapes where an estimator could return more tasks than producer procs.
+/// The transport does NOT support more tasks than producer procs: channels are keyed
+/// `(sender_proc, stage, partition)`, so two tasks wrapped onto one proc would interleave on one
+/// channel and the first EOF would truncate the other task's output. `ShmMqWorkerTransport::open`
+/// rejects that shape; the modulo here only keeps the function total.
 #[inline]
 pub fn proc_for_task(n_workers: u32, task_idx: u32) -> u32 {
     1 + (task_idx % n_workers.max(1))
@@ -111,14 +112,15 @@ impl MppMesh {
     /// Number of worker procs (= `n_procs - 1`, since the leader is proc 0). Used as the
     /// modulus in [`proc_for_task`].
     ///
-    /// The embedder must guarantee `n_procs >= 3` (one consumer-only leader plus at least two
-    /// producer workers) before constructing an `MppMesh`; the subtraction is otherwise unsound.
-    /// Asserted in debug builds so a future misuse fails loudly.
+    /// The embedder must guarantee `n_procs >= 2` (one consumer-only leader plus at least one
+    /// producer worker) before constructing an `MppMesh`; the subtraction is otherwise unsound.
+    /// `compute_dsm_layout` enforces the same bound. Asserted in debug builds so a future misuse
+    /// fails loudly.
     pub fn n_workers(&self) -> u32 {
         debug_assert!(
-            self.n_procs >= 3,
-            "MppMesh::n_workers() called with n_procs={} (< 3); the embedder must gate on \
-             n_procs >= 3",
+            self.n_procs >= 2,
+            "MppMesh::n_workers() called with n_procs={} (< 2); the embedder must gate on \
+             n_procs >= 2",
             self.n_procs
         );
         self.n_procs - 1
@@ -180,6 +182,18 @@ impl WorkerTransport for ShmMqWorkerTransport {
                 input_stage.num
             ))
         })?;
+        // More tasks than producer procs would fold two tasks onto one
+        // `(sender_proc, stage, partition)` channel: interleaved batches, and the first task's
+        // EOF truncates the second. Refuse the shape instead of wrapping.
+        if input_stage.workers.len() > self.mesh.n_workers() as usize {
+            return Err(DataFusionError::Internal(format!(
+                "ShmMqWorkerTransport: stage {} has {} tasks but only {} producer procs; \
+                 the shm_mq transport requires task_count <= n_workers",
+                input_stage.num,
+                input_stage.workers.len(),
+                self.mesh.n_workers()
+            )));
+        }
         let sender_proc = proc_for_task(self.mesh.n_workers(), target_task_u32);
         if sender_proc >= self.mesh.n_procs {
             return Err(DataFusionError::Internal(format!(
@@ -188,6 +202,12 @@ impl WorkerTransport for ShmMqWorkerTransport {
                 self.mesh.n_procs
             )));
         }
+        // First line to grep when a query hangs on a channel nothing registered.
+        log::debug!(
+            "embedded transport open: this_proc={} stage_id={stage_id} \
+             target_task={target_task} -> sender_proc={sender_proc}",
+            self.mesh.this_proc
+        );
         Ok(Box::new(ShmMqWorkerConnection {
             mesh: Arc::clone(&self.mesh),
             sender_proc,
@@ -264,6 +284,12 @@ impl WorkerConnection for ShmMqWorkerConnection {
         // sees only its named sender's slice even though the underlying inbox is
         // shared with all peers.
         let drain = Arc::clone(self.mesh.inbound_receiver());
+        log::debug!(
+            "embedded transport execute: register channel sender_proc={} stage_id={} \
+             partition={partition_u32}",
+            self.sender_proc,
+            self.stage_id
+        );
         let buffer = drain.register_channel(self.sender_proc, self.stage_id, partition_u32);
         let mesh = Arc::clone(&self.mesh);
         // Cooperative pull loop: the inbound drain runs inline on the consumer's thread. Each
@@ -284,6 +310,10 @@ impl WorkerConnection for ShmMqWorkerConnection {
                 match buffer.try_pop() {
                     Some(DrainItem::Batch(batch)) => yield Ok(batch),
                     Some(DrainItem::Eof) => break,
+                    Some(DrainItem::Failed(msg)) => {
+                        yield Err(DataFusionError::Execution(msg));
+                        return;
+                    }
                     None => tokio::task::yield_now().await,
                 }
             }

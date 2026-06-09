@@ -1,19 +1,19 @@
-// Copyright (c) 2023-2026 ParadeDB, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// This file is part of ParadeDB - Postgres for Search and Analytics
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! In-process instantiation of the embedded transport, plus an end-to-end test.
 //!
@@ -225,6 +225,21 @@ struct FragmentAssignment {
     routing: FragmentRouting,
 }
 
+/// Rebuild a plan subtree so each proc executes its own node instances. In production every
+/// proc decodes its own copy of the plan; sharing one `Arc` across procs would share
+/// execute-once state (a `RepartitionExec` panics when a second proc executes a partition the
+/// first already consumed). Leaves are shared: they carry no execute-once state here.
+fn reinstantiate(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let children: Vec<_> = plan.children().into_iter().map(reinstantiate).collect();
+    if children.is_empty() {
+        Arc::clone(plan)
+    } else {
+        Arc::clone(plan)
+            .with_new_children(children)
+            .expect("with_new_children with the same arity")
+    }
+}
+
 /// Expand the dispatched stages into the fragments `this_proc` owns under `proc_for_task`.
 fn fragments_for_proc(
     entries: &[StageEntry],
@@ -253,7 +268,7 @@ fn fragments_for_proc(
                 stage_id: entry.stage_num,
                 task_idx,
                 task_count: entry.task_count,
-                plan: Arc::clone(&entry.plan),
+                plan: reinstantiate(&entry.plan),
                 routing: entry.routing.clone(),
             });
         }
@@ -564,7 +579,7 @@ mod tests {
             let attach = unsafe {
                 worker_setup(
                     base.0,
-                    region_total as u64,
+                    region_total,
                     proc_idx,
                     Arc::clone(&wakeup),
                     receiver_token(proc_idx),
@@ -630,7 +645,178 @@ mod tests {
         let got_ids = ids_of(&got);
         assert_eq!(got_ids, expected_ids, "distributed gather != serial");
 
-        // Keep the region alive until every producer has finished writing into it.
-        drop(region);
+        // `region` is declared before the meshes, so reverse drop order frees it after every
+        // receiver handle into it is gone.
+    }
+
+    /// Mesh bootstrap shared by the tests: leader first (it initializes the rings), then each
+    /// worker attaches.
+    struct Bootstrap {
+        leader_mesh: Arc<MppMesh>,
+        workers: Vec<(u32, Arc<MppMesh>, Vec<Option<MppSender>>)>,
+        // Last field on purpose: struct fields drop in declaration order, so the region
+        // outlives every receiver handle into it.
+        _region: HeapRegion,
+    }
+
+    fn bootstrap_mesh(n_procs: u32) -> Bootstrap {
+        let region_total = dsm_region_bytes(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
+        let region = HeapRegion::new(region_total);
+        let base = SharedBase(region.base());
+        let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
+        let leader_mesh = unsafe {
+            leader_setup(
+                base.0,
+                n_procs,
+                IN_PROCESS_QUEUE_BYTES,
+                &[],
+                Arc::clone(&wakeup),
+                receiver_token(0),
+                Arc::new(NoInterrupt),
+            )
+        }
+        .unwrap();
+        let mut workers = Vec::new();
+        for proc_idx in 1..n_procs {
+            let attach = unsafe {
+                worker_setup(
+                    base.0,
+                    region_total,
+                    proc_idx,
+                    Arc::clone(&wakeup),
+                    receiver_token(proc_idx),
+                    Arc::new(NoInterrupt),
+                )
+            }
+            .unwrap();
+            workers.push((proc_idx, attach.mesh, attach.outbound_senders));
+        }
+        Bootstrap {
+            leader_mesh,
+            workers,
+            _region: region,
+        }
+    }
+
+    /// A `GROUP BY` plans a nested `NetworkShuffleExec`, so this exercises hash-routed
+    /// worker-to-worker traffic and the self-loop sender, which the plain gather test never
+    /// touches. That routing is the main thing an upstream rebase can silently break.
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_shuffle_query_matches_serial() {
+        let query = "SELECT val, count(*) AS c FROM t GROUP BY val ORDER BY val";
+
+        let serial_ctx = SessionContext::new();
+        register_table(&serial_ctx);
+        let expected = serial_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let boot = bootstrap_mesh(N_WORKERS + 1);
+        let leader_ctx = build_session(Arc::clone(&boot.leader_mesh));
+        let physical = leader_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.routing, FragmentRouting::Hashed { .. })),
+            "expected a hash-routed producer stage; got {:?}",
+            entries.iter().map(|e| &e.routing).collect::<Vec<_>>()
+        );
+
+        let mut workers = JoinSet::new();
+        for (proc_idx, mesh, outbound) in boot.workers {
+            let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
+            let session = build_session(Arc::clone(&mesh));
+            workers.spawn(run_worker_proc(
+                fragments, outbound, mesh, session, N_WORKERS,
+            ));
+        }
+
+        let leader_task_ctx = leader_ctx.task_ctx();
+        let dist = physical
+            .as_any()
+            .downcast_ref::<DistributedExec>()
+            .expect("DistributedExec");
+        let head = dist.prepare_in_process_plan(&leader_task_ctx).unwrap();
+        let stream = head.execute(0, leader_task_ctx).unwrap();
+        let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        while let Some(res) = workers.join_next().await {
+            res.expect("worker task panicked").expect("worker proc");
+        }
+
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        assert_eq!(
+            pretty_format_batches(&expected).unwrap().to_string(),
+            pretty_format_batches(&got).unwrap().to_string(),
+            "distributed shuffle != serial"
+        );
+    }
+
+    /// A producer that attaches and then goes away without sending its EOFs must fail the
+    /// gather, not hang it: the drain fails the channels the dead receiver fed once the ring
+    /// detaches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_loss_fails_the_gather_instead_of_hanging() {
+        let query = "SELECT id, val FROM t ORDER BY id";
+
+        let boot = bootstrap_mesh(N_WORKERS + 1);
+        let leader_ctx = build_session(Arc::clone(&boot.leader_mesh));
+        let physical = leader_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+
+        let mut workers = JoinSet::new();
+        for (proc_idx, mesh, outbound) in boot.workers {
+            if proc_idx == 1 {
+                // Simulated crash: the proc attached (its senders exist), then dies without
+                // running its fragments or sending EOF. Dropping the senders is what process
+                // exit does.
+                drop(outbound);
+                drop(mesh);
+                continue;
+            }
+            let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
+            let session = build_session(Arc::clone(&mesh));
+            workers.spawn(run_worker_proc(
+                fragments, outbound, mesh, session, N_WORKERS,
+            ));
+        }
+
+        let leader_task_ctx = leader_ctx.task_ctx();
+        let dist = physical
+            .as_any()
+            .downcast_ref::<DistributedExec>()
+            .expect("DistributedExec");
+        let head = dist.prepare_in_process_plan(&leader_task_ctx).unwrap();
+        let stream = head.execute(0, leader_task_ctx).unwrap();
+        let res: Result<Vec<RecordBatch>, _> = stream.try_collect().await;
+
+        while let Some(r) = workers.join_next().await {
+            r.expect("worker task panicked").expect("worker proc");
+        }
+
+        let err = res
+            .expect_err("gather must fail when a producer goes away")
+            .to_string();
+        assert!(
+            err.contains("detached before this channel's EOF"),
+            "unexpected error: {err}"
+        );
     }
 }

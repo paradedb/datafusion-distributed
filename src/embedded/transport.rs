@@ -1,19 +1,19 @@
-// Copyright (c) 2023-2026 ParadeDB, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// This file is part of ParadeDB - Postgres for Search and Analytics
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! Transport layer for MPP shuffle.
 //!
@@ -69,10 +69,13 @@ pub(super) enum MppFrameKind {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MppFrameHeader {
-    pub magic: u32,
-    pub flags: u32,
-    pub stage_id: u32,
-    pub partition: u32,
+    // Private so headers only come out of `batch()`/`eof()`: hand-built ones could bypass
+    // `pack_flags`'s sender bound and the reserved-bits invariant, and the consumer would
+    // reject them at decode, far from the producer.
+    pub(super) magic: u32,
+    pub(super) flags: u32,
+    pub(super) stage_id: u32,
+    pub(super) partition: u32,
 }
 
 /// `flags` bit layout:
@@ -297,6 +300,11 @@ struct DrainBufferInner {
     /// Consumer-side cancel flag. When set (e.g., query cancelled or `DrainHandle` dropped),
     /// `try_pop`/`pop_front` returns `Eof` even if `sources_done` hasn't reached `num_sources`.
     cancelled: bool,
+    /// Set when the receiver feeding this channel detached (or errored) before the channel's
+    /// `Eof` frame arrived. Distinct from `cancelled`: cancellation is a clean teardown and
+    /// yields `Eof`, while a lost source must surface as an error or the consumer would treat
+    /// truncated output as complete.
+    failed: Option<String>,
 }
 
 /// Yielded by [`DrainBuffer::pop_front`].
@@ -306,6 +314,8 @@ pub(super) enum DrainItem {
     Batch(RecordBatch),
     /// All source queues have detached and the local queue is drained.
     Eof,
+    /// The receiver feeding this channel went away before the channel's `Eof` frame.
+    Failed(String),
 }
 
 impl DrainBuffer {
@@ -319,6 +329,7 @@ impl DrainBuffer {
                 num_sources,
                 sources_done: 0,
                 cancelled: false,
+                failed: None,
             }),
             cond: Condvar::new(),
         })
@@ -339,6 +350,18 @@ impl DrainBuffer {
         if guard.sources_done >= guard.num_sources {
             self.cond.notify_all();
         }
+    }
+
+    /// Mark the channel as fed by a dead receiver, unless it already completed (its `Eof`
+    /// arrived), was cancelled, or already failed. Consumers then see an error instead of
+    /// hanging on a channel nothing will ever fill.
+    pub fn fail_pending(&self, msg: &str) {
+        let mut guard = self.inner.lock().expect("DrainBuffer mutex poisoned");
+        if guard.sources_done >= guard.num_sources || guard.cancelled || guard.failed.is_some() {
+            return;
+        }
+        guard.failed = Some(msg.to_string());
+        self.cond.notify_all();
     }
 
     /// Cancel all further pushes and wake all consumers with EOF.
@@ -367,6 +390,9 @@ impl DrainBuffer {
     fn try_pop_locked(guard: &mut MutexGuard<'_, DrainBufferInner>) -> Option<DrainItem> {
         if let Some(batch) = guard.queue.pop_front() {
             return Some(DrainItem::Batch(batch));
+        }
+        if let Some(msg) = &guard.failed {
+            return Some(DrainItem::Failed(msg.clone()));
         }
         if guard.cancelled || guard.sources_done >= guard.num_sources {
             return Some(DrainItem::Eof);
@@ -483,9 +509,10 @@ pub struct MppSender {
 
 // SAFETY: only `scratch: RefCell<Vec<u8>>` and the trait-object `Arc`s are `!Sync`. Callers
 // compose `send_*_traced` futures via `tokio::spawn` / `join_all`, which makes the compiler
-// require `&Self: Send` and therefore `Self: Sync`. At runtime those futures run on the
-// current-thread tokio runtime pinned to the PG backend thread, so the cell is never actually
-// observed from another thread.
+// require `&Self: Send` and therefore `Self: Sync`. The embedded model runs those futures on
+// a current-thread runtime (see the module docs), so the cell is never observed from two
+// threads; a multi-thread embedder would additionally be serialized by `send_lock` across
+// every send path that touches `scratch`.
 unsafe impl Sync for MppSender {}
 
 impl MppSender {
@@ -541,7 +568,7 @@ impl MppSender {
     ) -> Result<(), DataFusionError> {
         // Take the scratch buffer out of the `RefCell` rather than
         // holding a `RefMut` across the spin below. The spin contains
-        // `pgrx::check_for_interrupts!()`, which can `longjmp` through
+        // the embedder's `Interrupt::check`, which may unwind or `longjmp` through
         // Rust frames; a `longjmp` does not run `Drop`, so a `RefMut`
         // held across it would leave the cell perpetually borrowed and
         // panic the next caller. `replace` is atomic — the cell is
@@ -694,7 +721,7 @@ impl MppSender {
 /// Per-call timing + spin metrics for [`MppSender::send_batch_traced`].
 /// All fields accumulate; callers zero or reuse as needed.
 #[derive(Default, Debug, Clone)]
-pub(super) struct SendBatchStats {
+pub struct SendBatchStats {
     /// Cumulative time spent inside `encode_frame_into` (header + Arrow IPC serialization).
     pub(super) encode: Duration,
     /// Cumulative wall time in the send-retry spin after the first failed
@@ -724,6 +751,12 @@ impl MppPartitionSink {
             sender,
             stats: SendBatchStats::default(),
         }
+    }
+
+    /// Per-channel send counters, for an embedder that traces throughput. Read them before
+    /// `finish`, which consumes the sink.
+    pub fn stats(&self) -> &SendBatchStats {
+        &self.stats
     }
 }
 
@@ -799,6 +832,20 @@ struct ChannelBufferRegistry {
     /// buffer. This preserves the implicit "one stream per sender" semantics that
     /// `WorkerConnection::execute` consumers rely on.
     map: HashMap<(u32, u32, u32), Arc<DrainBuffer>>,
+    /// Scopes whose receiver detached (or errored) before draining cleanly. Channels fed by a
+    /// dead scope fail at registration time too, so a consumer that registers after the detach
+    /// does not wait on a channel nothing will ever fill.
+    dead_inbox: bool,
+    dead_self_loop: bool,
+}
+
+/// Which frames a receiver carries, so a detach can fail exactly the channels it feeds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ReceiverScope {
+    /// The proc's DSM inbox: frames from every peer proc.
+    Inbox,
+    /// The in-proc self-loop: frames this proc sends itself.
+    SelfLoop,
 }
 
 /// Per-sender-proc drain: stashes the receivers and polls them inline from the cooperative spin
@@ -825,18 +872,58 @@ pub struct DrainHandle {
     /// that detached receivers get polled once per pass (fast-returning `Detached`). The lock
     /// is uncontended in production (single backend thread) so the marginal cost is in the
     /// type system, not the runtime.
-    coop_receivers: Mutex<Vec<Option<MppReceiver>>>,
+    coop_receivers: Mutex<Vec<Option<(ReceiverScope, MppReceiver)>>>,
+    /// This proc's index, used to map a channel's `sender_proc` to the receiver scope that
+    /// feeds it (`SelfLoop` iff `sender_proc == this_proc`).
+    this_proc: u32,
 }
 
 impl DrainHandle {
     /// Construct a cooperative drain handle. Channel buffers are populated lazily by
     /// [`Self::try_drain_pass`] when a frame arrives, or up-front by [`Self::register_channel`]
     /// when a consumer needs a buffer to wait on before any frame has come in.
-    pub(super) fn cooperative(receivers: Vec<MppReceiver>) -> Self {
+    pub(super) fn cooperative(
+        this_proc: u32,
+        receivers: Vec<(ReceiverScope, MppReceiver)>,
+    ) -> Self {
         let wrapped = receivers.into_iter().map(Some).collect();
         Self {
             channel_buffers: Mutex::new(ChannelBufferRegistry::default()),
             coop_receivers: Mutex::new(wrapped),
+            this_proc,
+        }
+    }
+
+    fn scope_for_sender(&self, sender_proc: u32) -> ReceiverScope {
+        if sender_proc == self.this_proc {
+            ReceiverScope::SelfLoop
+        } else {
+            ReceiverScope::Inbox
+        }
+    }
+
+    /// Fail every registered channel fed by `scope` that has not completed yet, and remember the
+    /// scope as dead so later registrations fail too. Channels whose `Eof` already arrived are
+    /// untouched: a detach after a clean drain is the normal end of life for a ring.
+    fn fail_scope(&self, scope: ReceiverScope, reason: &str) {
+        let to_fail = {
+            let mut guard = self
+                .channel_buffers
+                .lock()
+                .expect("DrainHandle channel_buffers mutex poisoned");
+            match scope {
+                ReceiverScope::Inbox => guard.dead_inbox = true,
+                ReceiverScope::SelfLoop => guard.dead_self_loop = true,
+            }
+            guard
+                .map
+                .iter()
+                .filter(|((sender_proc, _, _), _)| self.scope_for_sender(*sender_proc) == scope)
+                .map(|(_, buf)| buf.clone())
+                .collect::<Vec<_>>()
+        };
+        for buf in to_fail {
+            buf.fail_pending(reason);
         }
     }
 
@@ -854,7 +941,11 @@ impl DrainHandle {
             .channel_buffers
             .lock()
             .expect("DrainHandle channel_buffers mutex poisoned");
-        guard
+        let scope_dead = match self.scope_for_sender(sender_proc) {
+            ReceiverScope::Inbox => guard.dead_inbox,
+            ReceiverScope::SelfLoop => guard.dead_self_loop,
+        };
+        let buf = guard
             .map
             .entry((sender_proc, stage_id, partition))
             .or_insert_with(|| {
@@ -863,7 +954,14 @@ impl DrainHandle {
                 // inbox is shared across all senders.
                 DrainBuffer::new(1)
             })
-            .clone()
+            .clone();
+        drop(guard);
+        if scope_dead {
+            buf.fail_pending(
+                "transport receiver detached before this channel's EOF; the producer went away",
+            );
+        }
+        buf
     }
 
     /// Cancel every registered channel buffer. Called from `Drop` to unblock any consumer waiting on
@@ -919,9 +1017,10 @@ impl DrainHandle {
 
         let mut slots = self.coop_receivers.lock().unwrap();
         for slot in slots.iter_mut() {
-            let Some(rx) = slot.as_ref() else {
+            let Some((scope, rx)) = slot.as_ref() else {
                 continue;
             };
+            let scope = *scope;
             for _ in 0..MAX_BATCHES_PER_SOURCE_PER_PASS {
                 match rx.try_recv_batch() {
                     RecvBatchOutcome::Batch { header, batch } => {
@@ -946,18 +1045,27 @@ impl DrainHandle {
                     RecvBatchOutcome::Detached => {
                         // Only THIS receiver is dead. The drain holds multiple receivers
                         // (own-inbox MPSC + self-loop in-proc); one going away doesn't
-                        // imply the others have. Don't fire a registry-wide "all channels
-                        // EOF" here, or channel buffers waiting on a still-live sibling
-                        // receiver would falsely terminate. Per-channel EOF flows via the
-                        // demuxed Eof frame above; query-teardown unblock flows via
-                        // `cancel_channel_buffers` from `DrainHandle::Drop`.
+                        // imply the others have. Fail only the channels this receiver's
+                        // scope feeds, and only those still waiting on their `Eof`: after a
+                        // clean drain the detach is the ring's normal end of life, but a
+                        // channel that never got its `Eof` (producer crash, early sender
+                        // drop) would otherwise spin on `try_pop -> None` forever.
                         *slot = None;
+                        self.fail_scope(
+                            scope,
+                            "transport receiver detached before this channel's EOF; the \
+                             producer went away",
+                        );
                         break;
                     }
                     RecvBatchOutcome::Error(e) => {
-                        // Same reasoning as Detached: drop only this slot. The error itself
-                        // still propagates up; caller surfaces it as a query error.
+                        // Same scoping as Detached, but the ring reported corruption (or the
+                        // receiver poisoned itself), so even completed siblings can't be
+                        // trusted to have been the last word. Still scope-limited: the other
+                        // receiver is an independent transport. The error also propagates to
+                        // this caller directly.
                         *slot = None;
+                        self.fail_scope(scope, &format!("transport receiver failed: {e}"));
                         return Err(e);
                     }
                 }
@@ -1079,6 +1187,9 @@ mod tests {
             loop {
                 if let Some(batch) = guard.queue.pop_front() {
                     return DrainItem::Batch(batch);
+                }
+                if let Some(msg) = &guard.failed {
+                    return DrainItem::Failed(msg.clone());
                 }
                 if guard.cancelled || guard.sources_done >= guard.num_sources {
                     return DrainItem::Eof;
@@ -1408,10 +1519,12 @@ mod tests {
         match buf.pop_front() {
             DrainItem::Batch(b) => assert_eq!(b.num_rows(), 3),
             DrainItem::Eof => panic!("expected batch"),
+            DrainItem::Failed(msg) => panic!("unexpected failure: {msg}"),
         }
         match buf.pop_front() {
             DrainItem::Batch(b) => assert_eq!(b.num_rows(), 5),
             DrainItem::Eof => panic!("expected batch"),
+            DrainItem::Failed(msg) => panic!("unexpected failure: {msg}"),
         }
         matches!(buf.pop_front(), DrainItem::Eof);
     }
@@ -1431,6 +1544,7 @@ mod tests {
         match buf.pop_front() {
             DrainItem::Batch(b) => assert_eq!(b.num_rows(), 2),
             DrainItem::Eof => panic!("expected batch first"),
+            DrainItem::Failed(msg) => panic!("unexpected failure: {msg}"),
         }
         assert!(matches!(buf.pop_front(), DrainItem::Eof));
         handle.join().unwrap();
@@ -1781,7 +1895,7 @@ mod tests {
         let s00 = base.clone_with_header(MppFrameHeader::batch(0, 0, 0));
         let s01 = base.clone_with_header(MppFrameHeader::batch(0, 1, 0));
         let receiver = MppReceiver::new(Box::new(rx));
-        let handle = DrainHandle::cooperative(vec![receiver]);
+        let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
         s00.send_batch(&sample_batch(2)).unwrap();
         s01.send_batch(&sample_batch(7)).unwrap();
@@ -1818,7 +1932,7 @@ mod tests {
         let s00 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(0, 0, 0));
         let s01 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(0, 1, 0));
         let receiver = MppReceiver::new(Box::new(rx));
-        let handle = DrainHandle::cooperative(vec![receiver]);
+        let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
         s00.send_batch(&sample_batch(4)).unwrap();
         let mut eof_buf = Vec::new();
@@ -1855,7 +1969,7 @@ mod tests {
         // DrainBuffer instance.
         let (_tx, rx) = in_proc_channel(8);
         let receiver = MppReceiver::new(Box::new(rx));
-        let handle = DrainHandle::cooperative(vec![receiver]);
+        let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
         let first = handle.register_channel(0, 2, 3);
         let second = handle.register_channel(0, 2, 3);
@@ -1871,7 +1985,7 @@ mod tests {
         let s_stage0 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(0, 0, 0));
         let s_stage1 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(1, 0, 0));
         let receiver = MppReceiver::new(Box::new(rx));
-        let handle = DrainHandle::cooperative(vec![receiver]);
+        let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
         s_stage0.send_batch(&sample_batch(2)).unwrap();
         s_stage1.send_batch(&sample_batch(9)).unwrap();
@@ -1904,7 +2018,7 @@ mod tests {
         // leave a consumer blocked on a buffer that will never see EOF.
         let (_tx, rx) = in_proc_channel(8);
         let receiver = MppReceiver::new(Box::new(rx));
-        let handle = DrainHandle::cooperative(vec![receiver]);
+        let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
         let buf_a = handle.register_channel(0, 0, 0);
         let buf_b = handle.register_channel(0, 7, 3);

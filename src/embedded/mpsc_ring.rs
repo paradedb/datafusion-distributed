@@ -1,19 +1,19 @@
-// Copyright (c) 2023-2026 ParadeDB, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// This file is part of ParadeDB - Postgres for Search and Analytics
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! DSM-backed MPSC ring for MPP mesh inboxes.
 //!
@@ -210,16 +210,12 @@ pub(super) struct DsmMpscRingHeader {
     detached: AtomicBool,
     _pad_after_detached: [u8; 3],
     /// Packed `(pgprocno: i32, pid: i32)` of the registered receiver, or 0 (both
-    /// fields zero / pgprocno not NO_RECEIVER but treated as unset by `wake_receiver`
-    /// because `unpack` returns pgprocno=0 which is < NO_RECEIVER=−1 check). The
-    /// `0_u64` initial state encodes `(pgprocno=0, pid=0)`. pgprocno=0 is the
-    /// postmaster slot, so we still need an explicit `NO_RECEIVER` (-1) to indicate
-    /// "unset"; producers check the pgprocno field for `>= 0 && < allProcCount`
-    /// before resolving.
-    ///
-    /// Packing both fields into one atomic eliminates the torn-read scenario where a
-    /// producer would otherwise observe `(new_pgprocno, old_pid)` mid-update and
-    /// either skip a legitimate wake or wake the wrong backend.
+    /// Opaque receiver token, set by the consumer via `set_receiver` and handed to the
+    /// embedder's `Wakeup` seam on every post-publish wake. Initialized to
+    /// [`NO_RECEIVER_TOKEN`] (`u64::MAX`), which producers treat as "no receiver yet:
+    /// skip the wake". The embedder defines the token's contents (pg_search packs
+    /// `(pgprocno, pid)`); a single atomic keeps whatever pair it packs from being
+    /// observed torn mid-update.
     receiver_packed: AtomicU64,
     /// Padding to push `head` onto its own cache line. Header up to here uses bytes
     /// 0..32; this padding fills 32..64 so `head` lands at offset 64 exactly. The
@@ -751,6 +747,11 @@ impl DsmMpscSender {
     /// Out-of-order publish would make the receiver block on a `Continue` whose data
     /// is already there but whose `seq` hasn't been stored yet, wasting one drain
     /// pass per fragment.
+    // Fairness caveat: a multi-slot frame needs `n_slots` consecutive empty slots starting at
+    // `tail`, and competing single-slot producers can keep winning the CAS, so a large frame
+    // has no progress bound under sustained contention. The cooperative drain keeps retrying
+    // (no deadlock), but latency is unbounded; revisit with a reservation scheme if it shows
+    // up in send stats.
     fn try_send_multi_slot(
         &self,
         header: &DsmMpscRingHeader,

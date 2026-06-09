@@ -26,6 +26,15 @@
 //! The point of hosting it in this crate is testing: the in-process instantiation runs real
 //! distributed queries through the transport in this crate's CI, so an upstream rebase that
 //! breaks the `WorkerTransport` contract fails here, before any downstream embedder rebuilds.
+//!
+//! Two assumptions an embedder signs up for:
+//! - Execution is cooperative on a current-thread runtime: consumers spin on
+//!   `try_pop` + `yield_now` and producers drain their own inbound while blocked, instead of
+//!   parking on the `Wakeup` seam. On a multi-thread runtime each stream burns a core while
+//!   idle.
+//! - Inbound frames demux into unbounded per-channel buffers, so a consumer that falls behind
+//!   buffers the in-flight intermediate result in process memory. The rings in shared memory
+//!   stay bounded; the overflow lives on the consumer's heap.
 
 mod dsm;
 mod mesh;
@@ -43,6 +52,7 @@ pub use setup::{
 };
 pub use transport::{
     CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
+    SendBatchStats,
 };
 
 // In-process instantiation + the end-to-end test that runs a real distributed query through the

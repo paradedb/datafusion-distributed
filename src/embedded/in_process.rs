@@ -165,7 +165,11 @@ fn collect_stages(
                 .local_plan()
                 .map_or(0, |p| p.properties().partitioning.partition_count());
             (0..n_out)
-                .map(|q| nb.route_partition(q).consumer_task as u32)
+                .map(|q| {
+                    nb.route_partition(q)
+                        .expect("coalesce is special-cased; slice-layout boundaries route")
+                        .consumer_task as u32
+                })
                 .collect::<Vec<u32>>()
         };
         let plan_any = plan.as_ref().as_any();

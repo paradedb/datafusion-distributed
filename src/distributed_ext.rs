@@ -225,7 +225,7 @@ pub trait DistributedExt: Sized {
         resolver: T,
     ) -> Self;
 
-    /// Same as [DistributedExt::with_distributed_channel_resolver] but with an in-place mutation.
+    /// Same as [DistributedExt::with_distributed_worker_resolver] but with an in-place mutation.
     fn set_distributed_worker_resolver<T: WorkerResolver + Send + Sync + 'static>(
         &mut self,
         resolver: T,

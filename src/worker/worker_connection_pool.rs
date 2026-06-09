@@ -161,8 +161,8 @@ impl WorkerConnectionPool {
                     .map(|v| Box::new(v) as Box<_>)
                     .map_err(Arc::new)
                 }
-                // Without the `flight` feature there is no remote transport. An embedder must
-                // supply local comms for every task it routes here.
+                // Without the `flight` feature there is no remote transport, so any
+                // cross-worker route fails here.
                 #[cfg(not(feature = "flight"))]
                 internal_err!(
                     "cannot reach worker at {target_url}: built without the `flight` feature"

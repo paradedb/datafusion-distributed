@@ -1,28 +1,34 @@
 #![deny(clippy::all)]
-// With `flight` off there is no built-in transport, so the worker-side serve/execute path and the
-// coordinator metrics back-channel are compiled but dormant until an embedder registers its own
-// transport. Keep that machinery in the crate (a non-Flight transport builds on it) without warning
-// about it being unreached in this configuration.
-#![cfg_attr(not(feature = "flight"), allow(dead_code))]
 
 mod common;
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod config_extension_ext;
 mod distributed_ext;
 mod execution_plans;
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod metrics;
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod passthrough_headers;
 mod stage;
+// With `flight` off there is no remote transport, so the worker-side serve/execute path and the
+// coordinator metrics back-channel are compiled but dormant. A non-Flight transport builds on
+// that machinery, so it stays in the crate; the `allow` is scoped per module to keep dead-code
+// detection live for the rest of the crate.
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod worker;
 
 mod distributed_planner;
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod networking;
 #[cfg(feature = "flight")]
 mod observability;
 mod protobuf;
 pub use protobuf::DistributedCodec;
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod coordinator;
 #[cfg(any(feature = "integration", test))]
 pub mod test_utils;
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod work_unit_feed;
 
 pub use arrow_ipc::CompressionType;

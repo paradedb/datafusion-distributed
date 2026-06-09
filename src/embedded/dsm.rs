@@ -51,7 +51,7 @@ use super::mesh::{align_up_maxalign_checked, aligned_queue_bytes};
 use super::mpsc_ring::{self, DsmMpscReceiver, DsmMpscRingHeader, DsmMpscSender, Wakeup};
 
 /// Number of slots in each per-receiver MPSC ring. With operator-visible
-/// `paradedb.mpp_queue_size` divided across `RING_SLOTS` slots, each slot holds
+/// The embedder's queue-size knob divided across `RING_SLOTS` slots, each slot holds
 /// up to `(queue_bytes / RING_SLOTS) - SLOT_HEADER` bytes of payload. That's enough
 /// for typical Arrow batches at the bench scales we measured. Fixed at compile time
 /// for now; a future GUC could expose it if bench data points at a different sweet
@@ -177,7 +177,7 @@ pub(super) struct DsmLayout {
 /// inbox and the receiver demultiplexes by `MppFrameHeader::sender_proc`.
 ///
 /// `queue_bytes` is the per-inbox total (ring header + `RING_SLOTS` slots).
-/// Operator-facing `paradedb.mpp_queue_size` controls this value.
+/// The embedder's operator-facing queue-size knob controls this value.
 pub(super) fn compute_dsm_layout(
     n_procs: u32,
     queue_bytes: usize,
@@ -188,8 +188,8 @@ pub(super) fn compute_dsm_layout(
     }
     // MAXALIGN-round-down first (operator-friendly), then round up to the ring's
     // 64-byte alignment requirement. Doing it in this order means each per-inbox
-    // region is both MAXALIGN-aligned (PG DSM convention) AND cache-line aligned
-    // (DsmMpscRingHeader's repr(C, align(64)) requirement).
+    // region is both MAXALIGN-aligned (PG DSM convention) AND cache-line aligned,
+    // which keeps the rings' hot header fields on separate cache lines.
     let queue_bytes = aligned_queue_bytes(queue_bytes);
     if queue_bytes == 0 {
         return Err("mpp: queue_bytes too small after alignment");
@@ -516,5 +516,17 @@ mod tests {
         let l = compute_dsm_layout(2, 64 * 1024, 0).unwrap();
         let h = MppDsmHeader::from_layout(&l);
         assert!(h.validate(l.region_total as u64 + 1).is_err());
+    }
+
+    /// Pins the coupling between `compute_dsm_layout`'s minimum check and `ring_dims_for`'s
+    /// slot-capacity floor: a queue sized below the floored ring must be rejected, or
+    /// `create_at` would write past its inbox region.
+    #[test]
+    fn layout_rejects_queue_smaller_than_floored_ring() {
+        let floored = DsmMpscRingHeader::region_bytes(RING_SLOTS, MIN_SLOT_CAPACITY);
+        let too_small = DsmMpscRingHeader::region_bytes(RING_SLOTS, 1);
+        assert!(too_small < floored);
+        assert!(compute_dsm_layout(2, too_small, 0).is_err());
+        assert!(compute_dsm_layout(2, floored.next_multiple_of(64), 0).is_ok());
     }
 }

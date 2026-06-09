@@ -723,17 +723,17 @@ impl MppSender {
 #[derive(Default, Debug, Clone)]
 pub struct SendBatchStats {
     /// Cumulative time spent inside `encode_frame_into` (header + Arrow IPC serialization).
-    pub(super) encode: Duration,
+    pub encode: Duration,
     /// Cumulative wall time in the send-retry spin after the first failed
     /// `try_send_bytes`. Zero if the first try succeeded.
-    pub(super) send_wait: Duration,
+    pub send_wait: Duration,
     /// Cumulative time spent in `try_drain_pass` while spinning on a
     /// full outbound. A subset of `send_wait`; the remainder is the
     /// `tokio::task::yield_now()` await + the (small) cost of
     /// `try_send_bytes` itself.
-    pub(super) coop_drain_in_spin: Duration,
+    pub coop_drain_in_spin: Duration,
     /// Count of `try_send_bytes` calls that returned `Ok(false)` (full).
-    pub(super) spin_iters: u64,
+    pub spin_iters: u64,
 }
 
 /// A [`crate::PartitionSink`] over one [`MppSender`]: the produce loop's per-partition send end.

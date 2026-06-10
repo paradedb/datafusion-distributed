@@ -99,7 +99,7 @@ pub(crate) struct LocalWorkerContext {
 /// it will initialize the corresponding position in the vector matching the provided `target_task`
 /// index.
 pub(crate) struct WorkerConnectionPool {
-    connections: Vec<OnceLockResult<Box<dyn WorkerConnection + Sync + Send>>>,
+    connections: Vec<OnceLockResult<Box<dyn WorkerConnection>>>,
     pub(crate) metrics: ExecutionPlanMetricsSet,
 }
 
@@ -126,7 +126,7 @@ impl WorkerConnectionPool {
         target_partitions: Range<usize>,
         target_task: usize,
         ctx: &Arc<TaskContext>,
-    ) -> Result<&(dyn WorkerConnection + Sync + Send)> {
+    ) -> Result<&dyn WorkerConnection> {
         let Some(worker_connection) = self.connections.get(target_task) else {
             return internal_err!(
                 "WorkerConnections: Task index {target_task} not found, only have {} tasks",
@@ -135,7 +135,7 @@ impl WorkerConnectionPool {
         };
 
         let conn = worker_connection.get_or_init(|| {
-            get_distributed_worker_transport(ctx)
+            get_distributed_worker_transport(ctx.session_config())
                 .open(
                     input_stage,
                     target_partitions,
@@ -156,43 +156,6 @@ impl WorkerConnectionPool {
 #[cfg(feature = "flight")]
 type WorkerMsg = Result<(FlightData, FlightAppMetadata), Status>;
 
-/// The default [WorkerTransport]: opens an Arrow-Flight gRPC stream per remote task, or bypasses
-/// gRPC with local comms when the target worker happens to be the current process.
-#[cfg(feature = "flight")]
-#[derive(Clone, Default)]
-pub struct FlightWorkerTransport;
-
-#[cfg(feature = "flight")]
-impl WorkerTransport for FlightWorkerTransport {
-    fn open(
-        &self,
-        input_stage: &RemoteStage,
-        target_partitions: Range<usize>,
-        target_task: usize,
-        ctx: &Arc<TaskContext>,
-        metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
-        let Some(target_url) = input_stage.workers.get(target_task) else {
-            return internal_err!("input_stage.workers[{target_task}] out of range.");
-        };
-        if let Some(lw_ctx) = ctx.session_config().get_extension::<LocalWorkerContext>()
-            && &lw_ctx.self_url == target_url
-        {
-            // Reach ourselves through local comms instead of a gRPC call.
-            Ok(Box::new(LocalWorkerConnection::init(
-                input_stage,
-                target_partitions,
-                target_task,
-                lw_ctx,
-                metrics,
-            )))
-        } else {
-            RemoteWorkerConnection::init(input_stage, target_partitions, target_task, ctx, metrics)
-                .map(|v| Box::new(v) as Box<dyn WorkerConnection + Send + Sync>)
-        }
-    }
-}
-
 /// Represents a connection to one [Worker]. Network boundaries will use this for streaming
 /// data from single partitions while the actual network communication is handling all the partitions
 /// under the hood.
@@ -205,7 +168,7 @@ impl WorkerTransport for FlightWorkerTransport {
 /// partition VS a single gRPC stream interleaving multiple partitions. The whole serialized plan
 /// needs to be sent over the wire on every gRPC call, so the less gRPC calls we do the better.
 #[cfg(feature = "flight")]
-struct RemoteWorkerConnection {
+pub(super) struct RemoteWorkerConnection {
     task: Arc<SpawnedTask<()>>,
     not_consumed_streams: Arc<AtomicUsize>,
     cancel_token: CancellationToken,
@@ -222,7 +185,7 @@ struct RemoteWorkerConnection {
 
 #[cfg(feature = "flight")]
 impl RemoteWorkerConnection {
-    fn init(
+    pub(super) fn init(
         input_stage: &RemoteStage,
         target_partition_range: Range<usize>,
         target_task: usize,
@@ -500,7 +463,7 @@ pub(crate) struct LocalWorkerConnection {
 }
 
 impl LocalWorkerConnection {
-    fn init(
+    pub(super) fn init(
         input_stage: &RemoteStage,
         target_partition_range: Range<usize>,
         target_task: usize,

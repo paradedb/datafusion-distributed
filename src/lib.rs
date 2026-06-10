@@ -32,7 +32,7 @@ pub mod test_utils;
 mod work_unit_feed;
 
 pub use arrow_ipc::CompressionType;
-pub use coordinator::DistributedExec;
+pub use coordinator::{DistributedExec, MetricsStore};
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
     DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
@@ -64,15 +64,16 @@ pub use work_unit_feed::{
     DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
 };
 #[cfg(feature = "flight")]
+pub use worker::FlightWorkerTransport;
+#[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
 #[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
-#[cfg(feature = "flight")]
-pub use worker::FlightWorkerTransport;
 pub use worker::{
     DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt, TaskData,
-    Worker, WorkerConnection, WorkerQueryContext, WorkerSessionBuilder, WorkerTransport,
+    Worker, WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerQueryContext,
+    WorkerSessionBuilder, WorkerTransport,
 };
 
 #[cfg(feature = "flight")]

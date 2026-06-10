@@ -1,4 +1,8 @@
 pub(crate) mod generated;
+// New Flight-side transport code lands here, behind this one gate, so the sibling modules
+// stay free of per-item `flight` attributes.
+#[cfg(feature = "flight")]
+mod flight;
 #[cfg(feature = "flight")]
 mod impl_coordinator_channel;
 mod impl_execute_task;
@@ -14,10 +18,10 @@ mod worker_connection_pool;
 mod worker_service;
 
 #[cfg(feature = "flight")]
-pub(crate) use single_write_multi_read::SingleWriteMultiRead;
-pub use transport::{WorkerConnection, WorkerTransport};
+pub use flight::FlightWorkerTransport;
 #[cfg(feature = "flight")]
-pub use worker_connection_pool::FlightWorkerTransport;
+pub(crate) use single_write_multi_read::SingleWriteMultiRead;
+pub use transport::{WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerTransport};
 #[cfg(feature = "flight")]
 pub(crate) use worker_connection_pool::LocalWorkerContext;
 pub(crate) use worker_connection_pool::WorkerConnectionPool;

@@ -1,13 +1,9 @@
 use crate::coordinator::MetricsStore;
 use crate::coordinator::distributed::PreparedPlan;
-#[cfg(feature = "flight")]
-use crate::coordinator::task_spawner::{
-    CoordinatorToWorkerMetrics, CoordinatorToWorkerTaskSpawner,
-};
 use crate::stage::RemoteStage;
 use crate::{
     DistributedConfig, NetworkBoundaryExt, Stage, TaskEstimator, TaskRoutingContext,
-    get_distributed_worker_resolver,
+    WorkerDispatchRequest, get_distributed_worker_resolver, get_distributed_worker_transport,
 };
 use datafusion::common::runtime::JoinSet;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -23,12 +19,12 @@ use url::Url;
 /// 1. Perform some worker URL assignation, choosing either:
 ///    - The URLs set by the user with [crate::TaskEstimator::route_tasks].
 ///    - Randomly otherwise
-/// 2. Sending the sliced subplans to the assigned URLs. For each URL assigned to a task, a
-///    network call feeding the subplan is necessary.
+/// 2. Handing each stage's sliced subplans to the registered [crate::WorkerTransport]'s
+///    dispatcher, which owns the delivery to the assigned workers.
 /// 3. In each network boundary, set the input plan to `None`. That way, network boundaries
 ///    become nodes without children and traversing them will not go further down in.
-/// 4. Spawn a background task per worker that waits for the worker to finish and collects
-///    its metrics into [DistributedExec::task_metrics] via the coordinator channel.
+/// 4. The dispatcher may spawn background per-worker work (plan delivery, work-unit feeds)
+///    onto the query's `JoinSet`, which propagates failures to the query head.
 pub(super) fn prepare_static_plan(
     base_plan: &Arc<dyn ExecutionPlan>,
     metrics: &ExecutionPlanMetricsSet,
@@ -50,15 +46,12 @@ pub(super) fn prepare_static_plan(
         let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
         worker_resolver.get_urls()?
     };
+    // One dispatcher per query: it carries per-query state (plan-send metrics, the query start
+    // timestamp) across every stage's dispatch. In-process embedders deliver plans over their
+    // own side channel, so no dispatcher is created for them.
+    let dispatcher =
+        (!in_process).then(|| get_distributed_worker_transport(ctx.session_config()).dispatcher());
 
-    // `metrics` / `task_metrics` only feed the gRPC plan-send and metrics-collection tasks.
-    #[cfg(not(feature = "flight"))]
-    let _ = (metrics, task_metrics);
-    #[cfg(feature = "flight")]
-    let metrics = CoordinatorToWorkerMetrics::new(metrics);
-
-    // `join_set` only receives the gRPC dispatch tasks, so it is mutated only under `flight`.
-    #[cfg_attr(not(feature = "flight"), allow(unused_mut))]
     let mut join_set = JoinSet::new();
     let prepared = Arc::clone(base_plan).transform_up(|plan| {
         // The following logic is just applied on network boundaries.
@@ -73,10 +66,6 @@ pub(super) fn prepare_static_plan(
         let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
         let task_estimator = &d_cfg.__private_task_estimator;
 
-        #[cfg(feature = "flight")]
-        let mut spawner =
-            CoordinatorToWorkerTaskSpawner::new(stage, &metrics, task_metrics, ctx, &mut join_set)?;
-
         let routed_urls = match task_estimator.route_tasks(&TaskRoutingContext {
             task_ctx: Arc::clone(ctx),
             plan: &stage.plan,
@@ -87,6 +76,12 @@ pub(super) fn prepare_static_plan(
             // If the user has not defined custom routing with a `route_tasks` implementation, we
             // default to round-robin task assignation from a randomized starting point.
             Ok(None) => {
+                if available_urls.is_empty() {
+                    return exec_err!(
+                        "the worker resolver returned no URLs; default routing needs at least \
+                         one (a custom `route_tasks` implementation lifts this requirement)"
+                    );
+                }
                 let start_idx = rand::rng().random_range(0..available_urls.len());
                 (0..stage.tasks)
                     .map(|i| available_urls[(start_idx + i) % available_urls.len()].clone())
@@ -103,34 +98,27 @@ pub(super) fn prepare_static_plan(
             );
         }
 
-        let mut workers = Vec::with_capacity(stage.tasks);
-        for (i, routed_url) in routed_urls.into_iter().enumerate() {
-            workers.push(routed_url.clone());
-            if in_process {
-                // Skip the coordinator -> worker gRPC plumbing: the embedder ships the
-                // worker plan over a side channel and exposes its own `WorkerTransport`.
-                // The URL still lands on `RemoteStage` because the transport keys off
-                // `target_task` (the index into `RemoteStage::workers`).
-                continue;
-            }
-            // Dispatch the subplan to the chosen worker over gRPC, one task per worker. Absent when
-            // Flight is compiled out; the URL still lands on `RemoteStage` because a transport keys
-            // off `target_task` (the index into `RemoteStage::workers`).
-            #[cfg(feature = "flight")]
-            {
-                let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;
-                spawner.metrics_collection_task(i, worker_rx);
-                spawner.work_unit_feed_task(Arc::clone(ctx), i, tx)?;
-            }
-            #[cfg(not(feature = "flight"))]
-            let _ = i;
+        // Hand each task's plan to its assigned worker. The transport owns the delivery (Flight
+        // ships a `SetPlanRequest` over gRPC; an embedded transport routes by `target_task`), so
+        // the coordinator no longer special-cases the gRPC send. In-process embedders deliver
+        // plans over their own side channel; the URLs still land on `RemoteStage` because the
+        // transport keys off `target_task` (the index into `RemoteStage::workers`).
+        if let Some(dispatcher) = &dispatcher {
+            dispatcher.dispatch(WorkerDispatchRequest {
+                stage,
+                routed_urls: &routed_urls,
+                task_ctx: ctx,
+                metrics,
+                metrics_store: task_metrics.as_ref(),
+                join_set: &mut join_set,
+            })?;
         }
 
         Ok(Transformed::yes(plan.with_input_stage(Stage::Remote(
             RemoteStage {
                 query_id: stage.query_id,
                 num: stage.num,
-                workers,
+                workers: routed_urls,
             },
         ))?))
     })?;

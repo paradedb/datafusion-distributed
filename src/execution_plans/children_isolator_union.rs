@@ -198,6 +198,8 @@ impl ChildrenIsolatorUnionExec {
 
     /// Trims out all the children that are going to be ignored based on the provided
     /// task index. These children are replaced by [EmptyExec] as placeholders.
+    // Only the flight-gated worker execute path specializes plans per task.
+    #[cfg_attr(not(feature = "flight"), allow(dead_code))]
     pub(crate) fn to_task_specialized(&self, task_i: usize) -> Self {
         let mut children_to_keep = vec![];
         for (child_i, _) in &self.task_idx_map[task_i] {

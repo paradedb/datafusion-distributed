@@ -365,7 +365,7 @@ impl TaskEstimator for CombinedTaskEstimator {
 mod tests {
     use super::*;
     use crate::networking::WorkerResolverExtension;
-    use crate::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver;
+    use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
     use crate::test_utils::parquet::register_parquet_tables;
     use datafusion::error::DataFusionError;
     use datafusion::prelude::SessionContext;

@@ -32,6 +32,17 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  clippy-no-flight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          components: clippy
+      # `--lib` keeps the benchmarks dev-dependency out of the graph; building any test
+      # target would re-enable `flight` through feature unification.
+      - run: cargo clippy --lib --no-default-features -- -D warnings
+
   unit-test:
     runs-on: ubuntu-latest
     steps:

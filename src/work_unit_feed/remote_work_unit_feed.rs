@@ -1,4 +1,4 @@
-use crate::common::{now_ns, serialize_uuid};
+use crate::common::now_ns;
 use crate::worker::generated::worker as pb;
 use crate::{BytesMetricExt, LatencyMetricExt, WorkUnit};
 use datafusion::common::{HashMap, Result, exec_err};
@@ -9,13 +9,20 @@ use datafusion_proto::protobuf::proto_error;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
+#[cfg(feature = "flight")]
+use crate::common::serialize_uuid;
+#[cfg(feature = "flight")]
+use tokio::sync::mpsc::UnboundedSender;
+
+#[cfg(feature = "flight")]
 pub(crate) type WorkUnitTx = UnboundedSender<Result<pb::WorkUnit>>;
 pub(crate) type WorkUnitRx = UnboundedReceiver<Result<pb::WorkUnit>>;
 pub(crate) type RemoteWorkUnitFeedRxs = HashMap<(Uuid, usize), Mutex<Option<WorkUnitRx>>>;
+#[cfg(feature = "flight")]
 pub(crate) type RemoteWorkUnitFeedTxs = HashMap<(Uuid, usize), WorkUnitTx>;
 
 /// Bridge between the worker's gRPC layer and the remote-variant
@@ -29,12 +36,14 @@ pub(crate) type RemoteWorkUnitFeedTxs = HashMap<(Uuid, usize), WorkUnitTx>;
 ///   variant of [`crate::WorkUnitFeed`]), which decodes the bytes back into the leaf plan's
 ///   concrete `T::WorkUnit` type so the leaf sees the same typed stream as it would in a
 ///   single-node execution.
+#[cfg(feature = "flight")]
 #[derive(Default)]
 pub(crate) struct RemoteWorkUnitFeedRegistry {
     pub(crate) receivers: RemoteWorkUnitFeedRxs,
     pub(crate) senders: RemoteWorkUnitFeedTxs,
 }
 
+#[cfg(feature = "flight")]
 impl RemoteWorkUnitFeedRegistry {
     /// Creates all the receivers and senders for a specific [WorkUnit] Feed id. One feed per
     /// partition is created.
@@ -47,6 +56,7 @@ impl RemoteWorkUnitFeedRegistry {
     }
 }
 
+#[cfg(feature = "flight")]
 pub(crate) fn build_work_unit_msg(
     id: &Uuid,
     partition: usize,
@@ -67,6 +77,7 @@ pub(crate) fn build_work_unit_msg(
     }
 }
 
+#[cfg(feature = "flight")]
 pub(crate) fn set_work_unit_send_time(
     mut msg: pb::CoordinatorToWorkerMsg,
 ) -> pb::CoordinatorToWorkerMsg {
@@ -79,6 +90,7 @@ pub(crate) fn set_work_unit_send_time(
     msg
 }
 
+#[cfg(feature = "flight")]
 pub(crate) fn set_work_unit_received_time(
     mut msg: pb::CoordinatorToWorkerMsg,
 ) -> pb::CoordinatorToWorkerMsg {

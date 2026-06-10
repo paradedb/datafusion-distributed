@@ -4,7 +4,7 @@ use crate::common::serialize_uuid;
 use crate::coordinator::DistributedExec;
 use crate::distributed_ext::DistributedExt;
 use crate::stage::Stage;
-use crate::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver;
+use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
 use crate::worker::generated::worker::TaskKey;
 #[cfg(test)]
 use crate::{DistributedConfig, TaskEstimation, TaskEstimator};

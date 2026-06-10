@@ -1,23 +1,24 @@
-use crate::common::{TreeNodeExt, now_ns, serialize_uuid, task_ctx_with_extension};
+use crate::common::{TreeNodeExt, now_ns, serialize_uuid};
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::MetricsStore;
 use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::protobuf::tonic_status_to_datafusion_error;
 use crate::stage::LocalStage;
-use crate::work_unit_feed::{build_work_unit_msg, set_work_unit_send_time};
+use crate::work_unit_feed::{
+    build_work_unit_msg, collect_task_work_unit_feeds, set_work_unit_send_time,
+};
 use crate::worker::generated::worker as pb;
 use crate::worker::generated::worker::coordinator_to_worker_msg::Inner;
 use crate::worker::generated::worker::set_plan_request::WorkUnitFeedDeclaration;
 use crate::{
     DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedConfig,
-    DistributedTaskContext, DistributedWorkUnitFeedContext, TaskKey,
-    get_distributed_channel_resolver,
+    DistributedTaskContext, TaskKey, get_distributed_channel_resolver,
 };
 use datafusion::common::Result;
 use datafusion::common::instant::Instant;
 use datafusion::common::runtime::JoinSet;
-use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
+use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DataFusionError, exec_datafusion_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr_common::metrics::{
@@ -260,53 +261,20 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         task_i: usize,
         tx: UnboundedSender<pb::CoordinatorToWorkerMsg>,
     ) -> Result<()> {
-        let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
-        let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
-
-        let d_ctx = DistributedTaskContext {
-            task_index: task_i,
-            task_count: self.task_count,
-        };
         let mut futures = vec![];
-        self.plan.apply_with_dt_ctx(d_ctx, |plan, d_ctx| {
-            let Some(wuf) = wuf_registry.get_work_unit_feed(plan) else {
-                return Ok(TreeNodeRecursion::Continue);
-            };
-
-            let partitions = plan.properties().partitioning.partition_count();
-            let start_partition = partitions * d_ctx.task_index;
-            let end_partition = start_partition + partitions;
-
-            let dist_feed_ctx = DistributedWorkUnitFeedContext {
-                fan_out_tasks: d_ctx.task_count,
-            };
-            let t_ctx = Arc::new(task_ctx_with_extension(&ctx, dist_feed_ctx));
-
-            // There should be as many partition feeds as [num partitions] * [num tasks], so that
-            // each task index handles a non-overlapping set of partition feeds.
-            for (partition, feed_idx) in (start_partition..end_partition).enumerate() {
-                // By calling `.take()` the respective partition feed is consumed, and further
-                // consumptions are allowed. Calling `.take()` on the same partition feed again
-                // will fail.
-                let mut work_unit_feed = wuf.feed(feed_idx, Arc::clone(&t_ctx))?;
-                let tx = tx.clone();
-                let id = wuf.id();
-                futures.push(Box::pin(async move {
-                    // At this point, the partition feed contains a stream of decoded messages,
-                    // so they must be encoded in order to send them over the wire.
-                    while let Some(data_or_err) = work_unit_feed.next().await {
-                        if tx
-                            .send(build_work_unit_msg(&id, partition, data_or_err?))
-                            .is_err()
-                        {
-                            break; // channel closed.
-                        };
+        for mut stream in collect_task_work_unit_feeds(self.plan, &ctx, task_i, self.task_count)? {
+            let tx = tx.clone();
+            futures.push(Box::pin(async move {
+                // Wrap each encoded work unit in the Flight envelope and push it over the
+                // coordinator-to-worker stream.
+                while let Some(work_unit) = stream.next().await {
+                    if tx.send(build_work_unit_msg(work_unit?)).is_err() {
+                        break; // channel closed.
                     }
-                    Ok::<_, DataFusionError>(())
-                }));
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
+                }
+                Ok::<_, DataFusionError>(())
+            }));
+        }
         self.join_set.spawn(async move {
             futures::future::try_join_all(futures).await?;
             Ok(())

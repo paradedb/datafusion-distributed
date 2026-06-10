@@ -1,5 +1,5 @@
 use crate::common::deserialize_uuid;
-use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
+use crate::work_unit_feed::{WorkUnitFeedChannels, set_work_unit_received_time};
 use crate::worker::LocalWorkerContext;
 use crate::worker::generated::worker::coordinator_to_worker_msg::Inner;
 use crate::worker::generated::worker::set_plan_request::WorkUnitFeedDeclaration;
@@ -47,10 +47,10 @@ impl Worker {
             .get_with(key.clone(), async { Default::default() })
             .await;
 
-        let mut remote_work_unit_feed_registry = RemoteWorkUnitFeedRegistry::default();
+        let mut work_unit_feed_channels = WorkUnitFeedChannels::default();
         for WorkUnitFeedDeclaration { id, partitions } in &request.work_unit_feed_declarations {
             if let Ok(id) = deserialize_uuid(id) {
-                remote_work_unit_feed_registry.add(id, *partitions as usize);
+                work_unit_feed_channels.add(id, *partitions as usize);
             }
         }
 
@@ -60,7 +60,7 @@ impl Worker {
             let headers = grpc_headers.into_headers();
 
             let mut cfg = SessionConfig::default()
-                .with_extension(Arc::new(remote_work_unit_feed_registry.receivers))
+                .with_extension(Arc::new(work_unit_feed_channels.receivers))
                 .with_extension(Arc::new(DistributedTaskContext {
                     task_index: key.task_number as usize,
                     task_count: request.task_count as usize,
@@ -120,7 +120,7 @@ impl Worker {
         })?;
 
         // Continue reading remaining messages (work unit feed data) in the background.
-        let work_unit_senders = remote_work_unit_feed_registry.senders;
+        let work_unit_senders = work_unit_feed_channels.senders;
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let mut body = body.map_ok(set_work_unit_received_time);

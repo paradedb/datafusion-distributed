@@ -1,5 +1,6 @@
 use crate::coordinator::MetricsStore;
 use crate::stage::{LocalStage, RemoteStage};
+use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::Result;
 use datafusion::common::runtime::JoinSet;
@@ -17,8 +18,9 @@ use url::Url;
 /// time, so the implementation can reuse a single underlying network/IPC stream and fan messages
 /// out to per-partition queues. Each partition can be streamed exactly once.
 pub trait WorkerConnection: Send + Sync {
-    /// Streams the specified partition. Consumers do not care if the implementation pulls data
-    /// over the wire or from local comms. Streaming the same partition twice is an error.
+    /// Streams the given output `partition`. The connection is opened per stage, so it closes over
+    /// the stage rather than taking it per call. Consumers do not care if the implementation pulls
+    /// data over the wire or from local comms. Streaming the same partition twice is an error.
     fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>>;
 }
 
@@ -38,6 +40,46 @@ pub struct WorkerDispatchRequest<'a> {
     /// their metrics back over its gRPC stream); other transports ignore it.
     pub metrics_store: Option<&'a Arc<MetricsStore>>,
     pub join_set: &'a mut JoinSet<Result<()>>,
+}
+
+/// The producer's send end for one partition channel, symmetric to a [WorkerConnection] read.
+///
+/// Contract with the produce loop:
+/// - Batches arrive in `send` order and can be assumed non-empty.
+/// - After a failed `send` the channel state is unspecified, but the caller still calls
+///   `finish` so the consumer sees EOF; `finish` must tolerate a prior `send` error.
+/// - Dropping a sink without calling `finish` does not end the channel.
+/// - `send` borrows the batch because transports serialize it into their own buffers; none
+///   needs ownership.
+#[async_trait]
+pub trait PartitionSink: Send {
+    /// Sends one batch. A transport that shares an execution resource (e.g. a single OS thread)
+    /// between producers and consumers drains its own inbound inside this future, so a full
+    /// outbound queue yields and retries instead of parking the shared thread. That cooperative
+    /// drain is what stops a symmetric send (every peer sending at once) from deadlocking.
+    async fn send(&mut self, batch: &RecordBatch) -> Result<()>;
+    /// Per-channel EOF, independent of the underlying link. Async for the same reason as `send`:
+    /// flushing the final frame on a shared single-thread runtime may need a cooperative drain.
+    async fn finish(self: Box<Self>) -> Result<()>;
+}
+
+/// The producer (write) side: opens a [PartitionSink] per output partition, symmetric to
+/// [WorkerConnection] (the read side). The worker's produce loop builds one and pushes each output
+/// batch in. A non-Flight transport (e.g. a shared-memory mesh) provides the implementation; it is
+/// constructed by the producer (which knows the per-partition routing), not handed out by the
+/// consume-side transport.
+///
+/// Flight has no [WorkerSink]: it produces inside its gRPC worker service (a streaming response
+/// bound to the request handler), so there is no free-standing sink.
+pub trait WorkerSink: Send + Sync {
+    /// Takes `stage` and `partition` separately because one sink serves every stage, unlike the
+    /// per-stage read connection that closes over its stage.
+    ///
+    /// `stage` is the producing stage's number and `partition` the producer task's own output
+    /// partition index, before routing. Several producer tasks of one stage may hold sinks for
+    /// the same pair, and the consumer merges them, so one `finish` is one producer task's EOF,
+    /// not channel completion (which stays transport-defined).
+    fn open_partition(&self, stage: usize, partition: usize) -> Result<Box<dyn PartitionSink>>;
 }
 
 /// The plan-delivery (write) side of a transport, symmetric to [WorkerConnection] (the read side).

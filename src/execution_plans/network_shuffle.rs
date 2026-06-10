@@ -226,13 +226,14 @@ impl ExecutionPlan for NetworkShuffleExec {
         };
 
         let task_context = DistributedTaskContext::from_ctx(&context);
-        let off = self.properties.partitioning.partition_count() * task_context.task_index;
+        let p_c = self.partitions_per_consumer_task();
+        let off = p_c * task_context.task_index;
 
         let mut streams = Vec::with_capacity(remote_stage.workers.len());
         for input_task_index in 0..remote_stage.workers.len() {
             let worker_connection = self.worker_connections.get_or_init_worker_connection(
                 remote_stage,
-                off..(off + self.properties.partitioning.partition_count()),
+                off..(off + p_c),
                 input_task_index,
                 &context,
             )?;

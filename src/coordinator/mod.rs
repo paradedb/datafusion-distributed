@@ -1,5 +1,6 @@
 mod distributed;
 mod metrics_store;
+mod plan_encoding;
 mod prepare_static_plan;
 #[cfg(feature = "flight")]
 mod task_spawner;

@@ -81,8 +81,6 @@ impl DistributedLeafExec {
     }
 
     /// Returns the variant belonging to provided task index.
-    // Only the flight-gated worker execute path specializes plans per task.
-    #[cfg_attr(not(feature = "flight"), allow(dead_code))]
     pub(crate) fn to_task_specialized(&self, task_i: usize) -> Arc<dyn ExecutionPlan> {
         Arc::clone(&self.variants[task_i])
     }

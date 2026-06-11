@@ -10,8 +10,7 @@ mod work_unit_feed_registry;
 // the seam keeps compiling in that configuration.
 #[cfg_attr(not(feature = "flight"), allow(unused_imports))]
 pub(crate) use coordinator::collect_task_work_unit_feeds;
-#[cfg_attr(not(feature = "flight"), allow(unused_imports))]
-pub(crate) use remote_work_unit_feed::WorkUnitFeedChannels;
+pub(crate) use remote_work_unit_feed::{RemoteWorkUnitFeedTxs, WorkUnitFeedChannels};
 #[cfg(feature = "flight")]
 pub(crate) use remote_work_unit_feed::{
     build_work_unit_msg, set_work_unit_received_time, set_work_unit_send_time,

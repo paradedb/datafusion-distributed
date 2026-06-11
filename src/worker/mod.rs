@@ -5,8 +5,8 @@ pub(crate) mod generated;
 mod flight;
 #[cfg(feature = "flight")]
 mod impl_coordinator_channel;
-#[cfg(feature = "flight")]
 mod impl_execute_task;
+mod impl_set_plan;
 mod session_builder;
 mod single_write_multi_read;
 #[cfg(feature = "flight")]

@@ -23,7 +23,7 @@ mod worker_service;
 pub use flight::FlightWorkerTransport;
 #[cfg(feature = "flight")]
 pub(crate) use flight::LocalWorkerContext;
-pub(crate) use impl_execute_task::execute_local_task;
+pub(crate) use impl_execute_task::{collect_plan_metrics_protos, execute_local_task};
 pub use in_memory::InMemoryWorkerTransport;
 #[cfg(feature = "flight")]
 pub(crate) use single_write_multi_read::SingleWriteMultiRead;

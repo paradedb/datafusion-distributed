@@ -865,13 +865,16 @@ impl MppSender {
         let result = async {
             encode_prost_frame_into(self.header, metrics, &mut scratch)?;
             let _send_guard = self.channel.send_lock().lock().await;
-            loop {
+            // Bounded so a worker exiting after the leader stopped draining cannot wedge on a
+            // full ring; one small frame against a mostly-drained inbox lands on the first try.
+            for _ in 0..10_000 {
                 match self.channel.try_send_bytes(&scratch) {
                     Ok(true) => return Ok(()),
                     Ok(false) => tokio::task::yield_now().await,
                     Err(_) => return Ok(()), // receiver gone; metrics are best-effort
                 }
             }
+            Ok(())
         }
         .await;
         self.scratch.replace(scratch);

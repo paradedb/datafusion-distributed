@@ -184,6 +184,30 @@ pub unsafe fn leader_setup(
 /// The caller must keep the proc draining (a consumer loop, a send spin, or an explicit
 /// [`crate::embedded::CooperativeDrainSet::try_drain_pass`] pump) while a fragment waits on its
 /// feed, or the units sit in the inbox unread.
+/// Build the [`TaskMetrics`] payload for one executed fragment, for embedders that run
+/// fragments outside the worker task registry (pg parallel workers). Pair it with
+/// [`super::transport::MppSender::send_task_metrics_best_effort`] after the fragment's streams
+/// complete; the leader-side rewrite consumes the same pre-order the in-registry path produces.
+/// The task-level stamps (plan added/executed/finished) stay unset on this path.
+///
+/// [`TaskMetrics`]: crate::TaskMetrics
+pub fn collect_task_metrics(
+    plan: &Arc<dyn ExecutionPlan>,
+    task_index: usize,
+    task_count: usize,
+) -> crate::TaskMetrics {
+    crate::TaskMetrics {
+        pre_order_plan_metrics: crate::worker::collect_plan_metrics_protos(
+            plan,
+            crate::DistributedTaskContext {
+                task_index,
+                task_count,
+            },
+        ),
+        task_metrics: None,
+    }
+}
+
 pub fn install_work_unit_channels(
     cfg: &mut datafusion::prelude::SessionConfig,
     mesh: &MppMesh,

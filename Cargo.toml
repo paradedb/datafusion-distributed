@@ -60,8 +60,8 @@ hyper-util = { version = "0.1.16", optional = true }
 [features]
 default = ["flight"]
 # Arrow Flight gRPC transport. When off, the crate builds with no `tonic` / `arrow-flight`
-# and has no built-in remote transport; cross-worker connections fail at runtime unless an
-# embedder registers its own transport.
+# and the in-memory transport becomes the default: distributed plans run inside the current
+# process. Multi-process execution needs an embedder-registered transport.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:tonic-prost", "dep:tower"]
 avro = ["datafusion/avro"]
 integration = ["flight", "insta", "parquet", "arrow", "hyper-util"]

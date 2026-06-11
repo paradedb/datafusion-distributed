@@ -1,6 +1,7 @@
-use crate::common::{now_ns, serialize_uuid};
+use crate::common::serialize_uuid;
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::MetricsStore;
+use crate::coordinator::dispatch_metrics::CoordinatorToWorkerMetrics;
 use crate::coordinator::plan_encoding::encode_task_plan;
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::protobuf::tonic_status_to_datafusion_error;
@@ -10,55 +11,22 @@ use crate::work_unit_feed::{
 };
 use crate::worker::generated::worker as pb;
 use crate::worker::generated::worker::coordinator_to_worker_msg::Inner;
-use crate::{DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, TaskKey, get_distributed_channel_resolver};
+use crate::{TaskKey, get_distributed_channel_resolver};
 use datafusion::common::Result;
 use datafusion::common::instant::Instant;
 use datafusion::common::runtime::JoinSet;
 use datafusion::common::{DataFusionError, exec_datafusion_err};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr_common::metrics::{
-    Count, ExecutionPlanMetricsSet, Label, MetricBuilder, MetricValue, Time,
-};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use http::Extensions;
-use std::fmt::Display;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Request;
 use tonic::metadata::MetadataMap;
 use url::Url;
 use uuid::Uuid;
-
-/// Metrics that measure network details about communications between [DistributedExec] and a
-/// worker.
-#[derive(Clone)]
-pub(crate) struct CoordinatorToWorkerMetrics {
-    pub(super) plan_bytes_sent: Count,
-    pub(super) plan_send_latency: Arc<LatencyMetric>,
-    pub(super) instantiation_time: u64,
-}
-
-impl CoordinatorToWorkerMetrics {
-    pub(crate) fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
-        Self {
-            // Metric that measures to total sum of bytes worth of subplans sent.
-            plan_bytes_sent: MetricBuilder::new(metrics)
-                .with_label(Label::new(DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, "0"))
-                .global_counter("plan_bytes_sent"),
-            // Latency statistics about the network calls issued to the workers for feeding subplans.
-            plan_send_latency: Arc::new(LatencyMetric::new(
-                "plan_send_latency",
-                |b| b.with_label(Label::new(DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, "0")),
-                metrics,
-            )),
-            instantiation_time: now_ns(),
-        }
-    }
-}
 
 /// Builder for the different kind of tasks that handle the communications between the
 /// [DistributedExec] node to the workers. This struct is responsible for instantiating the tasks
@@ -235,60 +203,5 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             Ok(())
         });
         Ok(())
-    }
-}
-
-/// DataFusion metrics system is pretty limited from an API standpoint. This intermediate struct
-/// bridges the gaps that are not satisfied by upstream API for measuring latency.
-pub(super) struct LatencyMetric {
-    max: Time,
-    avg: Time,
-    max_latency_micros: AtomicU64,
-    sum_latency_micros: AtomicU64,
-    count_latency_micros: AtomicU64,
-}
-
-impl Drop for LatencyMetric {
-    fn drop(&mut self) {
-        self.max.add_duration(Duration::from_micros(
-            self.max_latency_micros.load(Ordering::Relaxed),
-        ));
-        self.avg.add_duration(Duration::from_micros(
-            self.sum_latency_micros.load(Ordering::Relaxed)
-                / self.count_latency_micros.load(Ordering::Relaxed).max(1),
-        ));
-    }
-}
-
-impl LatencyMetric {
-    pub(crate) fn new(
-        name: impl Display,
-        builder: impl Fn(MetricBuilder) -> MetricBuilder,
-        metrics: &ExecutionPlanMetricsSet,
-    ) -> Self {
-        let max = Time::new();
-        builder(MetricBuilder::new(metrics)).build(MetricValue::Time {
-            name: format!("{name}_max").into(),
-            time: max.clone(),
-        });
-        let avg = Time::new();
-        builder(MetricBuilder::new(metrics)).build(MetricValue::Time {
-            name: format!("{name}_avg").into(),
-            time: avg.clone(),
-        });
-        Self {
-            max,
-            avg,
-            max_latency_micros: AtomicU64::new(0),
-            sum_latency_micros: AtomicU64::new(0),
-            count_latency_micros: AtomicU64::new(0),
-        }
-    }
-
-    fn record(&self, start: &Instant) {
-        let micros = start.elapsed().as_micros() as u64;
-        self.max_latency_micros.fetch_max(micros, Ordering::Relaxed);
-        self.sum_latency_micros.fetch_add(micros, Ordering::Relaxed);
-        self.count_latency_micros.fetch_add(1, Ordering::Relaxed);
     }
 }

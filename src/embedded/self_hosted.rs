@@ -33,6 +33,7 @@
 
 use std::alloc::Layout;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use dashmap::DashMap;
@@ -50,14 +51,16 @@ use uuid::Uuid;
 use super::mpsc_ring::Wakeup;
 use super::runtime::{MppMesh, ShmMqWorkerTransport, proc_for_task};
 use super::setup::{dsm_region_bytes, leader_setup, worker_setup};
-use super::transport::{CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink};
-use crate::common::{TreeNodeExt, deserialize_uuid, serialize_uuid};
+use super::transport::{
+    CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink, MppSender, SendBatchStats,
+};
+use crate::common::{TreeNodeExt, serialize_uuid};
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::CoordinatorToWorkerMetrics;
 use crate::coordinator::plan_encoding::encode_task_plan;
 use crate::networking::set_distributed_worker_transport;
 use crate::passthrough_headers::get_passthrough_headers;
-use crate::work_unit_feed::{collect_task_work_unit_feeds, set_received_time, set_sent_time};
+use crate::work_unit_feed::{collect_task_work_unit_feeds, set_sent_time};
 use crate::worker::execute_local_task;
 use crate::worker::generated::worker as pb;
 use crate::{
@@ -277,8 +280,12 @@ impl WorkerDispatch for SelfHostedDispatcher {
         let harness = match self.transport.queries.entry(stage.query_id) {
             dashmap::Entry::Occupied(e) => Arc::clone(e.get()),
             dashmap::Entry::Vacant(e) => {
-                let harness =
-                    Arc::new(QueryHarness::new(token.clone(), self.transport.queue_bytes));
+                let harness = Arc::new(QueryHarness::new(
+                    stage.query_id,
+                    token.clone(),
+                    self.transport.queue_bytes,
+                    metrics_store.cloned(),
+                ));
                 e.insert(Arc::clone(&harness));
                 // The token fires when the head stream drops (normal completion included), which
                 // is the query's end of life; drop the registry entry then. The region itself
@@ -291,6 +298,11 @@ impl WorkerDispatch for SelfHostedDispatcher {
                     watched.cancelled().await;
                     queries.remove(&query_id);
                 });
+                // One pump set per query: drains every proc's inbox so control frames flow even
+                // when no consumer or producer is actively draining (a fragment blocked on its
+                // feed, the metrics frames after the gather finished), and forwards the task
+                // metrics into the store. Lives until every driver and feed pump reported done.
+                join_set.spawn(run_pumps(Arc::clone(&harness), token.clone()));
                 harness
             }
         };
@@ -335,6 +347,7 @@ impl WorkerDispatch for SelfHostedDispatcher {
             // they do under the other transports.
             let feed_streams =
                 collect_task_work_unit_feeds(&stage.plan, task_ctx, task_i, stage.tasks)?;
+            let has_feeds = !feed_streams.is_empty();
 
             let driver = TaskDriver {
                 harness: Arc::clone(&harness),
@@ -344,14 +357,28 @@ impl WorkerDispatch for SelfHostedDispatcher {
                 n_partitions: encoded.partitions,
                 set_plan,
                 headers: headers.clone(),
-                feed_streams,
+                has_feeds,
                 metrics: metrics.clone(),
-                metrics_store: metrics_store.cloned(),
                 task_key,
                 plan_size,
                 token: token.clone(),
             };
+            harness.participants.fetch_add(1, Ordering::SeqCst);
             join_set.spawn(driver.run());
+
+            // The feeds travel as `WorkUnit` frames through the leader's outbound senders, so
+            // the worker side reads them exactly as a separate process would.
+            if has_feeds {
+                harness.state.lock().unwrap().any_feeds = true;
+                harness.participants.fetch_add(1, Ordering::SeqCst);
+                join_set.spawn(run_leader_feed_pump(
+                    Arc::clone(&harness),
+                    stage.num as u32,
+                    task_i,
+                    feed_streams,
+                    token.clone(),
+                ));
+            }
         }
         Ok(())
     }
@@ -386,13 +413,23 @@ struct StageRec {
 struct Launch {
     mesh: Arc<MppMesh>,
     sinks: Vec<Box<dyn PartitionSink>>,
+    /// Send end for this task's `TaskMetrics` frame to the leader.
+    metrics_sender: MppSender,
 }
 
 struct HarnessState {
     stages: HashMap<u32, StageRec>,
     routing: HashMap<u32, RoutingSpec>,
     started: bool,
+    /// Whether any dispatched task declared work-unit feeds; decides whether the leader
+    /// attaches its control-plane senders at finalize.
+    any_feeds: bool,
+    n_workers: u32,
     leader_mesh: Option<Arc<MppMesh>>,
+    /// The leader's outbound senders, the control-plane path for `WorkUnit` frames.
+    leader_senders: Vec<Option<MppSender>>,
+    /// One mesh per worker proc, kept for the per-proc drain pumps.
+    worker_meshes: Vec<Arc<MppMesh>>,
     launches: HashMap<(u32, usize), Launch>,
     /// Declared after the meshes so it would drop last either way; the harness Arcs held by
     /// drivers and pinned streams are what actually keep it alive long enough.
@@ -400,30 +437,84 @@ struct HarnessState {
 }
 
 struct QueryHarness {
+    query_id: Uuid,
     token: CancellationToken,
     queue_bytes: usize,
+    metrics_store: Option<Arc<crate::MetricsStore>>,
+    /// Drivers and feed pumps spawned for this query; `done` counts their exits. The pumps run
+    /// until the two meet, which is the deterministic "no more frames are coming" signal.
+    participants: AtomicUsize,
+    done: AtomicUsize,
     state: Mutex<HarnessState>,
     ready_tx: tokio::sync::watch::Sender<bool>,
     ready_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl QueryHarness {
-    fn new(token: CancellationToken, queue_bytes: usize) -> Self {
+    fn new(
+        query_id: Uuid,
+        token: CancellationToken,
+        queue_bytes: usize,
+        metrics_store: Option<Arc<crate::MetricsStore>>,
+    ) -> Self {
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         Self {
+            query_id,
             token,
             queue_bytes,
+            metrics_store,
+            participants: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
             state: Mutex::new(HarnessState {
                 stages: HashMap::new(),
                 routing: HashMap::new(),
                 started: false,
+                any_feeds: false,
+                n_workers: 0,
                 leader_mesh: None,
+                leader_senders: Vec::new(),
+                worker_meshes: Vec::new(),
                 launches: HashMap::new(),
                 region: None,
             }),
             ready_tx,
             ready_rx,
         }
+    }
+
+    /// Wait until the first read finalizes the harness.
+    async fn ready(&self) -> Result<()> {
+        let mut rx = self.ready_rx.clone();
+        while !*rx.borrow() {
+            rx.changed().await.map_err(|_| {
+                DataFusionError::Internal(
+                    "self-hosted shm transport: harness dropped before start".to_string(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The leader's send end for one task's `WorkUnit` frames, cooperative-draining the
+    /// leader's own inbox so a symmetric full-ring stall cannot deadlock the feed push.
+    fn leader_feed_sender(&self, stage_num: u32, task_i: usize) -> Result<MppSender> {
+        let state = self.state.lock().unwrap();
+        let dest_proc = proc_for_task(state.n_workers, task_i as u32);
+        let Some(base) = state
+            .leader_senders
+            .get(dest_proc as usize)
+            .and_then(|s| s.as_ref())
+        else {
+            return internal_err!(
+                "self-hosted shm transport: no leader sender for proc {dest_proc}"
+            );
+        };
+        let Some(leader_mesh) = state.leader_mesh.clone() else {
+            return internal_err!("self-hosted shm transport: leader mesh not built");
+        };
+        Ok(base
+            .clone_with_header(MppFrameHeader::work_unit(stage_num, task_i as u32, 0))
+            .with_cooperative_drain(leader_mesh as Arc<dyn CooperativeDrainSet>))
     }
 
     fn record_stage(&self, num: usize, tasks: usize, task_partitions: Vec<usize>) {
@@ -538,7 +629,7 @@ impl QueryHarness {
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
         let interrupt: Arc<dyn Interrupt> = Arc::new(CancellationInterrupt(self.token.clone()));
 
-        let leader_mesh = unsafe {
+        let leader_attach = unsafe {
             leader_setup(
                 region.base(),
                 n_procs,
@@ -547,8 +638,12 @@ impl QueryHarness {
                 Arc::clone(&wakeup),
                 receiver_token(0),
                 Arc::clone(&interrupt),
+                // The harness holds the senders until the query ends, so attaching is safe; an
+                // attach the query never uses would only delay worker-side detach detection.
+                state.any_feeds,
             )
         }?;
+        let leader_mesh = leader_attach.mesh;
         let mut worker_meshes = Vec::with_capacity(n_workers as usize);
         for proc_idx in 1..n_procs {
             let attach = unsafe {
@@ -574,6 +669,20 @@ impl QueryHarness {
                 let n_out = rec.task_partitions.get(task_i).copied().unwrap_or(0);
                 let proc = proc_for_task(n_workers, task_i as u32);
                 let (mesh, outbound) = &worker_meshes[(proc - 1) as usize];
+                let Some(to_leader) = outbound[0].as_ref() else {
+                    return internal_err!(
+                        "self-hosted shm transport: no outbound sender from proc {proc} to the \
+                         leader"
+                    );
+                };
+                // No cooperative drain on purpose: metrics frames go out after the cancellation
+                // token fired (it fires on normal completion), when the interrupt-checking spin
+                // would abort the send.
+                let metrics_sender = to_leader.clone_with_header(MppFrameHeader::task_metrics(
+                    stage_num,
+                    task_i as u32,
+                    proc,
+                ));
                 let mut sinks: Vec<Box<dyn PartitionSink>> = Vec::with_capacity(n_out);
                 for q in 0..n_out {
                     let consumer = match spec {
@@ -603,12 +712,16 @@ impl QueryHarness {
                     Launch {
                         mesh: Arc::clone(mesh),
                         sinks,
+                        metrics_sender,
                     },
                 );
             }
         }
 
+        state.n_workers = n_workers;
         state.leader_mesh = Some(leader_mesh);
+        state.leader_senders = leader_attach.outbound_senders;
+        state.worker_meshes = worker_meshes.iter().map(|(m, _)| Arc::clone(m)).collect();
         state.launches = launches;
         state.region = Some(region);
         state.started = true;
@@ -632,14 +745,7 @@ impl QueryHarness {
 
     /// Wait until the harness is finalized, then take this fragment's launch package.
     async fn wait_launch(&self, stage_num: u32, task_i: usize) -> Result<Launch> {
-        let mut rx = self.ready_rx.clone();
-        while !*rx.borrow() {
-            rx.changed().await.map_err(|_| {
-                DataFusionError::Internal(
-                    "self-hosted shm transport: harness dropped before start".to_string(),
-                )
-            })?;
-        }
+        self.ready().await?;
         let mut state = self.state.lock().unwrap();
         state.launches.remove(&(stage_num, task_i)).ok_or_else(|| {
             DataFusionError::Internal(format!(
@@ -659,9 +765,8 @@ struct TaskDriver {
     n_partitions: usize,
     set_plan: pb::SetPlanRequest,
     headers: http::HeaderMap,
-    feed_streams: Vec<BoxStream<'static, Result<pb::WorkUnit>>>,
+    has_feeds: bool,
     metrics: CoordinatorToWorkerMetrics,
-    metrics_store: Option<Arc<crate::MetricsStore>>,
     task_key: pb::TaskKey,
     plan_size: usize,
     token: CancellationToken,
@@ -669,6 +774,13 @@ struct TaskDriver {
 
 impl TaskDriver {
     async fn run(self) -> Result<()> {
+        let harness = Arc::clone(&self.harness);
+        let result = self.run_inner().await;
+        harness.done.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+
+    async fn run_inner(self) -> Result<()> {
         let Self {
             harness,
             worker,
@@ -677,12 +789,12 @@ impl TaskDriver {
             n_partitions,
             set_plan,
             headers,
-            feed_streams,
+            has_feeds,
             metrics,
-            metrics_store,
             task_key,
             plan_size,
             token,
+            ..
         } = self;
 
         // The launch package arrives when the first read finalizes the harness. A query torn
@@ -705,46 +817,16 @@ impl TaskDriver {
         metrics.plan_send_latency.record(&start);
         metrics.plan_bytes_sent.add(plan_size);
 
-        // Detached like the other transports' metrics collection: the receiver resolves only
-        // once every partition finished or was dropped, and must not stall query completion.
-        let metrics_rx = outcome.metrics_rx;
-        let metrics_key = task_key.clone();
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            if let (Ok(task_metrics), Some(store)) = (metrics_rx.await, metrics_store) {
-                store.insert(metrics_key, task_metrics);
-            }
-        });
-
-        // Feed pumps and the fragment production run together: the fragment consumes the feeds.
-        // The senders map must drop as soon as the pumps finish (not when this driver returns):
-        // the fragment's feed leaves read their channels to end-of-stream, which only happens
-        // once every sender is gone, and the fragment outlives the pumps by construction.
-        let pumps = async {
-            let senders = Arc::new(outcome.work_unit_senders);
-            let mut pumps = Vec::with_capacity(feed_streams.len());
-            for mut stream in feed_streams {
-                let senders = Arc::clone(&senders);
-                pumps.push(async move {
-                    while let Some(unit) = stream.next().await {
-                        let mut unit = unit?;
-                        set_sent_time(&mut unit);
-                        set_received_time(&mut unit);
-                        let Ok(id) = deserialize_uuid(&unit.id) else {
-                            continue;
-                        };
-                        let Some(tx) = senders.get(&(id, unit.partition as usize)) else {
-                            continue;
-                        };
-                        if tx.send(Ok(unit)).is_err() {
-                            break; // channel closed
-                        }
-                    }
-                    Ok::<_, DataFusionError>(())
-                });
-            }
-            futures::future::try_join_all(pumps).await
-        };
+        // The feeds arrive as `WorkUnit` frames on this proc's inbox; install the channels so
+        // the drain fills them (and flushes whatever arrived first). The leader-side pump owns
+        // delivery and the `FeedEof` that ends the streams.
+        if has_feeds {
+            launch.mesh.register_work_unit_senders(
+                stage_num,
+                task_i as u32,
+                outcome.work_unit_senders,
+            );
+        }
 
         let produce = async {
             let request = pb::ExecuteTaskRequest {
@@ -792,10 +874,123 @@ impl TaskDriver {
             }
             Ok(())
         };
+        let produce_res: Result<()> = produce.await;
 
-        let (pumps_res, produce_res) = futures::join!(pumps, produce);
-        produce_res.and(pumps_res.map(|_| ()))
+        // The metrics receiver resolves as the last partition stream above completes, so this
+        // does not block on anything remote. The frame goes back over the mesh, where the
+        // leader-side pump forwards it into the metrics store.
+        if let Ok(task_metrics) = outcome.metrics_rx.await {
+            let _ = launch
+                .metrics_sender
+                .send_task_metrics_best_effort(&task_metrics)
+                .await;
+        }
+        produce_res
     }
+}
+
+/// Leader-side pump for one task's work-unit feeds: drives the providers and ships each unit as
+/// a `WorkUnit` frame to the proc hosting the task, then closes the task's channels with a
+/// `FeedEof`. The close is unconditional, error or not: without it the fragment's feed streams
+/// never end and the worker side wedges instead of surfacing this pump's error.
+async fn run_leader_feed_pump(
+    harness: Arc<QueryHarness>,
+    stage_num: u32,
+    task_i: usize,
+    feed_streams: Vec<BoxStream<'static, Result<pb::WorkUnit>>>,
+    token: CancellationToken,
+) -> Result<()> {
+    let result = async {
+        tokio::select! {
+            ready = harness.ready() => ready?,
+            _ = token.cancelled() => return Ok(()),
+        }
+        let sender = harness.leader_feed_sender(stage_num, task_i)?;
+
+        let pump_result = async {
+            let mut pumps = Vec::with_capacity(feed_streams.len());
+            for mut stream in feed_streams {
+                let sender = &sender;
+                pumps.push(async move {
+                    let mut stats = SendBatchStats::default();
+                    while let Some(unit) = stream.next().await {
+                        let mut unit = unit?;
+                        set_sent_time(&mut unit);
+                        sender.send_work_unit_traced(&unit, &mut stats).await?;
+                    }
+                    Ok::<_, DataFusionError>(())
+                });
+            }
+            futures::future::try_join_all(pumps).await.map(|_| ())
+        }
+        .await;
+
+        let mut stats = SendBatchStats::default();
+        let eof_result = sender.send_feed_eof_traced(&mut stats).await;
+        pump_result.and(eof_result)
+    }
+    .await;
+    harness.done.fetch_add(1, Ordering::SeqCst);
+    result
+}
+
+/// Per-proc drain pumps plus the metrics forwarder, alive until every driver and feed pump
+/// reported done. They are what moves control frames when nothing else drains: a fragment
+/// blocked on its feed before producing, and the metrics frames arriving after the gather
+/// already finished.
+async fn run_pumps(harness: Arc<QueryHarness>, token: CancellationToken) -> Result<()> {
+    tokio::select! {
+        ready = harness.ready() => ready?,
+        _ = token.cancelled() => return Ok(()),
+    }
+    let (leader_mesh, worker_meshes) = {
+        let state = harness.state.lock().unwrap();
+        let Some(leader_mesh) = state.leader_mesh.clone() else {
+            return internal_err!("self-hosted shm transport: leader mesh not built");
+        };
+        (leader_mesh, state.worker_meshes.clone())
+    };
+    let metrics_rx = leader_mesh.take_task_metrics_receiver();
+
+    let mut meshes: Vec<Arc<MppMesh>> = Vec::with_capacity(worker_meshes.len() + 1);
+    meshes.push(Arc::clone(&leader_mesh));
+    meshes.extend(worker_meshes);
+    let pumps = meshes.into_iter().map(|mesh| {
+        let harness = Arc::clone(&harness);
+        async move {
+            loop {
+                let all_done = harness.done.load(Ordering::SeqCst)
+                    >= harness.participants.load(Ordering::SeqCst);
+                // Drain errors surface through the consumers reading the same registry;
+                // the pump just stops contributing.
+                if mesh.try_drain_pass().is_err() {
+                    break;
+                }
+                if all_done {
+                    // The pass above ran after the last participant reported done, so every
+                    // frame sent before that point has been routed.
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    futures::future::join_all(pumps).await;
+
+    // Every frame is routed by now; whatever metrics arrived are in the channel.
+    if let (Some(mut rx), Some(store)) = (metrics_rx, harness.metrics_store.clone()) {
+        while let Ok((stage_id, task_number, task_metrics)) = rx.try_recv() {
+            store.insert(
+                pb::TaskKey {
+                    query_id: serialize_uuid(&harness.query_id),
+                    stage_id: stage_id as u64,
+                    task_number: task_number as u64,
+                },
+                task_metrics,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

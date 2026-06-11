@@ -37,6 +37,11 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::DataFusionError;
+use prost::Message;
+
+use crate::common::deserialize_uuid;
+use crate::work_unit_feed::{RemoteWorkUnitFeedTxs, set_received_time};
+use crate::worker::generated::worker as pb;
 
 /// Magic bytes "MPPF" (MPP Frame) at the start of every wire message.
 /// Lets receivers reject misrouted / corrupt frames before they hit Arrow IPC.
@@ -52,11 +57,21 @@ const MPP_FRAME_HEADER_SIZE: usize = 16;
 /// `RecordBatch`. `Eof` carries no payload. It signals the receiver that the named
 /// `(stage_id, partition)` channel is done, even though the underlying shm_mq queue may still
 /// carry frames for other channels.
+///
+/// The remaining kinds are the control plane riding the same rings. For them the header's
+/// `partition` field carries the task number instead: a work unit already names its
+/// `(feed id, partition)` inside the payload, and metrics describe a whole task.
+/// `WorkUnit` (leader -> worker) carries one prost-encoded work unit for `(stage, task)`;
+/// `FeedEof` closes that task's feed channels (the wire stand-in for Flight's stream close);
+/// `TaskMetrics` (worker -> leader) carries the task's collected metrics.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MppFrameKind {
     Batch = 0,
     Eof = 1,
+    WorkUnit = 2,
+    FeedEof = 3,
+    TaskMetrics = 4,
 }
 
 /// 16-byte prefix on every transport frame.
@@ -128,6 +143,37 @@ impl MppFrameHeader {
         }
     }
 
+    /// Build a `WorkUnit` header addressed to `(stage_id, task_number)`. The `partition` slot
+    /// carries the task number; the unit's own `(feed id, partition)` ride in the payload.
+    pub fn work_unit(stage_id: u32, task_number: u32, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::WorkUnit, sender_proc),
+            stage_id,
+            partition: task_number,
+        }
+    }
+
+    /// Build a `FeedEof` header for `(stage_id, task_number)`: every feed of that task is done.
+    pub fn feed_eof(stage_id: u32, task_number: u32, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::FeedEof, sender_proc),
+            stage_id,
+            partition: task_number,
+        }
+    }
+
+    /// Build a `TaskMetrics` header for `(stage_id, task_number)`.
+    pub fn task_metrics(stage_id: u32, task_number: u32, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::TaskMetrics, sender_proc),
+            stage_id,
+            partition: task_number,
+        }
+    }
+
     /// The mesh peer that wrote this frame. The drain demuxes incoming frames into the
     /// per-channel buffer registry by `(sender_proc, stage_id, partition)`.
     pub fn sender_proc(&self) -> u32 {
@@ -148,6 +194,9 @@ impl MppFrameHeader {
         match self.flags & FRAME_KIND_MASK {
             0 => Ok(MppFrameKind::Batch),
             1 => Ok(MppFrameKind::Eof),
+            2 => Ok(MppFrameKind::WorkUnit),
+            3 => Ok(MppFrameKind::FeedEof),
+            4 => Ok(MppFrameKind::TaskMetrics),
             other => Err(DataFusionError::Internal(format!(
                 "mpp: unknown frame kind {other:#x}"
             ))),
@@ -244,29 +293,65 @@ fn encode_eof_frame_into(
     Ok(())
 }
 
-/// Inverse of [`encode_frame_into`]. Parses the 16-byte header and, for `Batch` frames, decodes
-/// the trailing Arrow IPC stream. `Eof` frames return `(header, None)`. Receivers branch on
-/// `header.kind()` to decide routing.
-fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, Option<RecordBatch>), DataFusionError> {
+/// Serialize a prost-encoded control payload (`WorkUnit` / `TaskMetrics`) behind `header`.
+fn encode_prost_frame_into(
+    header: MppFrameHeader,
+    msg: &impl prost::Message,
+    buf: &mut Vec<u8>,
+) -> Result<(), DataFusionError> {
+    buf.clear();
+    buf.resize(MPP_FRAME_HEADER_SIZE, 0);
+    header.write_to(&mut buf[..MPP_FRAME_HEADER_SIZE]);
+    msg.encode(buf)
+        .map_err(|e| DataFusionError::Internal(format!("mpp: prost frame encode: {e}")))?;
+    Ok(())
+}
+
+/// A decoded frame payload, routed by the drain according to its kind.
+#[derive(Debug)]
+enum FrameBody {
+    Batch(RecordBatch),
+    Eof,
+    WorkUnit(pb::WorkUnit),
+    FeedEof,
+    TaskMetrics(pb::TaskMetrics),
+}
+
+/// Inverse of the frame encoders. Parses the 16-byte header and decodes the payload according
+/// to the kind. Receivers branch on the body to decide routing.
+fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionError> {
     let header = MppFrameHeader::parse(bytes)?;
+    let payload = &bytes[MPP_FRAME_HEADER_SIZE..];
     match header.kind()? {
-        MppFrameKind::Eof => {
+        MppFrameKind::Eof | MppFrameKind::FeedEof => {
             if bytes.len() != MPP_FRAME_HEADER_SIZE {
                 return Err(DataFusionError::Internal(format!(
-                    "mpp: Eof frame carries payload ({} > {})",
+                    "mpp: payload-less frame carries payload ({} > {})",
                     bytes.len(),
                     MPP_FRAME_HEADER_SIZE
                 )));
             }
-            Ok((header, None))
+            match header.kind()? {
+                MppFrameKind::Eof => Ok((header, FrameBody::Eof)),
+                _ => Ok((header, FrameBody::FeedEof)),
+            }
+        }
+        MppFrameKind::WorkUnit => {
+            let unit = pb::WorkUnit::decode(payload)
+                .map_err(|e| DataFusionError::Internal(format!("mpp: work unit decode: {e}")))?;
+            Ok((header, FrameBody::WorkUnit(unit)))
+        }
+        MppFrameKind::TaskMetrics => {
+            let metrics = pb::TaskMetrics::decode(payload)
+                .map_err(|e| DataFusionError::Internal(format!("mpp: task metrics decode: {e}")))?;
+            Ok((header, FrameBody::TaskMetrics(metrics)))
         }
         MppFrameKind::Batch => {
-            let payload = &bytes[MPP_FRAME_HEADER_SIZE..];
             let mut reader = StreamReader::try_new(payload, None)?;
             let batch = reader.next().ok_or_else(|| {
                 DataFusionError::Execution("mpp: empty arrow-ipc stream in decode_frame".into())
             })??;
-            Ok((header, Some(batch)))
+            Ok((header, FrameBody::Batch(batch)))
         }
     }
 }
@@ -670,6 +755,16 @@ impl MppSender {
         let t_enc = Instant::now();
         encode_frame_into(self.header, batch, scratch)?;
         stats.encode += t_enc.elapsed();
+        self.spin_send_scratch(scratch, stats).await
+    }
+
+    /// Push an already-encoded frame through the channel via the cooperative-drain spin (or the
+    /// blocking fallback when no drain is attached). Shared by every frame kind's send path.
+    async fn spin_send_scratch(
+        &self,
+        scratch: &[u8],
+        stats: &mut SendBatchStats,
+    ) -> Result<(), DataFusionError> {
         let Some(drain) = self.cooperative_drain.as_ref() else {
             // No drain attached (unit tests, in-proc channels): fall
             // back to the blocking send path.
@@ -715,6 +810,72 @@ impl MppSender {
             stats.coop_drain_in_spin += t_drain.elapsed();
             tokio::task::yield_now().await;
         }
+    }
+
+    /// Send one work unit for the task this sender's header names. The unit's hop stamps are the
+    /// caller's job; the payload travels prost-encoded, never through Arrow IPC.
+    pub async fn send_work_unit_traced(
+        &self,
+        unit: &pb::WorkUnit,
+        stats: &mut SendBatchStats,
+    ) -> Result<(), DataFusionError> {
+        let mut scratch = self.scratch.replace(Vec::new());
+        let result = async {
+            encode_prost_frame_into(self.header, unit, &mut scratch)?;
+            self.spin_send_scratch(&scratch, stats).await
+        }
+        .await;
+        self.scratch.replace(scratch);
+        result
+    }
+
+    /// Close the feed channels of the task this sender's header names: the wire stand-in for
+    /// Flight closing its coordinator stream, after which the worker-side feed streams end.
+    pub async fn send_feed_eof_traced(
+        &self,
+        stats: &mut SendBatchStats,
+    ) -> Result<(), DataFusionError> {
+        let mut scratch = self.scratch.replace(Vec::new());
+        let result = async {
+            scratch.clear();
+            scratch.resize(MPP_FRAME_HEADER_SIZE, 0);
+            MppFrameHeader::feed_eof(
+                self.header.stage_id,
+                self.header.partition,
+                self.header.sender_proc(),
+            )
+            .write_to(&mut scratch[..MPP_FRAME_HEADER_SIZE]);
+            self.spin_send_scratch(&scratch, stats).await
+        }
+        .await;
+        self.scratch.replace(scratch);
+        result
+    }
+
+    /// Send the task's collected metrics without consulting the interrupt: this runs after the
+    /// query's cancellation token already fired (it fires on normal completion too), so the
+    /// cooperative spin would abort exactly when delivery matters. Best-effort like Flight's
+    /// metrics sends: a detached leader drops them. Retrying on a full ring is safe because the
+    /// receiving side keeps draining until every producer reported in.
+    pub async fn send_task_metrics_best_effort(
+        &self,
+        metrics: &pb::TaskMetrics,
+    ) -> Result<(), DataFusionError> {
+        let mut scratch = self.scratch.replace(Vec::new());
+        let result = async {
+            encode_prost_frame_into(self.header, metrics, &mut scratch)?;
+            let _send_guard = self.channel.send_lock().lock().await;
+            loop {
+                match self.channel.try_send_bytes(&scratch) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => tokio::task::yield_now().await,
+                    Err(_) => return Ok(()), // receiver gone; metrics are best-effort
+                }
+            }
+        }
+        .await;
+        self.scratch.replace(scratch);
+        result
     }
 }
 
@@ -785,8 +946,15 @@ impl MppReceiver {
     pub(super) fn try_recv_batch(&self) -> RecvBatchOutcome {
         match self.channel.try_recv() {
             RecvOutcome::Bytes(bytes) => match decode_frame(&bytes) {
-                Ok((header, Some(batch))) => RecvBatchOutcome::Batch { header, batch },
-                Ok((header, None)) => RecvBatchOutcome::Eof { header },
+                Ok((header, FrameBody::Batch(batch))) => RecvBatchOutcome::Batch { header, batch },
+                Ok((header, FrameBody::Eof)) => RecvBatchOutcome::Eof { header },
+                Ok((header, FrameBody::WorkUnit(unit))) => {
+                    RecvBatchOutcome::WorkUnit { header, unit }
+                }
+                Ok((header, FrameBody::FeedEof)) => RecvBatchOutcome::FeedEof { header },
+                Ok((header, FrameBody::TaskMetrics(metrics))) => {
+                    RecvBatchOutcome::TaskMetrics { header, metrics }
+                }
                 Err(e) => RecvBatchOutcome::Error(e),
             },
             RecvOutcome::Empty => RecvBatchOutcome::Empty,
@@ -810,6 +978,20 @@ pub(super) enum RecvBatchOutcome {
     /// per-channel without dropping the whole queue.
     Eof {
         header: MppFrameHeader,
+    },
+    /// One work unit for the task named by `header.(stage_id, partition=task)`.
+    WorkUnit {
+        header: MppFrameHeader,
+        unit: pb::WorkUnit,
+    },
+    /// Every feed of the task named by the header is done; its channels close.
+    FeedEof {
+        header: MppFrameHeader,
+    },
+    /// The collected metrics of the task named by the header.
+    TaskMetrics {
+        header: MppFrameHeader,
+        metrics: pb::TaskMetrics,
     },
     Empty,
     Detached,
@@ -876,6 +1058,52 @@ pub struct DrainHandle {
     /// This proc's index, used to map a channel's `sender_proc` to the receiver scope that
     /// feeds it (`SelfLoop` iff `sender_proc == this_proc`).
     this_proc: u32,
+    /// Worker-side destination of `WorkUnit` frames, keyed `(stage_id, task_number)`. Frames
+    /// arriving before the embedder registers a task's channels buffer in `Pending`; `FeedEof`
+    /// drops the senders so the consuming feed streams end, the wire analog of Flight closing
+    /// its coordinator stream.
+    feed_registry: Mutex<FeedRegistry>,
+    /// Leader-side destination of `TaskMetrics` frames: `(stage_id, task_number, metrics)`.
+    task_metrics_tx: tokio::sync::mpsc::UnboundedSender<(u32, u32, pb::TaskMetrics)>,
+    task_metrics_rx:
+        Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32, pb::TaskMetrics)>>>,
+}
+
+#[derive(Default)]
+struct FeedRegistry {
+    map: HashMap<(u32, u32), FeedSlot>,
+    /// Set when the inbox scope died: feeds come from a peer proc, so a dead inbox means no
+    /// further units or `FeedEof` can arrive. Registered channels get the failure pushed in;
+    /// later registrations fail immediately.
+    dead: Option<String>,
+}
+
+enum FeedSlot {
+    /// Frames that arrived before the embedder registered the task's channels.
+    Pending {
+        units: Vec<pb::WorkUnit>,
+        done: bool,
+    },
+    Active(RemoteWorkUnitFeedTxs),
+}
+
+/// Push one decoded unit into the channel its `(feed id, partition)` names. A missing channel is
+/// not an error: the same tolerance the Flight worker applies to its stream (a feed the plan
+/// does not declare is dropped).
+fn forward_unit(senders: &RemoteWorkUnitFeedTxs, unit: pb::WorkUnit) {
+    let Ok(id) = deserialize_uuid(&unit.id) else {
+        return;
+    };
+    let Some(tx) = senders.get(&(id, unit.partition as usize)) else {
+        return;
+    };
+    let _ = tx.send(Ok(unit));
+}
+
+fn fail_feed_senders(senders: &RemoteWorkUnitFeedTxs, reason: &str) {
+    for tx in senders.values() {
+        let _ = tx.send(Err(DataFusionError::Execution(reason.to_string())));
+    }
 }
 
 impl DrainHandle {
@@ -887,10 +1115,95 @@ impl DrainHandle {
         receivers: Vec<(ReceiverScope, MppReceiver)>,
     ) -> Self {
         let wrapped = receivers.into_iter().map(Some).collect();
+        let (task_metrics_tx, task_metrics_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             channel_buffers: Mutex::new(ChannelBufferRegistry::default()),
             coop_receivers: Mutex::new(wrapped),
             this_proc,
+            feed_registry: Mutex::new(FeedRegistry::default()),
+            task_metrics_tx,
+            task_metrics_rx: Mutex::new(Some(task_metrics_rx)),
+        }
+    }
+
+    /// Take the receiving end of the `TaskMetrics` frame stream. The embedder (the leader)
+    /// drains it into its metrics store; the first caller gets it, later calls get `None`.
+    pub(super) fn take_task_metrics_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32, pb::TaskMetrics)>> {
+        self.task_metrics_rx.lock().unwrap().take()
+    }
+
+    /// Install the senders of one task's feed channels, flushing any units that arrived first.
+    /// If the task's `FeedEof` (or the inbox death) already came through, the senders drop (or
+    /// fail) immediately so the consuming streams terminate instead of waiting forever.
+    pub(super) fn register_work_unit_senders(
+        &self,
+        stage_id: u32,
+        task_number: u32,
+        senders: RemoteWorkUnitFeedTxs,
+    ) {
+        let mut registry = self.feed_registry.lock().unwrap();
+        if let Some(reason) = &registry.dead {
+            fail_feed_senders(&senders, reason);
+            return;
+        }
+        match registry.map.remove(&(stage_id, task_number)) {
+            Some(FeedSlot::Pending { units, done }) => {
+                for unit in units {
+                    forward_unit(&senders, unit);
+                }
+                if !done {
+                    registry
+                        .map
+                        .insert((stage_id, task_number), FeedSlot::Active(senders));
+                }
+            }
+            Some(FeedSlot::Active(_)) | None => {
+                registry
+                    .map
+                    .insert((stage_id, task_number), FeedSlot::Active(senders));
+            }
+        }
+    }
+
+    fn route_work_unit(&self, stage_id: u32, task_number: u32, unit: pb::WorkUnit) {
+        let mut registry = self.feed_registry.lock().unwrap();
+        if registry.dead.is_some() {
+            return;
+        }
+        match registry.map.get_mut(&(stage_id, task_number)) {
+            Some(FeedSlot::Active(senders)) => forward_unit(senders, unit),
+            Some(FeedSlot::Pending { units, .. }) => units.push(unit),
+            None => {
+                registry.map.insert(
+                    (stage_id, task_number),
+                    FeedSlot::Pending {
+                        units: vec![unit],
+                        done: false,
+                    },
+                );
+            }
+        }
+    }
+
+    fn close_feeds(&self, stage_id: u32, task_number: u32) {
+        let mut registry = self.feed_registry.lock().unwrap();
+        match registry.map.get_mut(&(stage_id, task_number)) {
+            Some(FeedSlot::Active(_)) => {
+                // Dropping the senders is the close: the consuming streams see end-of-input.
+                registry.map.remove(&(stage_id, task_number));
+            }
+            Some(FeedSlot::Pending { done, .. }) => *done = true,
+            None => {
+                registry.map.insert(
+                    (stage_id, task_number),
+                    FeedSlot::Pending {
+                        units: Vec::new(),
+                        done: true,
+                    },
+                );
+            }
         }
     }
 
@@ -924,6 +1237,15 @@ impl DrainHandle {
         };
         for buf in to_fail {
             buf.fail_pending(reason);
+        }
+        if scope == ReceiverScope::Inbox {
+            let mut registry = self.feed_registry.lock().unwrap();
+            registry.dead = Some(reason.to_string());
+            for (_, slot) in registry.map.drain() {
+                if let FeedSlot::Active(senders) = slot {
+                    fail_feed_senders(&senders, reason);
+                }
+            }
         }
     }
 
@@ -1040,6 +1362,19 @@ impl DrainHandle {
                         buf.notify_source_done();
                         // Other channels may still flow on this queue, so the receiver slot
                         // stays live.
+                    }
+                    RecvBatchOutcome::WorkUnit { header, mut unit } => {
+                        set_received_time(&mut unit);
+                        self.route_work_unit(header.stage_id, header.partition, unit);
+                    }
+                    RecvBatchOutcome::FeedEof { header } => {
+                        self.close_feeds(header.stage_id, header.partition);
+                    }
+                    RecvBatchOutcome::TaskMetrics { header, metrics } => {
+                        // The embedder may have dropped the receiver; metrics are best-effort.
+                        let _ =
+                            self.task_metrics_tx
+                                .send((header.stage_id, header.partition, metrics));
                     }
                     RecvBatchOutcome::Empty => break,
                     RecvBatchOutcome::Detached => {
@@ -1331,6 +1666,10 @@ mod tests {
                         done[i] = true;
                         buffer.notify_source_done();
                     }
+                    // Control frames have no place in the test-only single-buffer path.
+                    RecvBatchOutcome::WorkUnit { .. }
+                    | RecvBatchOutcome::FeedEof { .. }
+                    | RecvBatchOutcome::TaskMetrics { .. } => {}
                     RecvBatchOutcome::Empty => {}
                     RecvBatchOutcome::Detached => {
                         done[i] = true;
@@ -1372,10 +1711,12 @@ mod tests {
         let mut buf = Vec::with_capacity(1024);
         encode_frame_into(header, &orig, &mut buf).expect("encode_frame");
 
-        let (parsed, batch_opt) = decode_frame(&buf).expect("decode_frame");
+        let (parsed, body) = decode_frame(&buf).expect("decode_frame");
         assert_eq!(parsed, header);
         assert_eq!(parsed.kind().unwrap(), MppFrameKind::Batch);
-        let decoded = batch_opt.expect("Batch frame must carry a payload");
+        let FrameBody::Batch(decoded) = body else {
+            panic!("Batch frame must carry a batch payload");
+        };
         assert_eq!(decoded.num_rows(), 64);
         assert_eq!(decoded.schema(), orig.schema());
         assert_eq!(decoded.num_columns(), orig.num_columns());
@@ -1390,10 +1731,99 @@ mod tests {
         encode_eof_frame_into(2, 5, 0, &mut buf).expect("encode_eof");
         assert_eq!(buf.len(), MPP_FRAME_HEADER_SIZE);
 
-        let (header, batch_opt) = decode_frame(&buf).expect("decode_frame");
+        let (header, body) = decode_frame(&buf).expect("decode_frame");
         assert_eq!(header, MppFrameHeader::eof(2, 5, 0));
         assert_eq!(header.kind().unwrap(), MppFrameKind::Eof);
-        assert!(batch_opt.is_none());
+        assert!(matches!(body, FrameBody::Eof));
+    }
+
+    #[test]
+    fn frame_round_trips_a_work_unit_and_feed_eof() {
+        let unit = pb::WorkUnit {
+            id: vec![7; 16],
+            partition: 4,
+            body: vec![1, 2, 3],
+            created_timestamp_unix_nanos: 11,
+            sent_timestamp_unix_nanos: 22,
+            received_timestamp_unix_nanos: 0,
+            processed_timestamp_unix_nanos: 0,
+        };
+        let header = MppFrameHeader::work_unit(3, 1, 0);
+        let mut buf = Vec::new();
+        encode_prost_frame_into(header, &unit, &mut buf).expect("encode work unit");
+        let (parsed, body) = decode_frame(&buf).expect("decode work unit");
+        assert_eq!(parsed, header);
+        let FrameBody::WorkUnit(decoded) = body else {
+            panic!("WorkUnit frame must carry a unit");
+        };
+        assert_eq!(decoded, unit);
+
+        let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
+        MppFrameHeader::feed_eof(3, 1, 0).write_to(&mut buf);
+        let (parsed, body) = decode_frame(&buf).expect("decode feed eof");
+        assert_eq!(parsed.kind().unwrap(), MppFrameKind::FeedEof);
+        assert!(matches!(body, FrameBody::FeedEof));
+    }
+
+    #[test]
+    fn frame_round_trips_task_metrics() {
+        let metrics = pb::TaskMetrics {
+            pre_order_plan_metrics: vec![],
+            task_metrics: None,
+        };
+        let header = MppFrameHeader::task_metrics(2, 0, 1);
+        let mut buf = Vec::new();
+        encode_prost_frame_into(header, &metrics, &mut buf).expect("encode metrics");
+        let (parsed, body) = decode_frame(&buf).expect("decode metrics");
+        assert_eq!(parsed, header);
+        assert!(matches!(body, FrameBody::TaskMetrics(m) if m == metrics));
+    }
+
+    #[test]
+    fn work_units_buffer_until_registration_and_feed_eof_closes() {
+        fn unit(partition: u64) -> pb::WorkUnit {
+            pb::WorkUnit {
+                id: vec![9; 16],
+                partition,
+                body: vec![],
+                created_timestamp_unix_nanos: 0,
+                sent_timestamp_unix_nanos: 0,
+                received_timestamp_unix_nanos: 0,
+                processed_timestamp_unix_nanos: 0,
+            }
+        }
+        let drain = DrainHandle::cooperative(1, vec![]);
+
+        // Units arriving before registration must buffer, not drop.
+        drain.route_work_unit(5, 0, unit(0));
+        drain.route_work_unit(5, 0, unit(0));
+
+        let id = crate::common::deserialize_uuid(&[9; 16]).unwrap();
+        let mut channels = crate::work_unit_feed::WorkUnitFeedChannels::default();
+        channels.add(id, 1);
+        let mut rx = channels
+            .receivers
+            .get(&(id, 0))
+            .unwrap()
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        drain.register_work_unit_senders(5, 0, channels.senders);
+
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert!(rx.try_recv().unwrap().is_ok());
+        // Still open: the producer may send more units.
+        assert!(rx.try_recv().is_err());
+
+        // FeedEof drops the senders, which ends the stream.
+        drain.route_work_unit(5, 0, unit(0));
+        drain.close_feeds(5, 0);
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
@@ -1494,7 +1924,7 @@ mod tests {
         encode_eof_frame_into(0, 0, 0, &mut buf).expect("encode_eof");
         buf.push(0xAB); // smuggle a payload byte after the Eof header
         let err = decode_frame(&buf).expect_err("Eof+payload must fail");
-        assert!(format!("{err}").contains("Eof frame carries payload"));
+        assert!(format!("{err}").contains("payload-less frame carries payload"));
     }
 
     #[test]
@@ -1503,8 +1933,10 @@ mod tests {
         for rows in [0, 1, 7, 64, 1024] {
             let orig = sample_batch(rows);
             encode_frame_into(MppFrameHeader::batch(0, 0, 0), &orig, &mut buf).expect("encode");
-            let (_header, decoded) = decode_frame(&buf).expect("decode");
-            let decoded = decoded.expect("Batch frame must carry a payload");
+            let (_header, body) = decode_frame(&buf).expect("decode");
+            let FrameBody::Batch(decoded) = body else {
+                panic!("Batch frame must carry a batch payload");
+            };
             assert_eq!(orig.num_rows(), decoded.num_rows());
         }
     }

@@ -571,9 +571,11 @@ mod tests {
                 Arc::clone(&wakeup),
                 receiver_token(0),
                 Arc::new(NoInterrupt),
+                /* attach_senders */ false,
             )
         }
-        .unwrap();
+        .unwrap()
+        .mesh;
         let mut worker_setups = Vec::new();
         for proc_idx in 1..n_procs {
             let attach = unsafe {
@@ -673,9 +675,11 @@ mod tests {
                 Arc::clone(&wakeup),
                 receiver_token(0),
                 Arc::new(NoInterrupt),
+                /* attach_senders */ false,
             )
         }
-        .unwrap();
+        .unwrap()
+        .mesh;
         let mut workers = Vec::new();
         for proc_idx in 1..n_procs {
             let attach = unsafe {

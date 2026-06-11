@@ -68,14 +68,9 @@ integration = ["flight", "insta", "parquet", "arrow", "hyper-util"]
 
 system-metrics = ["sysinfo"]
 
-tpch = ["integration"]
-tpcds = ["integration"]
-clickbench = ["integration"]
-slow-tests = []
 sysinfo = ["dep:sysinfo"]
 
 [dev-dependencies]
-datafusion-distributed-benchmarks = { path = "benchmarks" }
 structopt = "0.3"
 insta = { version = "1.46.0", features = ["filters"] }
 parquet = "58"

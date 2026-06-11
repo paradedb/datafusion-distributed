@@ -24,10 +24,10 @@ Integration tests are slower but cover a wide range of functionality.
 cargo test --features integration
 
 # Run TPCH integration tests
-cargo test --features tpch
+cargo test -p datafusion-distributed-benchmarks --features tpch
 
 # Run TPC-DS integration tests
-cargo test --features tpc-ds
+cargo test -p datafusion-distributed-benchmarks --features tpcds
 ```
 
 ## Resources

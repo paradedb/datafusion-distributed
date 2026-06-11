@@ -43,6 +43,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::metrics::MetricBuilder;
 use futures::stream::BoxStream;
 use url::Url;
 
@@ -169,8 +170,11 @@ impl WorkerTransport for ShmMqWorkerTransport {
         _target_partitions: Range<usize>,
         target_task: usize,
         _ctx: &Arc<TaskContext>,
-        _metrics: &ExecutionPlanMetricsSet,
+        metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Box<dyn WorkerConnection>> {
+        MetricBuilder::new(metrics)
+            .global_counter("mesh_connections_used")
+            .add(1);
         let target_task_u32 = u32::try_from(target_task).map_err(|_| {
             DataFusionError::Internal(format!(
                 "ShmMqWorkerTransport: target_task={target_task} > u32::MAX"

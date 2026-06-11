@@ -1,9 +1,9 @@
 #[cfg(not(feature = "flight"))]
 use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
-#[cfg(not(feature = "flight"))]
-use crate::{DistributedExt, InMemoryWorkerTransport};
 #[cfg(feature = "flight")]
 use crate::{DistributedExt, WorkerResolver};
+#[cfg(not(feature = "flight"))]
+use crate::{DistributedExt, embedded::SelfHostedShmTransport};
 use crate::{SessionStateBuilderExt, Worker, WorkerSessionBuilder};
 #[cfg(feature = "flight")]
 use async_trait::async_trait;
@@ -88,9 +88,10 @@ where
 }
 
 /// The no-flight twin of the gRPC variant above, so the integration suite compiles and runs in
-/// both configurations from the same source: workers are hosted in-process by an
-/// [InMemoryWorkerTransport] built from `session_builder`, nothing listens on localhost, and the
-/// returned [Worker]s are handles onto the shared in-process task registry.
+/// both configurations from the same source: workers are hosted in-process by a
+/// [SelfHostedShmTransport] built from `session_builder` (every cross-stage byte moves through
+/// the embedded shared-memory mesh), nothing listens on localhost, and the returned [Worker]s
+/// are handles onto the shared in-process task registry.
 #[cfg(not(feature = "flight"))]
 pub async fn start_localhost_context<B>(
     num_workers: usize,
@@ -100,7 +101,7 @@ where
     B: WorkerSessionBuilder + Send + Sync + 'static,
     B: Clone,
 {
-    let transport = InMemoryWorkerTransport::from_session_builder(session_builder);
+    let transport = SelfHostedShmTransport::from_session_builder(session_builder);
     let workers = (0..num_workers)
         .map(|_| transport.worker().clone())
         .collect();

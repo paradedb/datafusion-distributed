@@ -110,6 +110,37 @@ impl MppMesh {
         &self.inbound_receiver
     }
 
+    /// Install the senders of one task's work-unit feed channels on this proc's drain, so
+    /// inbound `WorkUnit` frames for `(stage_id, task_number)` flow into them. Units that
+    /// arrived first are flushed; a `FeedEof` that already came through closes the channels
+    /// immediately. The drain only fills channels: something on this proc must keep draining
+    /// (a consumer pull loop, a producer send spin, or an explicit
+    /// [`CooperativeDrainSet::try_drain_pass`] pump) or a fragment blocked on its feed starves.
+    pub fn register_work_unit_senders(
+        &self,
+        stage_id: u32,
+        task_number: u32,
+        senders: crate::work_unit_feed::RemoteWorkUnitFeedTxs,
+    ) {
+        self.inbound_receiver
+            .register_work_unit_senders(stage_id, task_number, senders);
+    }
+
+    /// Take the stream of `TaskMetrics` frames arriving on this proc's inbox:
+    /// `(stage_id, task_number, metrics)` per producer task that reported in. Meant for the
+    /// leader; the first caller gets it, later calls get `None`.
+    pub fn take_task_metrics_receiver(
+        &self,
+    ) -> Option<
+        tokio::sync::mpsc::UnboundedReceiver<(
+            u32,
+            u32,
+            crate::worker::generated::worker::TaskMetrics,
+        )>,
+    > {
+        self.inbound_receiver.take_task_metrics_receiver()
+    }
+
     /// Number of worker procs (= `n_procs - 1`, since the leader is proc 0). Used as the
     /// modulus in [`proc_for_task`].
     ///

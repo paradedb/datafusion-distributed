@@ -47,6 +47,7 @@ use super::transport::{
     ReceiverScope, SELF_LOOP_CAPACITY, in_proc_channel,
 };
 use crate::PartitionSink;
+use crate::work_unit_feed::WorkUnitFeedChannels;
 
 /// Total bytes the shared region needs for `n_procs` inboxes plus `plan_len` plan bytes, with
 /// `queue_bytes` per inbox. The embedder reserves exactly this much before [`leader_setup`].
@@ -104,7 +105,19 @@ fn build_outbound_senders(
     senders
 }
 
-/// Initialize the shared region as the leader (`proc 0`) and return its consumer-only mesh.
+/// What [`leader_setup`] hands back to the embedder.
+pub struct LeaderAttach {
+    /// The leader's mesh, installed on its DataFusion session.
+    pub mesh: Arc<MppMesh>,
+    /// Outbound senders keyed by destination proc index, for the control plane: work-unit
+    /// frames flow leader -> worker through them. Slot 0 (the leader itself) stays `None`;
+    /// empty unless `attach_senders` was passed. Holders must keep them alive for the whole
+    /// query: dropping them before a worker attaches latches that worker's inbox as detached.
+    pub outbound_senders: Vec<Option<MppSender>>,
+}
+
+/// Initialize the shared region as the leader (`proc 0`) and return its mesh plus its outbound
+/// senders.
 ///
 /// Writes the region header, copies `plan_bytes` in, initializes the `n_procs` inboxes, and
 /// attaches the leader as receiver to its own inbox. `receiver_token` is registered so producers
@@ -115,6 +128,7 @@ fn build_outbound_senders(
 ///   queue_bytes, plan_bytes.len())` bytes.
 /// - `base` must be at least 8-byte (MAXALIGN) aligned; the ring headers hold atomics.
 /// - The region must not be concurrently accessed until this returns.
+#[allow(clippy::too_many_arguments)] // mirrors worker_setup; the args are the embedder's knobs
 pub unsafe fn leader_setup(
     base: *mut c_void,
     n_procs: u32,
@@ -123,7 +137,8 @@ pub unsafe fn leader_setup(
     wakeup: Arc<dyn Wakeup>,
     receiver_token: u64,
     interrupt: Arc<dyn Interrupt>,
-) -> Result<Arc<MppMesh>> {
+    attach_senders: bool,
+) -> Result<LeaderAttach> {
     if receiver_token == NO_RECEIVER_TOKEN {
         return Err(DataFusionError::Internal(
             "mpp: leader_setup: receiver_token is the NO_RECEIVER_TOKEN sentinel; wakeups \
@@ -133,8 +148,16 @@ pub unsafe fn leader_setup(
     }
     let layout = compute_dsm_layout(n_procs, queue_bytes, plan_bytes.len())
         .map_err(|e| DataFusionError::Internal(format!("mpp: leader_setup compute layout: {e}")))?;
-    let attach = unsafe { leader_init(base, &layout, plan_bytes, Arc::clone(&wakeup)) }
-        .map_err(DataFusionError::Internal)?;
+    let attach = unsafe {
+        leader_init(
+            base,
+            &layout,
+            plan_bytes,
+            Arc::clone(&wakeup),
+            attach_senders,
+        )
+    }
+    .map_err(DataFusionError::Internal)?;
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
@@ -142,9 +165,38 @@ pub unsafe fn leader_setup(
         0,
         vec![(ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox)))],
     ));
-    // The leader is consumer-only; it never hosts a producer fragment.
-    drop(attach.outbound_senders);
-    Ok(Arc::new(MppMesh::new(0, n_procs, inbound, interrupt)))
+    // The leader hosts no producer fragments, but its senders carry the control plane:
+    // work-unit frames (and later dynamic filters) flow leader -> worker through them. Empty
+    // when the embedder did not opt in: a ring latches `detached` once its sender count hits
+    // zero, so senders that might drop before every worker attached must never exist.
+    let outbound_senders = build_outbound_senders(0, n_procs, attach.outbound_senders);
+    Ok(LeaderAttach {
+        mesh: Arc::new(MppMesh::new(0, n_procs, inbound, interrupt)),
+        outbound_senders,
+    })
+}
+
+/// Build one task's work-unit feed channels, install the receiving ends on `cfg` (where the
+/// deserialized plan's remote feed leaves look them up), and register the sending ends on
+/// `mesh`'s drain so inbound `WorkUnit` frames fill them. `feeds` lists the task's declared
+/// feeds as `(feed id, partitions)`, the same pairs the plan's `WorkUnitFeedDeclaration`s carry.
+///
+/// The caller must keep the proc draining (a consumer loop, a send spin, or an explicit
+/// [`crate::embedded::CooperativeDrainSet::try_drain_pass`] pump) while a fragment waits on its
+/// feed, or the units sit in the inbox unread.
+pub fn install_work_unit_channels(
+    cfg: &mut datafusion::prelude::SessionConfig,
+    mesh: &MppMesh,
+    stage_id: u32,
+    task_number: u32,
+    feeds: &[(uuid::Uuid, usize)],
+) {
+    let mut channels = WorkUnitFeedChannels::default();
+    for (id, partitions) in feeds {
+        channels.add(*id, *partitions);
+    }
+    cfg.set_extension(Arc::new(channels.receivers));
+    mesh.register_work_unit_senders(stage_id, task_number, channels.senders);
 }
 
 /// What [`worker_setup`] hands back to the embedder.

@@ -282,7 +282,12 @@ pub(super) fn peer_proc_for_index(this_proc: u32, peer_idx: u32) -> u32 {
 
 /// Initialize the DSM region as the leader (`proc_idx = 0`). Writes the MppDsmHeader,
 /// copies the plan bytes, initializes the N MPSC inboxes via `DsmMpscRing::create_at`,
-/// and attaches the leader as receiver to its own inbox + as sender to each peer.
+/// and attaches the leader as receiver to its own inbox, plus (when `attach_senders`) as
+/// sender to each peer for the control plane (work-unit frames).
+///
+/// `attach_senders` is a commitment: a ring latches `detached` when its sender count falls to
+/// zero, so a leader that attaches and then drops its senders before a worker attached poisons
+/// that worker's inbox. Attach only when the senders outlive the query.
 ///
 /// # Safety
 /// - `coordinate` must point to the start of a DSM region of size `>= layout.region_total`.
@@ -292,6 +297,7 @@ pub(super) unsafe fn leader_init(
     layout: &DsmLayout,
     plan_bytes: &[u8],
     wakeup: Arc<dyn Wakeup>,
+    attach_senders: bool,
 ) -> Result<ProcAttach, String> {
     if coordinate.is_null() {
         return Err("mpp: leader_init given null coordinate".into());
@@ -333,9 +339,7 @@ pub(super) unsafe fn leader_init(
         unsafe { mpsc_ring::create_at(inbox_addr, ring_slots, slot_capacity) };
     }
 
-    let attach = unsafe {
-        attach_proc(base, &header, 0, /* attach_senders */ false, wakeup)
-    };
+    let attach = unsafe { attach_proc(base, &header, 0, attach_senders, wakeup) };
     Ok(attach)
 }
 

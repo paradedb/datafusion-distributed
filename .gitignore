@@ -12,3 +12,7 @@ src/observability/gen/target/*
 src/observability/gen/Cargo.lock
 src/worker/gen/target/*
 src/worker/gen/Cargo.lock
+
+# Generated dataset files when the benchmarks test suites run with the crate as cwd.
+benchmarks/testdata/
+.claude/scheduled_tasks.lock

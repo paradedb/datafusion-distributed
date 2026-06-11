@@ -139,10 +139,17 @@ impl Interrupt for CancellationInterrupt {
 ///
 /// With the `flight` feature off this is the default transport. Multi-process embedders keep
 /// driving [`ShmMqWorkerTransport`] directly.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SelfHostedShmTransport {
     worker: Worker,
     queries: Arc<DashMap<Uuid, Arc<QueryHarness>>>,
+    queue_bytes: usize,
+}
+
+impl Default for SelfHostedShmTransport {
+    fn default() -> Self {
+        Self::new(Worker::default())
+    }
 }
 
 impl SelfHostedShmTransport {
@@ -152,7 +159,16 @@ impl SelfHostedShmTransport {
         Self {
             worker,
             queries: Arc::new(DashMap::new()),
+            queue_bytes: SELF_HOSTED_QUEUE_BYTES,
         }
+    }
+
+    /// Overrides the per-inbox ring size. Small values force multi-slot fragmentation and the
+    /// cooperative send spin on every query, which is how the ring mechanics get stress-tested;
+    /// the default is generous enough that only large batches touch them.
+    pub fn with_queue_bytes(mut self, queue_bytes: usize) -> Self {
+        self.queue_bytes = queue_bytes;
+        self
     }
 
     /// Builds the transport with a custom [WorkerSessionBuilder], the same customization hook a
@@ -261,7 +277,8 @@ impl WorkerDispatch for SelfHostedDispatcher {
         let harness = match self.transport.queries.entry(stage.query_id) {
             dashmap::Entry::Occupied(e) => Arc::clone(e.get()),
             dashmap::Entry::Vacant(e) => {
-                let harness = Arc::new(QueryHarness::new(token.clone()));
+                let harness =
+                    Arc::new(QueryHarness::new(token.clone(), self.transport.queue_bytes));
                 e.insert(Arc::clone(&harness));
                 // The token fires when the head stream drops (normal completion included), which
                 // is the query's end of life; drop the registry entry then. The region itself
@@ -384,16 +401,18 @@ struct HarnessState {
 
 struct QueryHarness {
     token: CancellationToken,
+    queue_bytes: usize,
     state: Mutex<HarnessState>,
     ready_tx: tokio::sync::watch::Sender<bool>,
     ready_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl QueryHarness {
-    fn new(token: CancellationToken) -> Self {
+    fn new(token: CancellationToken, queue_bytes: usize) -> Self {
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         Self {
             token,
+            queue_bytes,
             state: Mutex::new(HarnessState {
                 stages: HashMap::new(),
                 routing: HashMap::new(),
@@ -514,7 +533,7 @@ impl QueryHarness {
             .max(1) as u32;
         let n_procs = n_workers + 1;
 
-        let region_total = dsm_region_bytes(n_procs, SELF_HOSTED_QUEUE_BYTES, 0)?;
+        let region_total = dsm_region_bytes(n_procs, self.queue_bytes, 0)?;
         let region = HeapRegion::new(region_total);
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
         let interrupt: Arc<dyn Interrupt> = Arc::new(CancellationInterrupt(self.token.clone()));
@@ -523,7 +542,7 @@ impl QueryHarness {
             leader_setup(
                 region.base(),
                 n_procs,
-                SELF_HOSTED_QUEUE_BYTES,
+                self.queue_bytes,
                 &[],
                 Arc::clone(&wakeup),
                 receiver_token(0),
@@ -776,5 +795,112 @@ impl TaskDriver {
 
         let (pumps_res, produce_res) = futures::join!(pumps, produce);
         produce_res.and(pumps_res.map(|_| ()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
+    use crate::test_utils::session_context::register_temp_parquet_table;
+    use crate::{DistributedConfig, DistributedExt, SessionStateBuilderExt, display_plan_ascii};
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::physical_plan::execute_stream;
+    use datafusion::prelude::SessionContext;
+    use futures::TryStreamExt;
+
+    /// Forces the ring mechanics on every batch: with `RING_SLOTS = 8`, a 64 KiB inbox has
+    /// ~8 KiB slots, so the ~16 KiB frames below fragment across slots, and the ~2 MB of
+    /// payload wraps each ring dozens of times, exercising the cooperative send spin.
+    const TINY_QUEUE_BYTES: usize = 64 * 1024;
+
+    const ROWS: usize = 2000;
+
+    fn sample_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        // ~1 KiB per row, unique values so the GROUP BY keeps the full volume flowing
+        // through the shuffle instead of compacting it away at the partial aggregate.
+        let strings: Vec<String> = (0..ROWS)
+            .map(|i| format!("{i:06}-{}", "x".repeat(1024)))
+            .collect();
+        let vals: Vec<i32> = (0..ROWS as i32).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(strings)),
+                Arc::new(Int32Array::from(vals)),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn run(ctx: &SessionContext) -> Result<(String, Vec<String>)> {
+        // Shaped so every ring frame stays bounded by `shuffle_batch_size`. The strings cross
+        // the shuffle inside `max`'s partial state, which the repartition rebuilds with `take`
+        // into fresh per-batch arrays; the projection then reduces them to a length before the
+        // gather. Shipping `s` itself out of a sort or an aggregate would not work: those emit
+        // offset slices of their accumulated state, a sliced variable-length array ships its
+        // whole values buffer through arrow-ipc, and a single frame balloons to the size of the
+        // partition's state no matter the batch size.
+        let query = "SELECT val, length(max(s)) AS l FROM t GROUP BY val";
+        let plan = ctx.sql(query).await?.create_physical_plan().await?;
+        let display = display_plan_ascii(plan.as_ref(), false);
+        let batches: Vec<_> = execute_stream(plan, ctx.task_ctx())?.try_collect().await?;
+        let mut lines: Vec<String> = pretty_format_batches(&batches)?
+            .to_string()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        Ok((display, lines))
+    }
+
+    /// A high-cardinality shuffle query over rings far smaller than the data, so every
+    /// cross-stage byte moves through fragmented frames under send-spin backpressure. The
+    /// result must still match the serial reference exactly.
+    #[tokio::test]
+    async fn tiny_rings_force_fragmentation_and_backpressure() -> Result<()> {
+        let transport = SelfHostedShmTransport::default().with_queue_bytes(TINY_QUEUE_BYTES);
+        // Small producer batches keep each frame a few slots big instead of overflowing the
+        // whole ring (a single frame must fit within one ring).
+        let d_cfg = DistributedConfig {
+            shuffle_batch_size: 16,
+            ..Default::default()
+        };
+        let mut state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_distributed_option_extension(d_cfg)
+            .with_distributed_planner()
+            .with_distributed_task_estimator(2)
+            .with_distributed_worker_resolver(InMemoryWorkerResolver::new(3))
+            .with_distributed_worker_transport(transport)
+            .build();
+        state.config_mut().options_mut().execution.target_partitions = 3;
+        let ctx = SessionContext::from(state);
+        let path =
+            register_temp_parquet_table("t", sample_batch().schema(), vec![sample_batch()], &ctx)
+                .await?;
+
+        let (display, distributed) = run(&ctx).await?;
+        assert!(
+            display.contains("NetworkShuffleExec"),
+            "the query did not distribute:\n{display}"
+        );
+
+        let single = SessionContext::default();
+        single
+            .register_parquet("t", path.to_string_lossy().as_ref(), Default::default())
+            .await?;
+        let (_, expected) = run(&single).await?;
+
+        assert_eq!(distributed, expected);
+        Ok(())
     }
 }

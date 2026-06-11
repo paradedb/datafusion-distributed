@@ -40,6 +40,7 @@ mod dsm;
 mod mesh;
 mod mpsc_ring;
 mod runtime;
+mod self_hosted;
 mod setup;
 mod transport;
 
@@ -47,6 +48,7 @@ mod transport;
 // supplies the two seams (`Wakeup`, `Interrupt`); everything else is built here.
 pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
 pub use runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
+pub use self_hosted::SelfHostedShmTransport;
 pub use setup::{
     WorkerAttach, dsm_region_bytes, leader_setup, region_total, run_worker_fragment, worker_setup,
 };

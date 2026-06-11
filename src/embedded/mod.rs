@@ -50,8 +50,8 @@ pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
 pub use runtime::{InProcessWorkerResolver, MppMesh, ShmMqWorkerTransport, proc_for_task};
 pub use self_hosted::SelfHostedShmTransport;
 pub use setup::{
-    LeaderAttach, WorkerAttach, dsm_region_bytes, install_work_unit_channels, leader_setup,
-    region_total, run_worker_fragment, worker_setup,
+    LeaderAttach, WorkerAttach, collect_task_metrics, dsm_region_bytes, install_work_unit_channels,
+    leader_setup, region_total, run_worker_fragment, worker_setup,
 };
 pub use transport::{
     CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,

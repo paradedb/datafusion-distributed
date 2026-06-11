@@ -39,8 +39,7 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           components: clippy
-      # `--lib` because the example and the integration test helpers still require `flight`.
-      - run: cargo clippy --lib --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --features integration -- -D warnings
 
   unit-test:
     runs-on: ubuntu-latest
@@ -50,6 +49,16 @@ jobs:
           lfs: true
       - uses: ./.github/actions/setup
       - run: cargo test --features integration
+
+  # The same suite over the in-memory transport: `flight` off, Flight-specific tests skipped.
+  unit-test-no-flight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: ./.github/actions/setup
+      - run: cargo test --no-default-features --features integration
 
   tpch-test:
     runs-on: ubuntu-latest

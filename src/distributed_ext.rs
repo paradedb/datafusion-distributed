@@ -206,7 +206,7 @@ pub trait DistributedExt: Sized {
     /// # use datafusion::prelude::SessionConfig;
     /// # use url::Url;
     /// # use std::sync::Arc;
-    /// # use datafusion_distributed::{BoxCloneSyncChannel, WorkerResolver, DistributedExt, SessionStateBuilderExt, WorkerQueryContext};
+    /// # use datafusion_distributed::{WorkerResolver, DistributedExt, SessionStateBuilderExt, WorkerQueryContext};
     ///
     /// struct CustomWorkerResolver;
     ///

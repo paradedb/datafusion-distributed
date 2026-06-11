@@ -29,6 +29,8 @@ impl MetricsStore {
     }
 
     #[cfg(test)]
+    // Only the Flight-gated rewriter tests build stores by hand.
+    #[cfg_attr(not(feature = "flight"), allow(dead_code))]
     pub(crate) fn from_entries(
         entries: impl IntoIterator<Item = (TaskKey, pb::TaskMetrics)>,
     ) -> Self {

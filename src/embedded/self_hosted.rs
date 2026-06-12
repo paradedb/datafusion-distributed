@@ -53,6 +53,7 @@ use super::runtime::{MppMesh, ShmMqWorkerTransport, proc_for_task};
 use super::setup::{dsm_region_bytes, leader_setup, worker_setup};
 use super::transport::{
     CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink, MppSender, SendBatchStats,
+    SetPlanFrame,
 };
 use crate::common::{TreeNodeExt, serialize_uuid};
 use crate::config_extension_ext::get_config_extension_propagation_headers;
@@ -303,6 +304,10 @@ impl WorkerDispatch for SelfHostedDispatcher {
                 // feed, the metrics frames after the gather finished), and forwards the task
                 // metrics into the store. Lives until every driver and feed pump reported done.
                 join_set.spawn(run_pumps(Arc::clone(&harness), token.clone()));
+                // Plans travel as `SetPlan` frames like every other control message, but the
+                // rings only exist at finalize; this pump waits for them and ships the queue.
+                harness.participants.fetch_add(1, Ordering::SeqCst);
+                join_set.spawn(run_plan_delivery(Arc::clone(&harness), token.clone()));
                 harness
             }
         };
@@ -321,6 +326,12 @@ impl WorkerDispatch for SelfHostedDispatcher {
             stage.tasks,
             encoded_tasks.iter().map(|e| e.partitions).collect(),
         );
+        harness
+            .state
+            .lock()
+            .unwrap()
+            .coord_metrics
+            .get_or_insert_with(|| metrics.clone());
         harness.scan_for_child_routing(&stage.plan, stage.tasks)?;
 
         let mut headers = get_config_extension_propagation_headers(task_ctx.session_config())?;
@@ -342,6 +353,20 @@ impl WorkerDispatch for SelfHostedDispatcher {
                 target_worker_url: url.to_string(),
                 query_start_time_ns: metrics.instantiation_time,
             };
+            // The plan reaches the driver as a `SetPlan` frame on its proc's inbox, the same
+            // wire crossing a separate-process worker would see; the driver only holds its
+            // address. The frames queue here because the rings are only built at finalize.
+            harness
+                .state
+                .lock()
+                .unwrap()
+                .pending_set_plans
+                .push(PendingSetPlan {
+                    stage_num: stage.num as u32,
+                    task_i,
+                    frame: SetPlanFrame::from_parts(set_plan, &headers)?,
+                    plan_size,
+                });
 
             // Collected before spawning so the providers see the same eager `feed()` timing as
             // they do under the other transports.
@@ -355,12 +380,8 @@ impl WorkerDispatch for SelfHostedDispatcher {
                 stage_num: stage.num as u32,
                 task_i,
                 n_partitions: encoded.partitions,
-                set_plan,
-                headers: headers.clone(),
                 has_feeds,
-                metrics: metrics.clone(),
                 task_key,
-                plan_size,
                 token: token.clone(),
             };
             harness.participants.fetch_add(1, Ordering::SeqCst);
@@ -417,13 +438,25 @@ struct Launch {
     metrics_sender: MppSender,
 }
 
+/// One task's plan, queued between `dispatch` and finalize, when the rings exist to carry it.
+struct PendingSetPlan {
+    stage_num: u32,
+    task_i: usize,
+    frame: SetPlanFrame,
+    plan_size: usize,
+}
+
 struct HarnessState {
     stages: HashMap<u32, StageRec>,
     routing: HashMap<u32, RoutingSpec>,
     started: bool,
-    /// Whether any dispatched task declared work-unit feeds; decides whether the leader
-    /// attaches its control-plane senders at finalize.
+    /// Whether any dispatched task declared work-unit feeds; decides whether a feed pump runs.
     any_feeds: bool,
+    /// Plans queued by `dispatch` until finalize builds the mesh; the delivery pump then ships
+    /// each as a `SetPlan` frame to the proc hosting its task.
+    pending_set_plans: Vec<PendingSetPlan>,
+    /// Dispatch-side metrics (plan send latency / bytes), recorded by the delivery pump.
+    coord_metrics: Option<CoordinatorToWorkerMetrics>,
     n_workers: u32,
     leader_mesh: Option<Arc<MppMesh>>,
     /// The leader's outbound senders, the control-plane path for `WorkUnit` frames.
@@ -470,6 +503,8 @@ impl QueryHarness {
                 routing: HashMap::new(),
                 started: false,
                 any_feeds: false,
+                pending_set_plans: Vec::new(),
+                coord_metrics: None,
                 n_workers: 0,
                 leader_mesh: None,
                 leader_senders: Vec::new(),
@@ -638,9 +673,9 @@ impl QueryHarness {
                 Arc::clone(&wakeup),
                 receiver_token(0),
                 Arc::clone(&interrupt),
-                // The harness holds the senders until the query ends, so attaching is safe; an
-                // attach the query never uses would only delay worker-side detach detection.
-                state.any_feeds,
+                // The harness holds the senders until the query ends, so attaching is safe,
+                // and the plan delivery pump always needs them.
+                true,
             )
         }?;
         let leader_mesh = leader_attach.mesh;
@@ -763,12 +798,8 @@ struct TaskDriver {
     stage_num: u32,
     task_i: usize,
     n_partitions: usize,
-    set_plan: pb::SetPlanRequest,
-    headers: http::HeaderMap,
     has_feeds: bool,
-    metrics: CoordinatorToWorkerMetrics,
     task_key: pb::TaskKey,
-    plan_size: usize,
     token: CancellationToken,
 }
 
@@ -787,12 +818,8 @@ impl TaskDriver {
             stage_num,
             task_i,
             n_partitions,
-            set_plan,
-            headers,
             has_feeds,
-            metrics,
             task_key,
-            plan_size,
             token,
             ..
         } = self;
@@ -804,7 +831,14 @@ impl TaskDriver {
             _ = token.cancelled() => return Ok(()),
         };
 
-        let start = Instant::now();
+        // The plan arrives as a `SetPlan` frame on this proc's inbox, shipped by the leader's
+        // delivery pump; the pumps drain it into the registry this take resolves from.
+        let set_plan_frame = tokio::select! {
+            frame = launch.mesh.take_set_plan(stage_num, task_i as u32) => frame?,
+            _ = token.cancelled() => return Ok(()),
+        };
+        let (set_plan, headers) = set_plan_frame.into_parts()?;
+
         let mesh = Arc::clone(&launch.mesh);
         let outcome = worker
             .set_task_plan(set_plan, headers, move |mut cfg| {
@@ -814,8 +848,6 @@ impl TaskDriver {
                 Ok(cfg)
             })
             .await?;
-        metrics.plan_send_latency.record(&start);
-        metrics.plan_bytes_sent.add(plan_size);
 
         // The feeds arrive as `WorkUnit` frames on this proc's inbox; install the channels so
         // the drain fills them (and flushes whatever arrived first). The leader-side pump owns
@@ -887,6 +919,64 @@ impl TaskDriver {
         }
         produce_res
     }
+}
+
+/// Leader-side delivery of every dispatched plan: waits for finalize to build the rings, then
+/// ships each queued plan as a `SetPlan` frame to the proc hosting its task. One pump per query,
+/// counted as a participant so the drain pumps outlive it.
+async fn run_plan_delivery(harness: Arc<QueryHarness>, token: CancellationToken) -> Result<()> {
+    let result = run_plan_delivery_inner(&harness, token).await;
+    harness.done.fetch_add(1, Ordering::SeqCst);
+    result
+}
+
+async fn run_plan_delivery_inner(
+    harness: &Arc<QueryHarness>,
+    token: CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        ready = harness.ready() => ready?,
+        _ = token.cancelled() => return Ok(()),
+    }
+    let (pending, senders, metrics) = {
+        let mut state = harness.state.lock().unwrap();
+        let pending = std::mem::take(&mut state.pending_set_plans);
+        let Some(leader_mesh) = state.leader_mesh.clone() else {
+            return internal_err!("self-hosted shm transport: leader mesh not built");
+        };
+        let mut senders = Vec::with_capacity(pending.len());
+        for plan in &pending {
+            let dest_proc = proc_for_task(state.n_workers, plan.task_i as u32);
+            let Some(base) = state
+                .leader_senders
+                .get(dest_proc as usize)
+                .and_then(|s| s.as_ref())
+            else {
+                return internal_err!(
+                    "self-hosted shm transport: no leader sender for proc {dest_proc}"
+                );
+            };
+            senders.push(
+                base.clone_with_header(MppFrameHeader::set_plan(
+                    plan.stage_num,
+                    plan.task_i as u32,
+                    0,
+                ))
+                .with_cooperative_drain(Arc::clone(&leader_mesh) as Arc<dyn CooperativeDrainSet>),
+            );
+        }
+        (pending, senders, state.coord_metrics.clone())
+    };
+    let mut stats = SendBatchStats::default();
+    for (plan, sender) in pending.into_iter().zip(senders) {
+        let start = Instant::now();
+        sender.send_set_plan_traced(&plan.frame, &mut stats).await?;
+        if let Some(metrics) = &metrics {
+            metrics.plan_send_latency.record(&start);
+            metrics.plan_bytes_sent.add(plan.plan_size);
+        }
+    }
+    Ok(())
 }
 
 /// Leader-side pump for one task's work-unit feeds: drives the providers and ships each unit as

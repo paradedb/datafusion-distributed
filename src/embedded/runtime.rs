@@ -126,6 +126,19 @@ impl MppMesh {
             .register_work_unit_senders(stage_id, task_number, senders);
     }
 
+    /// Take the plan delivered for `(stage_id, task_number)` as a `SetPlan` frame on this proc's
+    /// inbox, waiting for it if it has not arrived yet. Something on this proc must keep
+    /// draining (a pump, a consumer pull loop, or a cooperative send spin) or the wait starves.
+    pub async fn take_set_plan(
+        &self,
+        stage_id: u32,
+        task_number: u32,
+    ) -> Result<super::transport::SetPlanFrame> {
+        self.inbound_receiver
+            .take_set_plan(stage_id, task_number)
+            .await
+    }
+
     /// Take the stream of `TaskMetrics` frames arriving on this proc's inbox:
     /// `(stage_id, task_number, metrics)` per producer task that reported in. Meant for the
     /// leader; the first caller gets it, later calls get `None`.

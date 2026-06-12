@@ -55,7 +55,7 @@ pub use setup::{
 };
 pub use transport::{
     CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
-    SendBatchStats,
+    SendBatchStats, SetPlanFrame,
 };
 
 // In-process instantiation + the end-to-end test that runs a real distributed query through the

@@ -66,7 +66,7 @@ pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
 #[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{
-    GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey, TaskMetrics,
+    GetWorkerInfoRequest, GetWorkerInfoResponse, SetPlanRequest, TaskKey, TaskMetrics,
 };
 pub use worker::{
     DefaultSessionBuilder, InMemoryWorkerTransport, MappedWorkerSessionBuilder,

@@ -48,18 +48,17 @@ pub struct WorkerDispatchRequest<'a> {
 /// - Batches arrive in `send` order and can be assumed non-empty.
 /// - After a failed `send` the channel state is unspecified, but the caller still calls
 ///   `finish` so the consumer sees EOF; `finish` must tolerate a prior `send` error.
-/// - Dropping a sink without calling `finish` does not end the channel.
+/// - Dropping a sink without calling `finish` does not end the channel, by design: `finish` is
+///   async so Drop can't run it, and an implicit EOF would make an aborted producer look like a
+///   clean, short stream. Abnormal teardown belongs to the transport, not the sink.
 /// - `send` borrows the batch because transports serialize it into their own buffers; none
 ///   needs ownership.
 #[async_trait]
 pub trait PartitionSink: Send {
-    /// Sends one batch. A transport that shares an execution resource (e.g. a single OS thread)
-    /// between producers and consumers drains its own inbound inside this future, so a full
-    /// outbound queue yields and retries instead of parking the shared thread. That cooperative
-    /// drain is what stops a symmetric send (every peer sending at once) from deadlocking.
+    /// Sends one batch. Async so a blocked send can yield and let the transport make progress
+    /// elsewhere; a full channel must not park the calling thread.
     async fn send(&mut self, batch: &RecordBatch) -> Result<()>;
-    /// Per-channel EOF, independent of the underlying link. Async for the same reason as `send`:
-    /// flushing the final frame on a shared single-thread runtime may need a cooperative drain.
+    /// Per-channel EOF, independent of the underlying link. Async for the same reason as `send`.
     async fn finish(self: Box<Self>) -> Result<()>;
 }
 
@@ -83,6 +82,8 @@ pub trait WorkerSink: Send + Sync {
 }
 
 /// The plan-delivery (write) side of a transport, symmetric to [WorkerConnection] (the read side).
+/// A dispatcher is a per-query object: [WorkerTransport::dispatcher] creates it before the first
+/// stage is dispatched, and every stage of that query goes through the same instance.
 ///
 /// Flight resolves each worker's URL, encodes the plan, and ships a `SetPlanRequest` over a
 /// bidirectional gRPC stream that also carries the work-unit feed and the metrics back-channel. A

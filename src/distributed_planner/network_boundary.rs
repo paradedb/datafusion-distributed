@@ -3,8 +3,8 @@ use datafusion::common::{Result, internal_err};
 use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 
-/// Where a producer's output partition is read: which consumer task, and the local partition index
-/// within that task's slice.
+/// Where a producer's output partition should be sent to: which consumer task, and the local
+/// partition index within that task's slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionRoute {
     pub consumer_task: usize,

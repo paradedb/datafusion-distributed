@@ -61,9 +61,11 @@ const MPP_FRAME_HEADER_SIZE: usize = 16;
 /// The remaining kinds are the control plane riding the same rings. For them the header's
 /// `partition` field carries the task number instead: a work unit already names its
 /// `(feed id, partition)` inside the payload, and metrics describe a whole task.
-/// `WorkUnit` (leader -> worker) carries one prost-encoded work unit for `(stage, task)`;
-/// `FeedEof` closes that task's feed channels (the wire stand-in for Flight's stream close);
-/// `TaskMetrics` (worker -> leader) carries the task's collected metrics.
+/// `SetPlan` (leader -> worker) carries one task's [`pb::SetPlanRequest`], the same message
+/// Flight ships over its coordinator stream, plus the propagation headers that ride gRPC
+/// metadata there; `WorkUnit` (leader -> worker) carries one prost-encoded work unit for
+/// `(stage, task)`; `FeedEof` closes that task's feed channels (the wire stand-in for Flight's
+/// stream close); `TaskMetrics` (worker -> leader) carries the task's collected metrics.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MppFrameKind {
@@ -72,6 +74,67 @@ pub(super) enum MppFrameKind {
     WorkUnit = 2,
     FeedEof = 3,
     TaskMetrics = 4,
+    SetPlan = 5,
+}
+
+/// Payload of a `SetPlan` frame: the plan-delivery message a worker needs to run one task,
+/// byte-compatible with what Flight sends.
+///
+/// `set_plan` is the exact [`pb::SetPlanRequest`] the Flight dispatcher would put on its gRPC
+/// stream. The headers are the config-extension propagation headers that travel as gRPC metadata
+/// there; the ring has no metadata side channel, so they ride inside the frame as parallel
+/// key/value lists (parallel lists rather than a map so repeated header names survive).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SetPlanFrame {
+    #[prost(message, optional, tag = "1")]
+    pub set_plan: Option<pb::SetPlanRequest>,
+    #[prost(string, repeated, tag = "2")]
+    pub header_keys: Vec<String>,
+    #[prost(string, repeated, tag = "3")]
+    pub header_values: Vec<String>,
+}
+
+impl SetPlanFrame {
+    /// Bundle a plan-delivery message with the headers Flight would carry as gRPC metadata.
+    pub fn from_parts(
+        set_plan: pb::SetPlanRequest,
+        headers: &http::HeaderMap,
+    ) -> Result<Self, DataFusionError> {
+        let mut header_keys = Vec::with_capacity(headers.len());
+        let mut header_values = Vec::with_capacity(headers.len());
+        for (name, value) in headers {
+            let value = value.to_str().map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "mpp: non-ASCII header {name} cannot travel in a SetPlan frame: {e}"
+                ))
+            })?;
+            header_keys.push(name.as_str().to_string());
+            header_values.push(value.to_string());
+        }
+        Ok(Self {
+            set_plan: Some(set_plan),
+            header_keys,
+            header_values,
+        })
+    }
+
+    /// Split back into the plan-delivery message and the propagation headers.
+    pub fn into_parts(self) -> Result<(pb::SetPlanRequest, http::HeaderMap), DataFusionError> {
+        let set_plan = self.set_plan.ok_or_else(|| {
+            DataFusionError::Internal("mpp: SetPlan frame carries no SetPlanRequest".to_string())
+        })?;
+        let mut headers = http::HeaderMap::with_capacity(self.header_keys.len());
+        for (key, value) in self.header_keys.iter().zip(self.header_values.iter()) {
+            let name = http::header::HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+                DataFusionError::Internal(format!("mpp: SetPlan frame header name {key:?}: {e}"))
+            })?;
+            let value = http::header::HeaderValue::from_str(value).map_err(|e| {
+                DataFusionError::Internal(format!("mpp: SetPlan frame header value for {key}: {e}"))
+            })?;
+            headers.append(name, value);
+        }
+        Ok((set_plan, headers))
+    }
 }
 
 /// 16-byte prefix on every transport frame.
@@ -174,6 +237,17 @@ impl MppFrameHeader {
         }
     }
 
+    /// Build a `SetPlan` header for `(stage_id, task_number)`: the frame delivers that task's
+    /// plan to the proc hosting it.
+    pub fn set_plan(stage_id: u32, task_number: u32, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::SetPlan, sender_proc),
+            stage_id,
+            partition: task_number,
+        }
+    }
+
     /// The mesh peer that wrote this frame. The drain demuxes incoming frames into the
     /// per-channel buffer registry by `(sender_proc, stage_id, partition)`.
     pub fn sender_proc(&self) -> u32 {
@@ -197,6 +271,7 @@ impl MppFrameHeader {
             2 => Ok(MppFrameKind::WorkUnit),
             3 => Ok(MppFrameKind::FeedEof),
             4 => Ok(MppFrameKind::TaskMetrics),
+            5 => Ok(MppFrameKind::SetPlan),
             other => Err(DataFusionError::Internal(format!(
                 "mpp: unknown frame kind {other:#x}"
             ))),
@@ -315,6 +390,7 @@ enum FrameBody {
     WorkUnit(pb::WorkUnit),
     FeedEof,
     TaskMetrics(pb::TaskMetrics),
+    SetPlan(SetPlanFrame),
 }
 
 /// Inverse of the frame encoders. Parses the 16-byte header and decodes the payload according
@@ -345,6 +421,11 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
             let metrics = pb::TaskMetrics::decode(payload)
                 .map_err(|e| DataFusionError::Internal(format!("mpp: task metrics decode: {e}")))?;
             Ok((header, FrameBody::TaskMetrics(metrics)))
+        }
+        MppFrameKind::SetPlan => {
+            let frame = SetPlanFrame::decode(payload)
+                .map_err(|e| DataFusionError::Internal(format!("mpp: set-plan decode: {e}")))?;
+            Ok((header, FrameBody::SetPlan(frame)))
         }
         MppFrameKind::Batch => {
             let mut reader = StreamReader::try_new(payload, None)?;
@@ -829,6 +910,23 @@ impl MppSender {
         result
     }
 
+    /// Ship one task's plan as a `SetPlan` frame: the wire stand-in for Flight's
+    /// `SetPlanRequest` over its coordinator stream.
+    pub async fn send_set_plan_traced(
+        &self,
+        frame: &SetPlanFrame,
+        stats: &mut SendBatchStats,
+    ) -> Result<(), DataFusionError> {
+        let mut scratch = self.scratch.replace(Vec::new());
+        let result = async {
+            encode_prost_frame_into(self.header, frame, &mut scratch)?;
+            self.spin_send_scratch(&scratch, stats).await
+        }
+        .await;
+        self.scratch.replace(scratch);
+        result
+    }
+
     /// Close the feed channels of the task this sender's header names: the wire stand-in for
     /// Flight closing its coordinator stream, after which the worker-side feed streams end.
     pub async fn send_feed_eof_traced(
@@ -958,6 +1056,9 @@ impl MppReceiver {
                 Ok((header, FrameBody::TaskMetrics(metrics))) => {
                     RecvBatchOutcome::TaskMetrics { header, metrics }
                 }
+                Ok((header, FrameBody::SetPlan(frame))) => {
+                    RecvBatchOutcome::SetPlan { header, frame }
+                }
                 Err(e) => RecvBatchOutcome::Error(e),
             },
             RecvOutcome::Empty => RecvBatchOutcome::Empty,
@@ -990,6 +1091,11 @@ pub(super) enum RecvBatchOutcome {
     /// Every feed of the task named by the header is done; its channels close.
     FeedEof {
         header: MppFrameHeader,
+    },
+    /// The plan for the task named by `header.(stage_id, partition=task)`.
+    SetPlan {
+        header: MppFrameHeader,
+        frame: SetPlanFrame,
     },
     /// The collected metrics of the task named by the header.
     TaskMetrics {
@@ -1070,6 +1176,10 @@ pub struct DrainHandle {
     task_metrics_tx: tokio::sync::mpsc::UnboundedSender<(u32, u32, pb::TaskMetrics)>,
     task_metrics_rx:
         Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32, pb::TaskMetrics)>>>,
+    /// Worker-side destination of `SetPlan` frames, keyed `(stage_id, task_number)`. Same
+    /// pending-or-waiting shape as the feed registry: a frame arriving before the task asks
+    /// buffers in `Pending`; a task asking first parks a oneshot the drain fulfills.
+    set_plan_registry: Mutex<SetPlanRegistry>,
 }
 
 #[derive(Default)]
@@ -1109,6 +1219,21 @@ fn fail_feed_senders(senders: &RemoteWorkUnitFeedTxs, reason: &str) {
     }
 }
 
+#[derive(Default)]
+struct SetPlanRegistry {
+    map: HashMap<(u32, u32), SetPlanSlot>,
+    /// Set when the inbox scope died: plans come from the leader's proc, so a dead inbox means
+    /// no plan can arrive. Parked takers get the failure; later takers fail immediately.
+    dead: Option<String>,
+}
+
+enum SetPlanSlot {
+    /// A frame that arrived before the task asked for it.
+    Pending(SetPlanFrame),
+    /// A task that asked before its frame arrived.
+    Waiting(tokio::sync::oneshot::Sender<Result<SetPlanFrame, DataFusionError>>),
+}
+
 impl DrainHandle {
     /// Construct a cooperative drain handle. Channel buffers are populated lazily by
     /// [`Self::try_drain_pass`] when a frame arrives, or up-front by [`Self::register_channel`]
@@ -1126,6 +1251,7 @@ impl DrainHandle {
             feed_registry: Mutex::new(FeedRegistry::default()),
             task_metrics_tx,
             task_metrics_rx: Mutex::new(Some(task_metrics_rx)),
+            set_plan_registry: Mutex::new(SetPlanRegistry::default()),
         }
     }
 
@@ -1210,6 +1336,66 @@ impl DrainHandle {
         }
     }
 
+    /// Route one decoded `SetPlan` frame to whoever asked for `(stage_id, task_number)`, or
+    /// buffer it until they do. A duplicate for an already-buffered slot keeps the first frame.
+    fn route_set_plan(&self, stage_id: u32, task_number: u32, frame: SetPlanFrame) {
+        let mut registry = self.set_plan_registry.lock().unwrap();
+        match registry.map.remove(&(stage_id, task_number)) {
+            Some(SetPlanSlot::Waiting(tx)) => {
+                let _ = tx.send(Ok(frame));
+            }
+            Some(pending @ SetPlanSlot::Pending(_)) => {
+                log::debug!(
+                    "mpp: duplicate SetPlan frame for stage {stage_id} task {task_number}; \
+                     keeping the first"
+                );
+                registry.map.insert((stage_id, task_number), pending);
+            }
+            None => {
+                registry
+                    .map
+                    .insert((stage_id, task_number), SetPlanSlot::Pending(frame));
+            }
+        }
+    }
+
+    /// Take the plan delivered for `(stage_id, task_number)`, waiting for its `SetPlan` frame if
+    /// it has not arrived yet. Something on this proc must keep draining (a pump or a
+    /// cooperative send spin) or the wait starves; same contract as the feed channels.
+    pub(super) async fn take_set_plan(
+        &self,
+        stage_id: u32,
+        task_number: u32,
+    ) -> Result<SetPlanFrame, DataFusionError> {
+        let rx = {
+            let mut registry = self.set_plan_registry.lock().unwrap();
+            if let Some(reason) = &registry.dead {
+                return Err(DataFusionError::Execution(reason.clone()));
+            }
+            match registry.map.remove(&(stage_id, task_number)) {
+                Some(SetPlanSlot::Pending(frame)) => return Ok(frame),
+                Some(SetPlanSlot::Waiting(_)) => {
+                    return Err(DataFusionError::Internal(format!(
+                        "mpp: two takers for the SetPlan frame of stage {stage_id} task \
+                         {task_number}"
+                    )));
+                }
+                None => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    registry
+                        .map
+                        .insert((stage_id, task_number), SetPlanSlot::Waiting(tx));
+                    rx
+                }
+            }
+        };
+        rx.await.map_err(|_| {
+            DataFusionError::Execution(
+                "mpp: transport torn down before this task's plan arrived".to_string(),
+            )
+        })?
+    }
+
     fn scope_for_sender(&self, sender_proc: u32) -> ReceiverScope {
         if sender_proc == self.this_proc {
             ReceiverScope::SelfLoop
@@ -1247,6 +1433,14 @@ impl DrainHandle {
             for (_, slot) in registry.map.drain() {
                 if let FeedSlot::Active(senders) = slot {
                     fail_feed_senders(&senders, reason);
+                }
+            }
+            drop(registry);
+            let mut plans = self.set_plan_registry.lock().unwrap();
+            plans.dead = Some(reason.to_string());
+            for (_, slot) in plans.map.drain() {
+                if let SetPlanSlot::Waiting(tx) = slot {
+                    let _ = tx.send(Err(DataFusionError::Execution(reason.to_string())));
                 }
             }
         }
@@ -1378,6 +1572,9 @@ impl DrainHandle {
                         let _ =
                             self.task_metrics_tx
                                 .send((header.stage_id, header.partition, metrics));
+                    }
+                    RecvBatchOutcome::SetPlan { header, frame } => {
+                        self.route_set_plan(header.stage_id, header.partition, frame);
                     }
                     RecvBatchOutcome::Empty => break,
                     RecvBatchOutcome::Detached => {
@@ -1672,7 +1869,8 @@ mod tests {
                     // Control frames have no place in the test-only single-buffer path.
                     RecvBatchOutcome::WorkUnit { .. }
                     | RecvBatchOutcome::FeedEof { .. }
-                    | RecvBatchOutcome::TaskMetrics { .. } => {}
+                    | RecvBatchOutcome::TaskMetrics { .. }
+                    | RecvBatchOutcome::SetPlan { .. } => {}
                     RecvBatchOutcome::Empty => {}
                     RecvBatchOutcome::Detached => {
                         done[i] = true;
@@ -1827,6 +2025,87 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn frame_round_trips_a_set_plan_with_headers() {
+        let set_plan = pb::SetPlanRequest {
+            plan_proto: vec![1, 2, 3, 4],
+            task_count: 2,
+            task_key: Some(pb::TaskKey {
+                query_id: vec![5; 16],
+                stage_id: 3,
+                task_number: 1,
+            }),
+            work_unit_feed_declarations: vec![],
+            target_worker_url: "inprocess://worker/1".to_string(),
+            query_start_time_ns: 42,
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-datafusion-distributed-config", "abc".parse().unwrap());
+        headers.append("x-repeated", "one".parse().unwrap());
+        headers.append("x-repeated", "two".parse().unwrap());
+
+        let frame = SetPlanFrame::from_parts(set_plan.clone(), &headers).expect("from_parts");
+        let header = MppFrameHeader::set_plan(3, 1, 0);
+        let mut buf = Vec::new();
+        encode_prost_frame_into(header, &frame, &mut buf).expect("encode set plan");
+        let (parsed, body) = decode_frame(&buf).expect("decode set plan");
+        assert_eq!(parsed, header);
+        assert_eq!(parsed.kind().unwrap(), MppFrameKind::SetPlan);
+        let FrameBody::SetPlan(decoded) = body else {
+            panic!("SetPlan frame must carry a SetPlanFrame");
+        };
+        let (decoded_plan, decoded_headers) = decoded.into_parts().expect("into_parts");
+        assert_eq!(decoded_plan, set_plan);
+        assert_eq!(decoded_headers, headers);
+    }
+
+    fn sample_set_plan_frame(plan_proto: Vec<u8>) -> SetPlanFrame {
+        SetPlanFrame {
+            set_plan: Some(pb::SetPlanRequest {
+                plan_proto,
+                task_count: 1,
+                task_key: None,
+                work_unit_feed_declarations: vec![],
+                target_worker_url: String::new(),
+                query_start_time_ns: 0,
+            }),
+            header_keys: vec![],
+            header_values: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn set_plan_serves_taker_in_either_arrival_order() {
+        let drain = DrainHandle::cooperative(1, vec![]);
+
+        // Frame first: the take resolves from the pending slot.
+        drain.route_set_plan(7, 0, sample_set_plan_frame(vec![1]));
+        let frame = drain.take_set_plan(7, 0).await.expect("pending take");
+        assert_eq!(frame.set_plan.unwrap().plan_proto, vec![1]);
+
+        // Taker first: the frame fulfills the parked oneshot.
+        let take = drain.take_set_plan(7, 1);
+        futures::pin_mut!(take);
+        assert!(futures::poll!(take.as_mut()).is_pending());
+        drain.route_set_plan(7, 1, sample_set_plan_frame(vec![2]));
+        let frame = take.await.expect("waiting take");
+        assert_eq!(frame.set_plan.unwrap().plan_proto, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn set_plan_take_fails_when_the_inbox_dies() {
+        let drain = DrainHandle::cooperative(1, vec![]);
+        let take = drain.take_set_plan(9, 0);
+        futures::pin_mut!(take);
+        assert!(futures::poll!(take.as_mut()).is_pending());
+        drain.fail_scope(ReceiverScope::Inbox, "producer went away");
+        let err = take.await.expect_err("dead inbox must fail the take");
+        assert!(format!("{err}").contains("producer went away"));
+        // Later takers fail immediately.
+        let err = drain.take_set_plan(9, 1).await.expect_err("dead registry");
+        assert!(format!("{err}").contains("producer went away"));
     }
 
     #[test]

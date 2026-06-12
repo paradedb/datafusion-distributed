@@ -1,4 +1,7 @@
-use crate::common::{require_one_child, serialize_uuid};
+use crate::common::{
+    DistributedCancellationToken, on_drop_stream, require_one_child, serialize_uuid,
+    task_ctx_with_extension,
+};
 use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
 use crate::distributed_planner::NetworkBoundaryExt;
@@ -11,12 +14,14 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr_common::metrics::MetricsSet;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// [ExecutionPlan] that executes the inner plan in distributed mode.
 /// Before executing it, two modifications are lazily performed on the plan:
@@ -171,6 +176,16 @@ impl ExecutionPlan for DistributedExec {
             );
         }
 
+        // Mint one cancellation token for this execution and attach it to the context before the
+        // plan is prepared, so the dispatch contexts handed to the transport carry it too, not
+        // just the head-stage consume path. Producers and consumers watch it; dropping the head
+        // stream fires it.
+        let cancel = CancellationToken::new();
+        let context = Arc::new(task_ctx_with_extension(
+            &context,
+            DistributedCancellationToken(cancel.clone()),
+        ));
+
         let PreparedPlan {
             head_stage,
             join_set,
@@ -182,6 +197,7 @@ impl ExecutionPlan for DistributedExec {
                 .map_err(|e| internal_datafusion_err!("Failed to lock prepared plan: {e}"))?;
             *guard = Some(head_stage.clone());
         }
+
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 1);
         let tx = builder.tx();
         // Spawn the task that pulls data from child...
@@ -201,7 +217,9 @@ impl ExecutionPlan for DistributedExec {
             }
             Ok(())
         });
-        Ok(builder.build())
+        let schema = self.schema();
+        let stream = on_drop_stream(builder.build(), move || cancel.cancel());
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

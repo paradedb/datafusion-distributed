@@ -103,7 +103,7 @@ pub(crate) fn partial_reduce_below_network_shuffles(
 #[cfg(test)]
 mod tests {
     use crate::distributed_planner::session_state_builder_ext::SessionStateBuilderExt;
-    use crate::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver;
+    use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
     use crate::test_utils::parquet::register_parquet_tables;
     use crate::{DistributedExt, assert_snapshot, display_plan_ascii};
     use datafusion::common::assert_not_contains;

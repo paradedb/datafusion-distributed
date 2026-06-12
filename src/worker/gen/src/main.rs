@@ -18,6 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // The gRPC client/server modules are the only tonic-dependent code in the generated
+        // file; gate them so a regeneration keeps no-flight builds compiling.
+        .client_mod_attribute(".", "#[cfg(feature = \"flight\")]")
+        .server_mod_attribute(".", "#[cfg(feature = \"flight\")]")
         .out_dir(&out_dir)
         .extern_path(".worker.FlightData", "::arrow_flight::FlightData")
         .extern_path(

@@ -66,8 +66,8 @@ mod tests {
     }
 
     /// Bare-minimum `WorkerTransport` impl. The test stops at `prepare_in_process_plan`, which
-    /// only walks and rewrites the plan, so `open()` should never be reached. It would only
-    /// fire if the in-process skip in the per-worker loop regressed.
+    /// only walks and rewrites the plan, so neither `open()` nor `dispatcher()` should be
+    /// reached. They would only fire if the in-process skips in the prepare path regressed.
     struct NoopWorkerTransport;
     impl WorkerTransport for NoopWorkerTransport {
         fn open(
@@ -77,10 +77,17 @@ mod tests {
             _target_task: usize,
             _ctx: &Arc<datafusion::execution::TaskContext>,
             _metrics: &datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet,
-        ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
+        ) -> Result<Box<dyn WorkerConnection>> {
             unreachable!(
                 "NoopWorkerTransport::open called: the in-process prepare path should not \
                  dispatch through the WorkerTransport"
+            )
+        }
+
+        fn dispatcher(&self) -> Box<dyn datafusion_distributed::WorkerDispatch> {
+            unreachable!(
+                "NoopWorkerTransport::dispatcher called: the in-process prepare path should \
+                 not create a dispatcher"
             )
         }
     }

@@ -19,7 +19,7 @@ pub fn collect_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<Metrics
     Ok(metrics)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "flight"))]
 mod tests {
 
     use super::*;

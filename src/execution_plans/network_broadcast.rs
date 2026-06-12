@@ -248,13 +248,14 @@ impl ExecutionPlan for NetworkBroadcastExec {
         };
 
         let task_context = DistributedTaskContext::from_ctx(&context);
-        let off = self.properties.partitioning.partition_count() * task_context.task_index;
+        let p_c = self.partitions_per_consumer_task();
+        let off = p_c * task_context.task_index;
         let mut streams = Vec::with_capacity(self.input_stage.task_count());
 
         for input_task_index in 0..self.input_stage.task_count() {
             let worker_connection = self.worker_connections.get_or_init_worker_connection(
                 remote_stage,
-                off..(off + self.properties.partitioning.partition_count()),
+                off..(off + p_c),
                 input_task_index,
                 &context,
             )?;

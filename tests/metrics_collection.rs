@@ -8,6 +8,8 @@ mod tests {
     use datafusion::physical_plan::{ExecutionPlan, execute_stream};
     use datafusion::prelude::SessionContext;
     use datafusion_distributed::test_utils::localhost::start_localhost_context;
+    #[cfg(feature = "flight")]
+    use datafusion_distributed::test_utils::localhost::start_localhost_flight_context;
     use datafusion_distributed::test_utils::parquet::register_parquet_tables;
     use datafusion_distributed::test_utils::test_work_unit_feed::{
         RowGeneratorExec, TestWorkUnitFeedExecCodec, TestWorkUnitFeedFunction,
@@ -147,7 +149,7 @@ mod tests {
     async fn test_metric_collection_network_boundaries(
         format: DistributedMetricsFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
+        let (d_ctx, _guard, _) = start_localhost_flight_context(3, DefaultSessionBuilder).await;
 
         let query =
             r#"SELECT count(*), "RainToday" FROM weather GROUP BY "RainToday" ORDER BY count(*)"#;

@@ -62,6 +62,13 @@ impl DistributedExec {
         self
     }
 
+    /// The store worker task metrics land in when collection is enabled. An embedder driving
+    /// its own workers fills it (e.g. from transport frames) before rewriting the plan for
+    /// display.
+    pub fn metrics_store(&self) -> Option<Arc<MetricsStore>> {
+        self.metrics_store.clone()
+    }
+
     /// Waits until all worker tasks have reported their metrics back via the coordinator channel.
     ///
     /// Metrics are delivered asynchronously after query execution completes, so callers that need

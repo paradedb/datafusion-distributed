@@ -1,5 +1,6 @@
 use crate::common::{TreeNodeExt, on_drop_stream};
 use crate::metrics::proto::df_metrics_set_to_proto;
+use crate::worker::generated::worker as pb;
 use crate::worker::generated::worker::TaskMetrics;
 use crate::worker::worker_service::TaskDataEntries;
 use crate::{DistributedConfig, DistributedTaskContext};
@@ -98,14 +99,12 @@ pub(crate) async fn execute_local_task(
     Ok((streams, task_ctx))
 }
 
-/// Collects metrics from the plan in pre-order traversal order and sends them via the
-/// coordinator channel oneshot.
-fn send_metrics_via_channel(
-    metrics_tx: &Arc<Mutex<Option<Sender<TaskMetrics>>>>,
+/// Per-node metrics of an executed plan in pre-order, the order the metrics rewriter consumes.
+/// Nodes without metrics contribute an empty set so the positions stay aligned.
+pub(crate) fn collect_plan_metrics_protos(
     plan: &Arc<dyn ExecutionPlan>,
     dt_ctx: DistributedTaskContext,
-    task_data_metrics: &Arc<TaskDataMetrics>,
-) {
+) -> Vec<pb::MetricsSet> {
     let mut pre_order_plan_metrics = vec![];
     let _ = plan.apply_with_dt_ctx(dt_ctx, |node, _| {
         pre_order_plan_metrics.push(
@@ -115,6 +114,18 @@ fn send_metrics_via_channel(
         );
         Ok(TreeNodeRecursion::Continue)
     });
+    pre_order_plan_metrics
+}
+
+/// Collects metrics from the plan in pre-order traversal order and sends them via the
+/// coordinator channel oneshot.
+fn send_metrics_via_channel(
+    metrics_tx: &Arc<Mutex<Option<Sender<TaskMetrics>>>>,
+    plan: &Arc<dyn ExecutionPlan>,
+    dt_ctx: DistributedTaskContext,
+    task_data_metrics: &Arc<TaskDataMetrics>,
+) {
+    let pre_order_plan_metrics = collect_plan_metrics_protos(plan, dt_ctx);
 
     let tx = {
         let mut guard = match metrics_tx.lock() {

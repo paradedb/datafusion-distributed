@@ -1,10 +1,11 @@
 pub(crate) mod generated;
-// New Flight-side transport code lands here, behind this one gate, so the sibling modules
-// stay free of per-item `flight` attributes.
+// The whole Arrow-Flight implementation hangs off this one gate; the sibling modules stay
+// neutral so a no-flight build compiles them without per-item attributes.
 #[cfg(feature = "flight")]
 mod flight;
 #[cfg(feature = "flight")]
 mod impl_coordinator_channel;
+#[cfg(feature = "flight")]
 mod impl_execute_task;
 mod session_builder;
 mod single_write_multi_read;
@@ -20,13 +21,13 @@ mod worker_service;
 #[cfg(feature = "flight")]
 pub use flight::FlightWorkerTransport;
 #[cfg(feature = "flight")]
+pub(crate) use flight::LocalWorkerContext;
+#[cfg(feature = "flight")]
 pub(crate) use single_write_multi_read::SingleWriteMultiRead;
 pub use transport::{
     PartitionSink, WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerSink,
     WorkerTransport,
 };
-#[cfg(feature = "flight")]
-pub(crate) use worker_connection_pool::LocalWorkerContext;
 pub(crate) use worker_connection_pool::WorkerConnectionPool;
 
 pub use session_builder::{

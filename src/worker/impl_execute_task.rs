@@ -19,37 +19,21 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::oneshot::Sender;
 
-#[cfg(feature = "flight")]
 use crate::common::now_ns;
-#[cfg(feature = "flight")]
 use crate::protobuf::datafusion_error_to_tonic_status;
-#[cfg(feature = "flight")]
 use crate::worker::generated::worker::FlightAppMetadata;
-#[cfg(feature = "flight")]
 use crate::worker::generated::worker::worker_service_server::WorkerService;
-#[cfg(feature = "flight")]
 use crate::worker::spawn_select_all::spawn_select_all;
-#[cfg(feature = "flight")]
 use crate::worker::worker_service::Worker;
-#[cfg(feature = "flight")]
 use arrow_flight::encode::{DictionaryHandling, FlightDataEncoder, FlightDataEncoderBuilder};
-#[cfg(feature = "flight")]
 use arrow_flight::error::FlightError;
-#[cfg(feature = "flight")]
 use arrow_select::dictionary::garbage_collect_any_dictionary;
-#[cfg(feature = "flight")]
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions};
-#[cfg(feature = "flight")]
 use datafusion::arrow::ipc::CompressionType;
-#[cfg(feature = "flight")]
 use datafusion::arrow::ipc::writer::IpcWriteOptions;
-#[cfg(feature = "flight")]
 use futures::TryStreamExt;
-#[cfg(feature = "flight")]
 use prost::Message;
-#[cfg(feature = "flight")]
 use tokio_stream::StreamExt;
-#[cfg(feature = "flight")]
 use tonic::{Request, Response, Status};
 
 /// How many record batches to buffer from the plan execution.
@@ -138,7 +122,6 @@ pub(crate) async fn execute_local_task(
 ///
 /// This method eagerly starts streaming data from the task, and communicates via channels the
 /// produced [RecordBatch]s already encoded as Arrow Flight data.
-#[cfg(feature = "flight")]
 pub(crate) async fn execute_remote_task(
     task_data_entries: &Arc<TaskDataEntries>,
     request: Request<ExecuteTaskRequest>,
@@ -189,7 +172,6 @@ pub(crate) async fn execute_remote_task(
     }))))
 }
 
-#[cfg(feature = "flight")]
 fn build_flight_data_stream(
     stream: SendableRecordBatchStream,
     compression_type: Option<CompressionType>,
@@ -268,7 +250,6 @@ fn send_metrics_via_channel(
 ///
 /// Unused values can arise from operations such as filtering, where
 /// some keys may no longer be referenced in the filtered result.
-#[cfg(feature = "flight")]
 fn garbage_collect_arrays(batch: RecordBatch) -> Result<RecordBatch, DataFusionError> {
     let (schema, arrays, row_count) = batch.into_parts();
 

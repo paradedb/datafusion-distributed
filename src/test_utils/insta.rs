@@ -18,6 +18,9 @@ pub fn settings() -> insta::Settings {
     let cwd = env::current_dir().unwrap();
     let cwd = cwd.to_str().unwrap();
     settings.add_filter(cwd.trim_start_matches("/"), "");
+    // Tests in sibling crates (e.g. the benchmarks dataset suites) run with their own crate as
+    // cwd, but the data paths in plan snapshots live under this workspace root.
+    settings.add_filter(env!("CARGO_MANIFEST_DIR").trim_start_matches('/'), "");
     settings.add_filter(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         "UUID",

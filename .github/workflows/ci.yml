@@ -39,9 +39,7 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           components: clippy
-      # `--lib` keeps the benchmarks dev-dependency out of the graph; building any test
-      # target would re-enable `flight` through feature unification.
-      - run: cargo clippy --lib --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --features integration -- -D warnings
 
   unit-test:
     runs-on: ubuntu-latest
@@ -52,12 +50,22 @@ jobs:
       - uses: ./.github/actions/setup
       - run: cargo test --features integration
 
+  # The same suite over the in-memory transport: `flight` off, Flight-specific tests skipped.
+  unit-test-no-flight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: ./.github/actions/setup
+      - run: cargo test --no-default-features --features integration
+
   tpch-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
-      - run: cargo test --features tpch --test 'tpch_*'
+      - run: cargo test -p datafusion-distributed-benchmarks --features tpch --test 'tpch_*'
 
   tpcds-correctness-test:
     runs-on: ubuntu-latest
@@ -70,9 +78,9 @@ jobs:
       - uses: ./.github/actions/setup
       - uses: actions/cache@v4
         with:
-          path: testdata/tpcds/main.zip
+          path: benchmarks/testdata/tpcds/main.zip
           key: "main.zip"
-      - run: cargo test --features tpcds --test tpcds_correctness_test shard${{ matrix.shard }}
+      - run: cargo test -p datafusion-distributed-benchmarks --features tpcds --test tpcds_correctness_test shard${{ matrix.shard }}
 
   tpcds-plans-test:
     runs-on: ubuntu-latest
@@ -81,9 +89,9 @@ jobs:
       - uses: ./.github/actions/setup
       - uses: actions/cache@v4
         with:
-          path: testdata/tpcds/main.zip
+          path: benchmarks/testdata/tpcds/main.zip
           key: "main.zip"
-      - run: cargo test --features tpcds --test tpcds_plans_test
+      - run: cargo test -p datafusion-distributed-benchmarks --features tpcds --test tpcds_plans_test
 
   clickbench-test:
     runs-on: ubuntu-latest
@@ -92,9 +100,9 @@ jobs:
       - uses: ./.github/actions/setup
       - uses: actions/cache@v4
         with:
-          path: testdata/clickbench/
+          path: benchmarks/testdata/clickbench/
           key: "data"
-      - run: cargo test --features clickbench --test 'clickbench_*'
+      - run: cargo test -p datafusion-distributed-benchmarks --features clickbench --test 'clickbench_*'
 
   format-check:
     runs-on: ubuntu-latest

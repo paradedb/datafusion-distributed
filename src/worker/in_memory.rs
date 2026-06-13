@@ -83,7 +83,7 @@ impl WorkerTransport for InMemoryWorkerTransport {
             input_stage,
             target_partitions,
             target_task,
-            Arc::clone(&self.worker.task_data_entries),
+            Arc::clone(self.worker.task_data_entries()),
             metrics,
         )))
     }

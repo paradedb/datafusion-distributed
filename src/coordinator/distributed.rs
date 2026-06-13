@@ -127,7 +127,9 @@ impl DistributedExec {
     /// - No cancellation token: teardown is the embedder's job.
     /// - No work-unit feeds: Flight pumps those from dispatch-spawned tasks, which don't exist
     ///   here, so feed-declaring plans are rejected.
-    /// - No plan recording: metrics rewriting and `prepared_plan()` do not apply.
+    /// - No metrics delivery: the prepared plan is recorded, so
+    ///   [`crate::rewrite_distributed_plan_with_metrics`] applies once the embedder fills
+    ///   [`Self::metrics_store`] itself (e.g. from its transport's metrics frames).
     pub fn prepare_in_process_plan(
         &self,
         ctx: &Arc<TaskContext>,
@@ -162,6 +164,13 @@ impl DistributedExec {
                  prepare_in_process_plan requires a transport whose dispatch completes \
                  synchronously"
             );
+        }
+        {
+            let mut guard = self
+                .prepared_plan
+                .lock()
+                .map_err(|e| internal_datafusion_err!("Failed to lock prepared plan: {e}"))?;
+            *guard = Some(head_stage.clone());
         }
         Ok(head_stage)
     }

@@ -16,6 +16,13 @@ use std::sync::Arc;
 pub(crate) struct EncodedTaskPlan {
     pub(crate) plan_proto: Vec<u8>,
     pub(crate) feed_declarations: Vec<WorkUnitFeedDeclaration>,
+    /// Output partitions of the specialized plan. Task-isolated nodes (a union executing one
+    /// child per task) make this differ from the unspecialized stage plan, so a push-based
+    /// transport must size its per-task sinks from this, not from the stage plan. Read only by
+    /// out-of-registry transports that produce into sinks; the in-crate pull transports read
+    /// the partition count straight from the task registry.
+    #[allow(dead_code)]
+    pub(crate) partitions: usize,
 }
 
 /// Specializes `plan` for `task_index` and encodes it with the session's combined codec.
@@ -60,11 +67,13 @@ pub(crate) fn encode_task_plan(
     })?;
 
     let codec = DistributedCodec::new_combined_with_user(cfg);
+    let partitions = specialized.data.properties().partitioning.partition_count();
     let plan_proto =
         PhysicalPlanNode::try_from_physical_plan(specialized.data, &codec)?.encode_to_vec();
 
     Ok(EncodedTaskPlan {
         plan_proto,
         feed_declarations,
+        partitions,
     })
 }

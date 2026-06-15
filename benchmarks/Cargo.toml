@@ -35,7 +35,7 @@ mimalloc = "0.1"
 
 [features]
 # Gates for the dataset test suites under `tests/`. They live in this crate instead of the
-# library because they depend on it: as a dev-dependency of the library they re-enabled
+# library because they depend on it: as a dev-dependency of the library they re-enable
 # `flight` on every test build through feature unification.
 tpch = []
 tpcds = []

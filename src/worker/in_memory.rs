@@ -39,9 +39,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// query, stage, and task number, so a single registry isolates them. The worker resolver's URLs
 /// only size the stages; nothing is dialed.
 ///
-/// With the `flight` feature off this is the default transport, so a single-process build runs
-/// distributed plans out of the box. Embedders with their own comms still register a custom
-/// transport; multi-process execution still needs one.
+/// With the `flight` feature off this is the default transport, so distributed plans run out of
+/// the box without the Flight stack. Embedders with their own comms register a custom transport.
 #[derive(Clone, Default)]
 pub struct InMemoryWorkerTransport {
     worker: Worker,

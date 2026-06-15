@@ -292,7 +292,7 @@ pub trait DistributedExt: Sized {
 
     /// Overrides the [WorkerTransport] this crate uses to talk to workers: opening read
     /// connections from the worker connection pool and delivering each stage's plans at prepare
-    /// time. The default is the Arrow-Flight gRPC implementation shipped in this crate (the
+    /// time. The default is the Arrow-Flight gRPC implementation shipped in this crate (or the
     /// in-memory transport when `flight` is off); an embedded executor registers its own
     /// (e.g. shared-memory queues) without forking the per-operator code paths.
     fn with_distributed_worker_transport<T: WorkerTransport + 'static>(self, transport: T) -> Self;

@@ -81,6 +81,12 @@ impl Worker {
         self.hooks.on_plan.push(Arc::new(hook));
     }
 
+    /// The registry of in-flight tasks this worker owns. In-crate transports read it to
+    /// execute stored tasks directly.
+    pub(crate) fn task_data_entries(&self) -> &Arc<TaskDataEntries> {
+        &self.task_data_entries
+    }
+
     /// Sets a version string reported by the `GetWorkerInfo` gRPC endpoint.
     pub fn with_version(mut self, version: impl Into<Cow<'static, str>>) -> Self {
         self.version = version.into();

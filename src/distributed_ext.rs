@@ -206,7 +206,7 @@ pub trait DistributedExt: Sized {
     /// # use datafusion::prelude::SessionConfig;
     /// # use url::Url;
     /// # use std::sync::Arc;
-    /// # use datafusion_distributed::{BoxCloneSyncChannel, WorkerResolver, DistributedExt, SessionStateBuilderExt, WorkerQueryContext};
+    /// # use datafusion_distributed::{WorkerResolver, DistributedExt, SessionStateBuilderExt, WorkerQueryContext};
     ///
     /// struct CustomWorkerResolver;
     ///
@@ -292,9 +292,9 @@ pub trait DistributedExt: Sized {
 
     /// Overrides the [WorkerTransport] this crate uses to talk to workers: opening read
     /// connections from the worker connection pool and delivering each stage's plans at prepare
-    /// time. The default is the Arrow-Flight gRPC implementation shipped in this crate; an
-    /// embedded executor registers its own (e.g. shared-memory queues) without forking the
-    /// per-operator code paths.
+    /// time. The default is the Arrow-Flight gRPC implementation shipped in this crate (or the
+    /// in-memory transport when `flight` is off); an embedded executor registers its own
+    /// (e.g. shared-memory queues) without forking the per-operator code paths.
     fn with_distributed_worker_transport<T: WorkerTransport + 'static>(self, transport: T) -> Self;
 
     /// Same as [DistributedExt::with_distributed_worker_transport] but with an in-place mutation.
@@ -471,15 +471,6 @@ pub trait DistributedExt: Sized {
 
     /// Same as [DistributedExt::with_distributed_broadcast_joins_enabled] but with an in-place mutation.
     fn set_distributed_broadcast_joins(&mut self, enabled: bool) -> Result<(), DataFusionError>;
-
-    /// Skip the gRPC plan-send / metrics-collection / work-unit-feed tasks in
-    /// `DistributedExec::prepare_plan`. Intended for embedders that ship the worker plan over a
-    /// side channel and provide their own [crate::WorkerTransport]; input stages are still
-    /// converted from `Local` to `Remote` so transport-keyed routing works the same way.
-    fn with_distributed_in_process_mode(self, enabled: bool) -> Result<Self, DataFusionError>;
-
-    /// Same as [DistributedExt::with_distributed_in_process_mode] but with an in-place mutation.
-    fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
 
     /// The compression type to use for sending data over the wire.
     ///
@@ -695,12 +686,6 @@ impl DistributedExt for SessionConfig {
         Ok(())
     }
 
-    fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError> {
-        let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
-        d_cfg.in_process_mode = enabled;
-        Ok(())
-    }
-
     fn set_distributed_compression(
         &mut self,
         compression: Option<CompressionType>,
@@ -821,10 +806,6 @@ impl DistributedExt for SessionConfig {
             #[expr($?;Ok(self))]
             fn with_distributed_broadcast_joins(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            #[call(set_distributed_in_process_mode)]
-            #[expr($?;Ok(self))]
-            fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
-
             #[call(set_distributed_compression)]
             #[expr($?;Ok(self))]
             fn with_distributed_compression(mut self, compression: Option<CompressionType>) -> Result<Self, DataFusionError>;
@@ -931,10 +912,6 @@ impl DistributedExt for SessionStateBuilder {
             #[expr($?;Ok(self))]
             fn with_distributed_broadcast_joins(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
-            #[call(set_distributed_in_process_mode)]
-            #[expr($?;Ok(self))]
-            fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
             fn set_distributed_compression(&mut self, compression: Option<CompressionType>) -> Result<(), DataFusionError>;
             #[call(set_distributed_compression)]
@@ -1054,10 +1031,6 @@ impl DistributedExt for SessionState {
             #[expr($?;Ok(self))]
             fn with_distributed_broadcast_joins(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
-            #[call(set_distributed_in_process_mode)]
-            #[expr($?;Ok(self))]
-            fn with_distributed_in_process_mode(mut self, enabled: bool) -> Result<Self, DataFusionError>;
 
             fn set_distributed_compression(&mut self, compression: Option<CompressionType>) -> Result<(), DataFusionError>;
             #[call(set_distributed_compression)]
@@ -1177,10 +1150,6 @@ impl DistributedExt for SessionContext {
             #[expr($?;Ok(self))]
             fn with_distributed_broadcast_joins(self, enabled: bool) -> Result<Self, DataFusionError>;
 
-            fn set_distributed_in_process_mode(&mut self, enabled: bool) -> Result<(), DataFusionError>;
-            #[call(set_distributed_in_process_mode)]
-            #[expr($?;Ok(self))]
-            fn with_distributed_in_process_mode(self, enabled: bool) -> Result<Self, DataFusionError>;
 
             fn set_distributed_compression(&mut self, compression: Option<CompressionType>) -> Result<(), DataFusionError>;
             #[call(set_distributed_compression)]

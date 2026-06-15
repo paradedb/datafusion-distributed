@@ -60,22 +60,20 @@ hyper-util = { version = "0.1.16", optional = true }
 [features]
 default = ["flight"]
 # Arrow Flight gRPC transport. When off, the crate builds with no `tonic` / `arrow-flight`
-# and has no built-in remote transport; cross-worker connections fail at runtime unless an
-# embedder registers its own transport.
+# and the in-memory transport becomes the default: distributed plans run inside the current
+# process. Multi-process execution needs an embedder-registered transport.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:tonic-prost", "dep:tower"]
 avro = ["datafusion/avro"]
-integration = ["flight", "insta", "parquet", "arrow", "hyper-util"]
+# Independent from `flight` so the integration suite runs against both the gRPC transport
+# (`--features integration`) and the in-memory one (`--no-default-features --features
+# integration`); the Flight-specific tests gate themselves on `flight`.
+integration = ["insta", "parquet", "arrow", "hyper-util"]
 
 system-metrics = ["sysinfo"]
 
-tpch = ["integration"]
-tpcds = ["integration"]
-clickbench = ["integration"]
-slow-tests = []
 sysinfo = ["dep:sysinfo"]
 
 [dev-dependencies]
-datafusion-distributed-benchmarks = { path = "benchmarks" }
 structopt = "0.3"
 insta = { version = "1.46.0", features = ["filters"] }
 parquet = "58"
@@ -84,6 +82,31 @@ tokio-stream = { version = "0.1.17", features = ["sync"] }
 hyper-util = "0.1.16"
 pretty_assertions = "1.4"
 test-case = "3.3.1"
+
+# The examples all drive the gRPC transport, so no-flight builds skip them.
+[[example]]
+name = "custom_execution_plan"
+required-features = ["integration", "flight"]
+
+[[example]]
+name = "in_memory_cluster"
+required-features = ["flight"]
+
+[[example]]
+name = "localhost_run"
+required-features = ["flight"]
+
+[[example]]
+name = "localhost_worker"
+required-features = ["flight"]
+
+[[example]]
+name = "localhost_versioned_run"
+required-features = ["flight"]
+
+[[example]]
+name = "localhost_versioned_worker"
+required-features = ["flight"]
 
 [workspace.lints.clippy]
 disallowed_types = "deny"

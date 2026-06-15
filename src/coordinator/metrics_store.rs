@@ -18,7 +18,9 @@ impl MetricsStore {
         Self { tx, rx }
     }
 
-    pub(crate) fn insert(&self, key: TaskKey, metrics: pb::TaskMetrics) {
+    /// Record one task's metrics. Transports call this as frames arrive; an embedder driving
+    /// its own workers fills the store the same way before rewriting the plan for display.
+    pub fn insert(&self, key: TaskKey, metrics: pb::TaskMetrics) {
         self.tx.send_modify(|map| {
             map.insert(key, metrics);
         });
@@ -29,6 +31,8 @@ impl MetricsStore {
     }
 
     #[cfg(test)]
+    // Only the Flight-gated rewriter tests build stores by hand.
+    #[cfg_attr(not(feature = "flight"), allow(dead_code))]
     pub(crate) fn from_entries(
         entries: impl IntoIterator<Item = (TaskKey, pb::TaskMetrics)>,
     ) -> Self {

@@ -1,7 +1,8 @@
-use crate::common::{TreeNodeExt, now_ns, serialize_uuid};
+use crate::common::serialize_uuid;
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::MetricsStore;
-use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
+use crate::coordinator::dispatch_metrics::CoordinatorToWorkerMetrics;
+use crate::coordinator::plan_encoding::encode_task_plan;
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::protobuf::tonic_status_to_datafusion_error;
 use crate::stage::LocalStage;
@@ -10,63 +11,22 @@ use crate::work_unit_feed::{
 };
 use crate::worker::generated::worker as pb;
 use crate::worker::generated::worker::coordinator_to_worker_msg::Inner;
-use crate::worker::generated::worker::set_plan_request::WorkUnitFeedDeclaration;
-use crate::{
-    DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedConfig,
-    DistributedTaskContext, TaskKey, get_distributed_channel_resolver,
-};
+use crate::{TaskKey, get_distributed_channel_resolver};
 use datafusion::common::Result;
 use datafusion::common::instant::Instant;
 use datafusion::common::runtime::JoinSet;
-use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DataFusionError, exec_datafusion_err};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr_common::metrics::{
-    Count, ExecutionPlanMetricsSet, Label, MetricBuilder, MetricValue, Time,
-};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_proto::physical_plan::AsExecutionPlan;
-use datafusion_proto::protobuf::PhysicalPlanNode;
 use futures::StreamExt;
 use http::Extensions;
-use prost::Message;
-use std::fmt::Display;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Request;
 use tonic::metadata::MetadataMap;
 use url::Url;
 use uuid::Uuid;
-
-/// Metrics that measure network details about communications between [DistributedExec] and a
-/// worker.
-#[derive(Clone)]
-pub(crate) struct CoordinatorToWorkerMetrics {
-    pub(super) plan_bytes_sent: Count,
-    pub(super) plan_send_latency: Arc<LatencyMetric>,
-    pub(super) instantiation_time: u64,
-}
-
-impl CoordinatorToWorkerMetrics {
-    pub(crate) fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
-        Self {
-            // Metric that measures to total sum of bytes worth of subplans sent.
-            plan_bytes_sent: MetricBuilder::new(metrics)
-                .with_label(Label::new(DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, "0"))
-                .global_counter("plan_bytes_sent"),
-            // Latency statistics about the network calls issued to the workers for feeding subplans.
-            plan_send_latency: Arc::new(LatencyMetric::new(
-                "plan_send_latency",
-                |b| b.with_label(Label::new(DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, "0")),
-                metrics,
-            )),
-            instantiation_time: now_ns(),
-        }
-    }
-}
 
 /// Builder for the different kind of tasks that handle the communications between the
 /// [DistributedExec] node to the workers. This struct is responsible for instantiating the tasks
@@ -81,7 +41,6 @@ pub(crate) struct CoordinatorToWorkerTaskSpawner<'a> {
     query_id: Uuid,
     stage_id: usize,
     task_count: usize,
-    task_ctx: &'a TaskContext,
     metrics: &'a CoordinatorToWorkerMetrics,
     task_metrics: Option<&'a Arc<MetricsStore>>,
     join_set: &'a mut JoinSet<Result<()>>,
@@ -94,7 +53,6 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         stage: &'a LocalStage,
         metrics: &'a CoordinatorToWorkerMetrics,
         task_metrics: Option<&'a Arc<MetricsStore>>,
-        task_ctx: &'a TaskContext,
         join_set: &'a mut JoinSet<Result<()>>,
     ) -> Result<Self> {
         Ok(Self {
@@ -102,7 +60,6 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             query_id: stage.query_id,
             stage_id: stage.num,
             task_count: stage.tasks,
-            task_ctx,
             metrics,
             task_metrics,
             join_set,
@@ -121,42 +78,8 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         UnboundedSender<pb::CoordinatorToWorkerMsg>,
         UnboundedReceiver<pb::WorkerToCoordinatorMsg>,
     )> {
-        let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
-        let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
-
-        let mut work_unit_feed_declarations = vec![];
-        let d_ctx = DistributedTaskContext {
-            task_index: task_i,
-            task_count: self.task_count,
-        };
-
-        let plan = Arc::clone(self.plan);
-        let specialized = plan.transform_down_with_dt_ctx(d_ctx, |plan, d_ctx| {
-            if let Some(wuf) = wuf_registry.get_work_unit_feed(&plan) {
-                work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
-                    id: serialize_uuid(&wuf.id()),
-                    partitions: plan.properties().partitioning.partition_count() as u64,
-                });
-            };
-
-            if let Some(ciu) = plan.as_any().downcast_ref::<ChildrenIsolatorUnionExec>() {
-                let ciu = ciu.to_task_specialized(d_ctx.task_index);
-                return Ok(Transformed::yes(Arc::new(ciu)));
-            };
-
-            if let Some(dle) = plan.as_any().downcast_ref::<DistributedLeafExec>() {
-                let specialized = dle.to_task_specialized(d_ctx.task_index);
-                return Ok(Transformed::yes(specialized));
-            }
-
-            Ok(Transformed::no(plan))
-        })?;
-
-        let codec = DistributedCodec::new_combined_with_user(self.task_ctx.session_config());
-
-        let plan_proto =
-            PhysicalPlanNode::try_from_physical_plan(specialized.data, &codec)?.encode_to_vec();
-        let plan_size = plan_proto.len();
+        let encoded = encode_task_plan(self.plan, task_i, self.task_count, ctx.session_config())?;
+        let plan_size = encoded.plan_proto.len();
 
         let task_key = TaskKey {
             query_id: serialize_uuid(&self.query_id),
@@ -165,10 +88,10 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         };
         let msg = pb::CoordinatorToWorkerMsg {
             inner: Some(Inner::SetPlanRequest(pb::SetPlanRequest {
-                plan_proto,
+                plan_proto: encoded.plan_proto,
                 task_count: self.task_count as u64,
                 task_key: Some(task_key.clone()),
-                work_unit_feed_declarations,
+                work_unit_feed_declarations: encoded.feed_declarations,
                 target_worker_url: url.to_string(),
                 query_start_time_ns: self.metrics.instantiation_time,
             })),
@@ -280,60 +203,5 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             Ok(())
         });
         Ok(())
-    }
-}
-
-/// DataFusion metrics system is pretty limited from an API standpoint. This intermediate struct
-/// bridges the gaps that are not satisfied by upstream API for measuring latency.
-pub(super) struct LatencyMetric {
-    max: Time,
-    avg: Time,
-    max_latency_micros: AtomicU64,
-    sum_latency_micros: AtomicU64,
-    count_latency_micros: AtomicU64,
-}
-
-impl Drop for LatencyMetric {
-    fn drop(&mut self) {
-        self.max.add_duration(Duration::from_micros(
-            self.max_latency_micros.load(Ordering::Relaxed),
-        ));
-        self.avg.add_duration(Duration::from_micros(
-            self.sum_latency_micros.load(Ordering::Relaxed)
-                / self.count_latency_micros.load(Ordering::Relaxed).max(1),
-        ));
-    }
-}
-
-impl LatencyMetric {
-    pub(crate) fn new(
-        name: impl Display,
-        builder: impl Fn(MetricBuilder) -> MetricBuilder,
-        metrics: &ExecutionPlanMetricsSet,
-    ) -> Self {
-        let max = Time::new();
-        builder(MetricBuilder::new(metrics)).build(MetricValue::Time {
-            name: format!("{name}_max").into(),
-            time: max.clone(),
-        });
-        let avg = Time::new();
-        builder(MetricBuilder::new(metrics)).build(MetricValue::Time {
-            name: format!("{name}_avg").into(),
-            time: avg.clone(),
-        });
-        Self {
-            max,
-            avg,
-            max_latency_micros: AtomicU64::new(0),
-            sum_latency_micros: AtomicU64::new(0),
-            count_latency_micros: AtomicU64::new(0),
-        }
-    }
-
-    fn record(&self, start: &Instant) {
-        let micros = start.elapsed().as_micros() as u64;
-        self.max_latency_micros.fetch_max(micros, Ordering::Relaxed);
-        self.sum_latency_micros.fetch_add(micros, Ordering::Relaxed);
-        self.count_latency_micros.fetch_add(1, Ordering::Relaxed);
     }
 }

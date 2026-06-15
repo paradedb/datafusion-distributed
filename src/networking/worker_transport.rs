@@ -32,11 +32,12 @@ pub(crate) fn set_distributed_worker_transport(
 static DEFAULT_WORKER_TRANSPORT: LazyLock<Arc<dyn WorkerTransport>> =
     LazyLock::new(|| Arc::new(FlightWorkerTransport));
 
-// With Flight compiled out there is no built-in transport. Embedders must register one; if they
-// do not, opening a connection fails loudly instead of silently doing nothing.
+// With Flight compiled out the default is the in-memory transport: every task runs in the
+// current process through the default worker session. A custom session (UDFs, codecs) or
+// multi-process execution still needs a registered transport.
 #[cfg(not(feature = "flight"))]
 static DEFAULT_WORKER_TRANSPORT: LazyLock<Arc<dyn WorkerTransport>> =
-    LazyLock::new(|| Arc::new(UnsetWorkerTransport));
+    LazyLock::new(|| Arc::new(crate::worker::InMemoryWorkerTransport::default()));
 
 /// Returns the [WorkerTransport] registered on the provided session config, or a process-wide
 /// default if none has been set. This is what `WorkerConnectionPool` consults at execute time
@@ -57,41 +58,6 @@ pub fn get_distributed_worker_transport(cfg: &SessionConfig) -> Arc<dyn WorkerTr
 
 #[derive(Clone, Default)]
 pub(crate) struct WorkerTransportExtension(pub(crate) Option<Arc<dyn WorkerTransport>>);
-
-#[cfg(not(feature = "flight"))]
-struct UnsetWorkerTransport;
-
-#[cfg(not(feature = "flight"))]
-const UNSET_TRANSPORT_MSG: &str = "no WorkerTransport registered: the crate was built without the `flight` feature, so register \
-     one via DistributedExt::with_distributed_worker_transport";
-
-#[cfg(not(feature = "flight"))]
-impl WorkerTransport for UnsetWorkerTransport {
-    fn open(
-        &self,
-        _input_stage: &crate::RemoteStage,
-        _target_partitions: std::ops::Range<usize>,
-        _target_task: usize,
-        _ctx: &Arc<datafusion::execution::TaskContext>,
-        _metrics: &datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet,
-    ) -> datafusion::common::Result<Box<dyn crate::WorkerConnection>> {
-        datafusion::common::not_impl_err!("{UNSET_TRANSPORT_MSG}")
-    }
-
-    fn dispatcher(&self) -> Box<dyn crate::WorkerDispatch> {
-        Box::new(UnsetWorkerTransport)
-    }
-}
-
-#[cfg(not(feature = "flight"))]
-impl crate::WorkerDispatch for UnsetWorkerTransport {
-    fn dispatch(
-        &self,
-        _request: crate::WorkerDispatchRequest<'_>,
-    ) -> datafusion::common::Result<()> {
-        datafusion::common::not_impl_err!("{UNSET_TRANSPORT_MSG}")
-    }
-}
 
 #[cfg(test)]
 mod tests {

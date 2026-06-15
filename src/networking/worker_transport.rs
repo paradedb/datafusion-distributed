@@ -32,13 +32,13 @@ pub(crate) fn set_distributed_worker_transport(
 static DEFAULT_WORKER_TRANSPORT: LazyLock<Arc<dyn WorkerTransport>> =
     LazyLock::new(|| Arc::new(FlightWorkerTransport));
 
-// With Flight compiled out the default is the self-hosted embedded transport: every task runs
-// in the current process through the default worker session, with the data moving through the
-// shared-memory mesh. A custom session (UDFs, codecs) or multi-process execution still needs a
-// registered transport.
+// With Flight compiled out the default is the self-hosted shared-memory transport: every task
+// runs in the current process through the default worker session, with the data moving through
+// the shared-memory mesh. A custom session (UDFs, codecs) or multi-process execution still needs
+// a registered transport.
 #[cfg(not(feature = "flight"))]
 static DEFAULT_WORKER_TRANSPORT: LazyLock<Arc<dyn WorkerTransport>> =
-    LazyLock::new(|| Arc::new(crate::embedded::SelfHostedShmTransport::default()));
+    LazyLock::new(|| Arc::new(crate::shm::SelfHostedShmTransport::default()));
 
 /// Returns the [WorkerTransport] registered on the provided session config, or a process-wide
 /// default if none has been set. This is what `WorkerConnectionPool` consults at execute time

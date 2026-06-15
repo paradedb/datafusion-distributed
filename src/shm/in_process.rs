@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! In-process instantiation of the embedded transport, plus an end-to-end test.
+//! In-process instantiation of the shared-memory transport, plus an end-to-end test.
 //!
 //! A real distributed query runs through [`ShmMqWorkerTransport`] with no Postgres and no Flight.
 //! This is the rebase-safety payoff: a single process plays every role that production splits

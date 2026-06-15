@@ -1,6 +1,6 @@
 #[cfg(feature = "flight")]
 use crate::WorkerResolver;
-use crate::embedded::SelfHostedShmTransport;
+use crate::shm::SelfHostedShmTransport;
 use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
 use crate::{DistributedExt, SessionStateBuilderExt, Worker, WorkerSessionBuilder};
 #[cfg(feature = "flight")]
@@ -89,7 +89,7 @@ where
 
 /// Workers and context with a fixed number of target partitions, hosted in-process by a
 /// [SelfHostedShmTransport] built from `session_builder`. Every cross-stage byte moves through the
-/// embedded shared-memory mesh, so this is what the integration suite exercises by default in both
+/// shared-memory mesh, so this is what the integration suite exercises by default in both
 /// build configurations. Nothing listens on localhost; the returned [Worker]s are handles onto the
 /// shared in-process task registry.
 pub async fn start_localhost_context<B>(

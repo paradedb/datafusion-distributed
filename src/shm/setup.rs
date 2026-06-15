@@ -182,7 +182,7 @@ pub unsafe fn leader_setup(
 /// feeds as `(feed id, partitions)`, the same pairs the plan's `WorkUnitFeedDeclaration`s carry.
 ///
 /// The caller must keep the proc draining (a consumer loop, a send spin, or an explicit
-/// [`crate::embedded::CooperativeDrainSet::try_drain_pass`] pump) while a fragment waits on its
+/// [`crate::shm::CooperativeDrainSet::try_drain_pass`] pump) while a fragment waits on its
 /// feed, or the units sit in the inbox unread.
 /// Build the [`TaskMetrics`] payload for one executed fragment, for embedders that run
 /// fragments outside the worker task registry (pg parallel workers). Pair it with

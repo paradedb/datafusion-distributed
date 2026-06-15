@@ -252,7 +252,7 @@ impl WorkerTransport for ShmMqWorkerTransport {
         }
         // First line to grep when a query hangs on a channel nothing registered.
         log::debug!(
-            "embedded transport open: this_proc={} stage_id={stage_id} \
+            "shm transport open: this_proc={} stage_id={stage_id} \
              target_task={target_task} -> sender_proc={sender_proc}",
             self.mesh.this_proc
         );
@@ -333,7 +333,7 @@ impl WorkerConnection for ShmMqWorkerConnection {
         // shared with all peers.
         let drain = Arc::clone(self.mesh.inbound_receiver());
         log::debug!(
-            "embedded transport execute: register channel sender_proc={} stage_id={} \
+            "shm transport execute: register channel sender_proc={} stage_id={} \
              partition={partition_u32}",
             self.sender_proc,
             self.stage_id

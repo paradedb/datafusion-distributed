@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The embedded transport hosting its own workers, so it can serve as a session default.
+//! The shared-memory transport hosting its own workers, so it can serve as a session default.
 //!
 //! Production embedders drive the mesh themselves: they allocate the region, launch the worker
 //! processes, and deliver plans out of band, so [`ShmMqWorkerTransport`]'s dispatcher is a no-op.
@@ -135,7 +135,7 @@ impl Interrupt for CancellationInterrupt {
     }
 }
 
-/// [`WorkerTransport`] over the embedded shared-memory mesh, hosting its own workers in-process.
+/// [`WorkerTransport`] over the shared-memory mesh, hosting its own workers in-process.
 ///
 /// All tasks share one [Worker] (one task registry, one session builder), like the in-memory
 /// transport; what differs is the data plane: producer fragments run eagerly as background tasks

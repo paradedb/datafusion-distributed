@@ -27,7 +27,7 @@ use super::transport::{BatchChannelReceiver, BatchChannelSender, RecvOutcome};
 
 /// Postgres MAXALIGN. The DSM layout must agree between this crate (which computes the per-inbox
 /// offsets) and whatever shared buffer the embedder hands it. PG's `MAXIMUM_ALIGNOF` is 8 on every
-/// supported platform, so the embedded layout pins it.
+/// supported platform, so the shared-memory layout pins it.
 const MAXALIGN: usize = 8;
 
 /// MAXALIGN-DOWN of `queue_bytes`, so every per-inbox region in the grid is the same size and

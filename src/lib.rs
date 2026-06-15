@@ -3,12 +3,12 @@
 mod common;
 mod config_extension_ext;
 mod distributed_ext;
-// Public so an embedder (e.g. pg_search's shared-memory MPP) consumes the transport directly,
-// and so its in-process test runs a real distributed query through it in this crate's CI.
-pub mod embedded;
 mod execution_plans;
 mod metrics;
 mod passthrough_headers;
+// Public so an embedder (e.g. pg_search's shared-memory MPP) consumes the transport directly,
+// and so its in-process test runs a real distributed query through it in this crate's CI.
+pub mod shm;
 mod stage;
 // With `flight` off the in-memory transport keeps this machinery live; what remains dormant is
 // the gRPC envelope side: the generated stream messages and the Flight-only `Worker` accessors.

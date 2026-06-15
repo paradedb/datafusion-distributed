@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Embedded shared-memory transport.
+//! Shared-memory transport.
 //!
 //! A non-Flight `WorkerTransport` for co-located execution, where "workers" are tasks or
 //! parallel processes sharing one machine and communicating over a shared-memory mesh rather

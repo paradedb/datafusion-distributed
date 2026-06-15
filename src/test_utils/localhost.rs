@@ -1,10 +1,8 @@
-#[cfg(not(feature = "flight"))]
-use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
-#[cfg(not(feature = "flight"))]
-use crate::{DistributedExt, InMemoryWorkerTransport};
 #[cfg(feature = "flight")]
-use crate::{DistributedExt, WorkerResolver};
-use crate::{SessionStateBuilderExt, Worker, WorkerSessionBuilder};
+use crate::WorkerResolver;
+use crate::shm::SelfHostedShmTransport;
+use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
+use crate::{DistributedExt, SessionStateBuilderExt, Worker, WorkerSessionBuilder};
 #[cfg(feature = "flight")]
 use async_trait::async_trait;
 #[cfg(feature = "flight")]
@@ -23,7 +21,9 @@ use tonic::transport::Server;
 #[cfg(feature = "flight")]
 use url::Url;
 
-/// Create workers and context on localhost with a fixed number of target partitions.
+/// Create workers and context on localhost with a fixed number of target partitions, behind the
+/// Arrow-Flight gRPC transport. For flight-specific tests (network metrics, URL routing); the
+/// generic suite runs through [start_localhost_context] instead.
 ///
 /// Creates `num_workers` listeners, all bound to a random OS decided port on `127.0.0.1`, then
 /// attaches a channel resolver that is aware of these addresses to `session_builder` and uses it
@@ -31,7 +31,7 @@ use url::Url;
 ///
 /// Returns a session context aware of these workers, and a join set of all spawned worker tasks.
 #[cfg(feature = "flight")]
-pub async fn start_localhost_context<B>(
+pub async fn start_localhost_flight_context<B>(
     num_workers: usize,
     session_builder: B,
 ) -> (SessionContext, JoinSet<()>, Vec<Worker>)
@@ -87,11 +87,11 @@ where
     (SessionContext::from(state), join_set, workers)
 }
 
-/// The no-flight twin of the gRPC variant above, so the integration suite compiles and runs in
-/// both configurations from the same source: workers are hosted in-process by an
-/// [InMemoryWorkerTransport] built from `session_builder`, nothing listens on localhost, and the
-/// returned [Worker]s are handles onto the shared in-process task registry.
-#[cfg(not(feature = "flight"))]
+/// Workers and context with a fixed number of target partitions, hosted in-process by a
+/// [SelfHostedShmTransport] built from `session_builder`. Every cross-stage byte moves through the
+/// shared-memory mesh, so this is what the integration suite exercises by default in both
+/// build configurations. Nothing listens on localhost; the returned [Worker]s are handles onto the
+/// shared in-process task registry.
 pub async fn start_localhost_context<B>(
     num_workers: usize,
     session_builder: B,
@@ -100,7 +100,7 @@ where
     B: WorkerSessionBuilder + Send + Sync + 'static,
     B: Clone,
 {
-    let transport = InMemoryWorkerTransport::from_session_builder(session_builder);
+    let transport = SelfHostedShmTransport::from_session_builder(session_builder);
     let workers = (0..num_workers)
         .map(|_| transport.worker().clone())
         .collect();

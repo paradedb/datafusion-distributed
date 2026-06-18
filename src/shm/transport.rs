@@ -75,9 +75,10 @@ pub(super) enum MppFrameKind {
     FeedEof = 3,
     TaskMetrics = 4,
     SetPlan = 5,
-    /// Consumer -> producer: stop producing for `stage_id`, the consumer abandoned it (a top-N
-    /// `LIMIT` is satisfied). The producer ends that stage's sends cleanly. Scoped to the stage
-    /// rather than the connection, so the ring stays healthy for metrics and other stages, the
+    /// Consumer -> producer: stop producing for `stage_id`, the consumer stopped reading before EOF
+    /// (a top-N `LIMIT`, an inner merge join exhausting a side, etc.). The producer ends that
+    /// stage's sends cleanly. Scoped to the stage rather than the connection, so the ring stays
+    /// healthy for metrics and other stages, the
     /// way gRPC closes one stream without dropping the channel.
     Cancel = 6,
 }
@@ -807,11 +808,14 @@ impl MppSender {
         result
     }
 
-    /// Best-effort, bounded, synchronous send of a `Cancel` frame for `stage_id`. The consumer
-    /// calls it on each peer sender when it abandons a stage (a satisfied `LIMIT`), telling that
-    /// proc's producers to stop. Synchronous so it can run from the consumer stream's drop, where
-    /// `await` isn't available; best-effort because a producer that already finished, or whose
-    /// inbox briefly backs up, has nothing the cancel needs to reach.
+    /// Bounded synchronous send of a `Cancel` frame for `stage_id`. The consumer calls it on each
+    /// peer sender when it abandons a stage, telling that proc's producers to stop. Synchronous so
+    /// it can run from the consumer stream's drop, where `await` isn't available.
+    ///
+    /// The bound doesn't risk a stuck producer. A live producer drains its own inbox in its send
+    /// spin, so a slot frees and the frame lands well inside the bound even when the inbox is
+    /// backed up. The bound only runs out if the producer already exited or died, and a dead worker
+    /// makes the leader's wait-for-workers error out rather than hang.
     pub fn try_send_cancel(&self, stage_id: u32) {
         let header = MppFrameHeader::cancel(stage_id, self.header.sender_proc());
         let mut buf = [0u8; MPP_FRAME_HEADER_SIZE];
@@ -846,9 +850,9 @@ impl MppSender {
         let t_wait_start = Instant::now();
         loop {
             drain.check_interrupt()?;
-            // The consumer cancelled this stage (a satisfied `LIMIT` upstream stopped it reading).
-            // End the send cleanly so the producer fragment completes. Checked before the send so a
-            // cancel that landed mid-spin stops the next iteration.
+            // The consumer cancelled this stage, so end the send cleanly and let the producer
+            // fragment complete. Checked before the send so a cancel that landed mid-spin stops
+            // the next iteration.
             if drain.stage_cancelled(self.header.stage_id) {
                 return Ok(());
             }
@@ -926,9 +930,9 @@ impl MppSender {
         // siblings if any are ready, mostly a no-op under today's linear MPP topology.
         loop {
             drain.check_interrupt()?;
-            // The consumer cancelled this stage (a satisfied `LIMIT` upstream stopped it reading).
-            // End the send cleanly so the producer fragment completes. Checked before the send so a
-            // cancel that landed mid-spin stops the next iteration.
+            // The consumer cancelled this stage, so end the send cleanly and let the producer
+            // fragment complete. Checked before the send so a cancel that landed mid-spin stops
+            // the next iteration.
             if drain.stage_cancelled(self.header.stage_id) {
                 return Ok(());
             }
@@ -1021,10 +1025,10 @@ impl MppSender {
         let result = async {
             encode_prost_frame_into(self.header, metrics, &mut scratch)?;
             let _send_guard = self.channel.send_lock().lock().await;
-            // The consumer stops reading the data path on an early `LIMIT` but keeps draining at
-            // teardown to collect these metrics, so the frame lands once the data the cancel
-            // stopped drains out and a slot frees. Bounded so a leader that really went away can't
-            // wedge the worker on a full ring.
+            // The consumer stops reading the data path early but keeps draining at teardown to
+            // collect these metrics, so the frame lands once the data the cancel stopped drains out
+            // and a slot frees. Bounded so a leader that really went away can't wedge the worker on
+            // a full ring.
             for _ in 0..10_000 {
                 match self.channel.try_send_bytes(&scratch) {
                     Ok(true) => return Ok(()),
@@ -1247,7 +1251,7 @@ pub struct DrainHandle {
     set_plan_registry: Mutex<SetPlanRegistry>,
     /// Stages this proc's consumers abandoned, learned from inbound `Cancel` frames. A producer
     /// blocked on a full outbound checks it in its send spin and ends that stage's stream cleanly,
-    /// so a satisfied `LIMIT` upstream doesn't leave it spinning to the statement timeout.
+    /// so a consumer that stopped reading early doesn't leave it spinning to the statement timeout.
     cancelled_stages: Mutex<HashSet<u32>>,
 }
 
@@ -2063,7 +2067,7 @@ mod tests {
         let sender = MppSender::with_header(Arc::new(out_tx), MppFrameHeader::batch(7, 0, 1))
             .with_cooperative_drain(Arc::clone(&drain) as Arc<dyn CooperativeDrainSet>);
 
-        // The leader abandons stage 7 (a satisfied `LIMIT`): a `Cancel` reaches the producer's inbox.
+        // The leader abandons stage 7 (it stopped reading before EOF): a `Cancel` reaches the inbox.
         let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
         MppFrameHeader::cancel(7, 0).write_to(&mut buf);
         inbox_tx.send_bytes(&buf).unwrap();

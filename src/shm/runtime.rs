@@ -128,10 +128,14 @@ impl MppMesh {
         *self.cancel_senders.lock().unwrap() = Some(senders);
     }
 
-    /// Tell every producer of `stage_id` to stop: the leader's consumer abandoned it (a satisfied
-    /// `LIMIT`). Ships a `Cancel` frame to each peer inbox, leaving the rings healthy for metrics
-    /// and other stages. Idempotent across the gather partitions that all drop at once. A no-op
-    /// when no senders are installed (a worker, or after teardown cleared them).
+    /// Tell every producer of `stage_id` to stop: the leader's consumer stopped reading it before
+    /// EOF. Ships a `Cancel` frame to each peer inbox, leaving the rings healthy for metrics and
+    /// other stages. Idempotent across the gather partitions that all drop at once. A no-op when no
+    /// senders are installed (a worker, or after teardown cleared them).
+    ///
+    /// Stage-level and leader-only on purpose: the leader is the sole consumer of its gather stage,
+    /// so one stream drop abandons the whole stage. A shuffle stage has many consumers, so
+    /// generalizing this to any consumer's drop would need per-`(stage, partition)` scoping.
     pub fn cancel_stage(&self, stage_id: u32) {
         if !self.cancelled_stages.lock().unwrap().insert(stage_id) {
             return;
@@ -367,9 +371,9 @@ struct ShmMqWorkerConnection {
 
 /// Cancels the leader's gather stage if a consumer stream drops before EOF. The leader is the only
 /// consumer-only proc, so it's the only one that can stop pulling early (a top-N `LIMIT` above the
-/// gather). When it does, its producers would otherwise spin on the full inbox until the statement
-/// timeout. Disarmed on a clean EOF: there the producers already finished, so there's nothing to
-/// cancel.
+/// gather, an inner merge join exhausting a side, etc.). When it does, its producers would
+/// otherwise spin on the full inbox until the statement timeout. Disarmed on a clean EOF: there the
+/// producers already finished, so there's nothing to cancel.
 struct LeaderStageCancelGuard {
     mesh: Arc<MppMesh>,
     stage_id: u32,

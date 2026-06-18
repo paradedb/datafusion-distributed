@@ -33,7 +33,9 @@
 //! substitute internally under the old `in_process_mode` flag.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use datafusion::common::HashSet;
 
 use crate::{
     RemoteStage, WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerResolver,
@@ -47,7 +49,12 @@ use datafusion::physical_plan::metrics::MetricBuilder;
 use futures::stream::BoxStream;
 use url::Url;
 
-use super::transport::{CooperativeDrainSet, DrainHandle, DrainItem, Interrupt};
+use super::transport::{CooperativeDrainSet, DrainHandle, DrainItem, Interrupt, MppSender};
+
+/// The leader's outbound senders to each peer inbox, shared between the mesh (for `Cancel` frames)
+/// and the embedder that owns their lifetime. Indexed by destination `proc_idx`; the leader's own
+/// slot is `None`.
+pub type PeerSenders = Arc<Mutex<Vec<Option<MppSender>>>>;
 
 /// `task_idx → proc_idx` round-robin over the worker procs. The leader is `proc_idx = 0`
 /// (consumer-only), workers are `1..n_procs` (each hosts producer fragments).
@@ -86,6 +93,14 @@ pub struct MppMesh {
     /// Cancellation hook, injected by the embedder, checked at the transport's block points (the
     /// cooperative send spin and the consumer pull loop).
     interrupt: Arc<dyn Interrupt>,
+    /// The leader's outbound senders to each peer inbox, shared with the embedder that owns their
+    /// lifetime (it clears the `Vec` before the DSM unmaps). Used by [`Self::cancel_stage`] to ship
+    /// `Cancel` frames when the leader's gather terminates early. `None` on workers and until the
+    /// embedder installs it.
+    cancel_senders: Mutex<Option<PeerSenders>>,
+    /// Stages already cancelled, so [`Self::cancel_stage`] ships one round of frames per stage even
+    /// though each gather partition's stream drop calls it.
+    cancelled_stages: Mutex<HashSet<u32>>,
 }
 
 impl MppMesh {
@@ -101,6 +116,32 @@ impl MppMesh {
             n_procs,
             inbound_receiver,
             interrupt,
+            cancel_senders: Mutex::new(None),
+            cancelled_stages: Mutex::new(HashSet::default()),
+        }
+    }
+
+    /// Share the leader's outbound senders so [`Self::cancel_stage`] can reach the producers. The
+    /// embedder keeps owning their lifetime: it passes a clone of the same `Arc` it releases before
+    /// the DSM unmaps, so the mesh never extends the senders past teardown.
+    pub fn set_cancel_senders(&self, senders: PeerSenders) {
+        *self.cancel_senders.lock().unwrap() = Some(senders);
+    }
+
+    /// Tell every producer of `stage_id` to stop: the leader's consumer abandoned it (a satisfied
+    /// `LIMIT`). Ships a `Cancel` frame to each peer inbox, leaving the rings healthy for metrics
+    /// and other stages. Idempotent across the gather partitions that all drop at once. A no-op
+    /// when no senders are installed (a worker, or after teardown cleared them).
+    pub fn cancel_stage(&self, stage_id: u32) {
+        if !self.cancelled_stages.lock().unwrap().insert(stage_id) {
+            return;
+        }
+        let guard = self.cancel_senders.lock().unwrap();
+        let Some(senders) = guard.as_ref() else {
+            return;
+        };
+        for sender in senders.lock().unwrap().iter().flatten() {
+            sender.try_send_cancel(stage_id);
         }
     }
 
@@ -188,6 +229,10 @@ impl CooperativeDrainSet for MppMesh {
 
     fn check_interrupt(&self) -> Result<(), DataFusionError> {
         self.interrupt.check()
+    }
+
+    fn stage_cancelled(&self, stage_id: u32) -> bool {
+        self.inbound_receiver.stage_cancelled(stage_id)
     }
 }
 
@@ -320,6 +365,25 @@ struct ShmMqWorkerConnection {
     stage_id: u32,
 }
 
+/// Cancels the leader's gather stage if a consumer stream drops before EOF. The leader is the only
+/// consumer-only proc, so it's the only one that can stop pulling early (a top-N `LIMIT` above the
+/// gather). When it does, its producers would otherwise spin on the full inbox until the statement
+/// timeout. Disarmed on a clean EOF: there the producers already finished, so there's nothing to
+/// cancel.
+struct LeaderStageCancelGuard {
+    mesh: Arc<MppMesh>,
+    stage_id: u32,
+    armed: bool,
+}
+
+impl Drop for LeaderStageCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.mesh.cancel_stage(self.stage_id);
+        }
+    }
+}
+
 impl WorkerConnection for ShmMqWorkerConnection {
     fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let partition_u32 = u32::try_from(partition).map_err(|_| {
@@ -345,7 +409,13 @@ impl WorkerConnection for ShmMqWorkerConnection {
         // into the registry, pops one batch to yield, then yields back to Tokio so sibling tasks
         // (e.g. the leader's own producer subplan) advance. The send side runs the same interrupt
         // check inside `MppSender`'s retry spin.
+        let stage_id = self.stage_id;
         let stream = async_stream::stream! {
+            let mut cancel_guard = (mesh.this_proc == 0).then(|| LeaderStageCancelGuard {
+                mesh: Arc::clone(&mesh),
+                stage_id,
+                armed: true,
+            });
             loop {
                 if let Err(e) = mesh.check_interrupt() {
                     yield Err(e);
@@ -357,7 +427,13 @@ impl WorkerConnection for ShmMqWorkerConnection {
                 }
                 match buffer.try_pop() {
                     Some(DrainItem::Batch(batch)) => yield Ok(batch),
-                    Some(DrainItem::Eof) => break,
+                    Some(DrainItem::Eof) => {
+                        // Clean end: producers already EOF'd, so there's nothing to cancel.
+                        if let Some(g) = cancel_guard.as_mut() {
+                            g.armed = false;
+                        }
+                        break;
+                    }
                     Some(DrainItem::Failed(msg)) => {
                         yield Err(DataFusionError::Execution(msg));
                         return;

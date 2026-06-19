@@ -281,6 +281,11 @@ pub(super) struct DsmMpscSender {
     /// Hook to wake the registered consumer after a publish. Injected by the embedder so the
     /// ring stays free of any process/thread-notification mechanism.
     wakeup: Arc<dyn Wakeup>,
+    /// Whether this handle counts toward `sender_count`. Data senders (the producer fragments)
+    /// do, so the last one's drop flips `detached` and the consumer learns its producers are gone.
+    /// Control senders (a consumer's `Cancel` path) don't: they target a peer's inbox without being
+    /// one of its producers, so counting them would mask that peer's own producer-gone signal.
+    counts_as_data: bool,
 }
 
 // SAFETY: the ring is a `repr(C)` blob in shared memory whose atomic operations are the
@@ -622,7 +627,23 @@ impl DsmMpscSender {
     pub(super) unsafe fn new(ring: NonNull<DsmMpscRingHeader>, wakeup: Arc<dyn Wakeup>) -> Self {
         let header = unsafe { ring.as_ref() };
         header.sender_count.fetch_add(1, Ordering::AcqRel);
-        Self { ring, wakeup }
+        Self {
+            ring,
+            wakeup,
+            counts_as_data: true,
+        }
+    }
+
+    /// A control-plane sibling onto the same ring this handle already targets: it can publish
+    /// frames but stays out of `sender_count`, so it never sets or delays `detached`. Used to derive
+    /// a proc's `Cancel` senders from its data senders without a second attach, so a consumer can
+    /// reach its producer without masquerading as one of that producer's data senders.
+    pub(super) fn to_control(&self) -> DsmMpscSender {
+        DsmMpscSender {
+            ring: self.ring,
+            wakeup: Arc::clone(&self.wakeup),
+            counts_as_data: false,
+        }
     }
 
     /// Wake the registered consumer, if any. Reads the token the consumer stored via
@@ -649,7 +670,9 @@ impl DsmMpscSender {
     /// interleave their fragments. See [`FragmentKind`].
     pub(super) fn try_send(&self, bytes: &[u8]) -> Result<(), SendError> {
         let header = unsafe { self.ring.as_ref() };
-        if header.detached.load(Ordering::Acquire) {
+        // Control senders ignore `detached`: a `Cancel` still has to reach a producer whose own
+        // inbox already detached because its upstream finished while it's mid-output.
+        if self.counts_as_data && header.detached.load(Ordering::Acquire) {
             return Err(SendError::Detached);
         }
         let payload_cap = (header.slot_capacity as usize).saturating_sub(SLOT_HEADER_BYTES);
@@ -849,6 +872,11 @@ impl DsmMpscSender {
 
 impl Drop for DsmMpscSender {
     fn drop(&mut self) {
+        if !self.counts_as_data {
+            // Control senders never joined `sender_count`, so there's nothing to release and no
+            // detach to trigger.
+            return;
+        }
         let header = unsafe { self.ring.as_ref() };
         // AcqRel: decrement is observed by other producers (they don't care, but the
         // Release pairs with the receiver's Acquire load on `detached` below).
@@ -953,6 +981,36 @@ mod tests {
         let receiver = unsafe { DsmMpscReceiver::new(nn) };
         let sender = unsafe { DsmMpscSender::new(nn, noop_wakeup()) };
         (region, receiver, sender)
+    }
+
+    #[test]
+    fn control_sender_does_not_gate_detach() {
+        let bytes = DsmMpscRingHeader::region_bytes(4, 64);
+        let region = AlignedRegion::new(bytes);
+        let nn = NonNull::new(unsafe { create_at(region.as_mut_ptr(), 4, 64) }).unwrap();
+        let rx = unsafe { DsmMpscReceiver::new(nn) };
+        let data = unsafe { DsmMpscSender::new(nn, noop_wakeup()) };
+        let control = data.to_control();
+
+        let mut buf = Vec::new();
+        // The control sender publishes without joining `sender_count`.
+        control.try_send(&[1, 2, 3]).unwrap();
+        assert_eq!(rx.try_recv(&mut buf), RecvOutcome::Bytes);
+        assert_eq!(&buf[..], &[1, 2, 3]);
+        // The data sender still holds the ring open.
+        assert_eq!(rx.try_recv(&mut buf), RecvOutcome::Empty);
+
+        // Dropping the only data sender detaches the ring even though the control sender is held,
+        // so a downstream cancel never masks a producer-gone signal.
+        drop(data);
+        assert_eq!(rx.try_recv(&mut buf), RecvOutcome::Detached);
+
+        // The control sender still reaches the now-detached inbox: a `Cancel` has to land on a
+        // producer whose own upstream already finished.
+        control.try_send(&[9]).unwrap();
+        assert_eq!(rx.try_recv(&mut buf), RecvOutcome::Bytes);
+        assert_eq!(&buf[..], &[9]);
+        drop(control);
     }
 
     #[test]

@@ -742,6 +742,15 @@ impl MppSender {
         }
     }
 
+    /// Whether the consumer of this sender's `(stage, partition)` stream cancelled it. Read by the
+    /// produce loop to stop pulling its input, not just skip the send. `false` without a drain
+    /// (in-proc test channels carry no inbound cancel).
+    pub(super) fn stream_cancelled(&self) -> bool {
+        self.cooperative_drain
+            .as_ref()
+            .is_some_and(|d| d.stream_cancelled(self.header.stage_id, self.header.partition))
+    }
+
     /// Attach a [`CooperativeDrainSet`] so `Self::send_batch_traced`'s spin
     /// can drain inbound peer traffic while waiting for outbound space.
     /// Required for peer-mesh fragments where every worker is both sender and
@@ -1094,6 +1103,10 @@ impl crate::PartitionSink for MppPartitionSink {
 
     async fn finish(mut self: Box<Self>) -> datafusion::common::Result<()> {
         self.sender.send_eof_traced(&mut self.stats).await
+    }
+
+    fn cancelled(&self) -> bool {
+        self.sender.stream_cancelled()
     }
 }
 

@@ -340,6 +340,11 @@ pub async fn run_worker_fragment(
                         continue;
                     }
                     sink.send(&batch).await?;
+                    // Consumer abandoned this stream. Stop pulling: dropping `stream` ends the
+                    // upstream scan and cascades the cancel to its own producers.
+                    if sink.cancelled() {
+                        break;
+                    }
                 }
                 Ok(())
             }

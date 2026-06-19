@@ -75,11 +75,11 @@ pub(super) enum MppFrameKind {
     FeedEof = 3,
     TaskMetrics = 4,
     SetPlan = 5,
-    /// Consumer -> producer: stop producing for `stage_id`, the consumer stopped reading before EOF
-    /// (a top-N `LIMIT`, an inner merge join exhausting a side, etc.). The producer ends that
-    /// stage's sends cleanly. Scoped to the stage rather than the connection, so the ring stays
-    /// healthy for metrics and other stages, the
-    /// way gRPC closes one stream without dropping the channel.
+    /// Consumer -> producer: stop producing the `(stage_id, partition)` stream, the consumer
+    /// stopped reading it before EOF (a top-N `LIMIT`, an inner merge join exhausting a side, etc.).
+    /// The producer ends that one stream cleanly. Scoped to the stream, not the connection, so the
+    /// ring stays healthy for metrics and every other stream, the way gRPC closes one stream
+    /// without dropping the channel.
     Cancel = 6,
 }
 
@@ -254,14 +254,14 @@ impl MppFrameHeader {
         }
     }
 
-    /// Build a `Cancel` header for `stage_id`, stamped with the consumer's `sender_proc`. Carries
-    /// no payload; the producer reads it as "stop sending `stage_id`."
-    pub fn cancel(stage_id: u32, sender_proc: u32) -> Self {
+    /// Build a `Cancel` header for the `(stage_id, partition)` stream, stamped with the consumer's
+    /// `sender_proc`. Carries no payload; the producer reads it as "stop sending this stream."
+    pub fn cancel(stage_id: u32, partition: u32, sender_proc: u32) -> Self {
         Self {
             magic: MPP_FRAME_MAGIC,
             flags: pack_flags(MppFrameKind::Cancel, sender_proc),
             stage_id,
-            partition: 0,
+            partition,
         }
     }
 
@@ -643,10 +643,10 @@ pub trait CooperativeDrainSet: Send + Sync {
         Ok(())
     }
 
-    /// Whether a consumer cancelled `stage_id` (a `Cancel` frame arrived on this proc's inbox).
-    /// The send spin ends the producer's stream cleanly when it's set. Default `false` for drains
-    /// that don't carry inbound control frames (in-proc test channels).
-    fn stage_cancelled(&self, _stage_id: u32) -> bool {
+    /// Whether a consumer cancelled the `(stage_id, partition)` stream (a `Cancel` frame arrived on
+    /// this proc's inbox). The send spin ends the producer's stream cleanly when it's set. Default
+    /// `false` for drains that don't carry inbound control frames (in-proc test channels).
+    fn stream_cancelled(&self, _stage_id: u32, _partition: u32) -> bool {
         false
     }
 }
@@ -671,8 +671,8 @@ impl CooperativeDrainSet for DrainHandle {
         DrainHandle::try_drain_pass(self)
     }
 
-    fn stage_cancelled(&self, stage_id: u32) -> bool {
-        DrainHandle::stage_cancelled(self, stage_id)
+    fn stream_cancelled(&self, stage_id: u32, partition: u32) -> bool {
+        DrainHandle::stream_cancelled(self, stage_id, partition)
     }
 }
 
@@ -808,16 +808,16 @@ impl MppSender {
         result
     }
 
-    /// Bounded synchronous send of a `Cancel` frame for `stage_id`. The consumer calls it on each
-    /// peer sender when it abandons a stage, telling that proc's producers to stop. Synchronous so
-    /// it can run from the consumer stream's drop, where `await` isn't available.
+    /// Bounded synchronous send of a `Cancel` frame for the `(stage_id, partition)` stream. The
+    /// consumer calls it on the sender to the producing proc when it abandons that stream.
+    /// Synchronous so it can run from the consumer stream's drop, where `await` isn't available.
     ///
     /// The bound doesn't risk a stuck producer. A live producer drains its own inbox in its send
     /// spin, so a slot frees and the frame lands well inside the bound even when the inbox is
     /// backed up. The bound only runs out if the producer already exited or died, and a dead worker
     /// makes the leader's wait-for-workers error out rather than hang.
-    pub fn try_send_cancel(&self, stage_id: u32) {
-        let header = MppFrameHeader::cancel(stage_id, self.header.sender_proc());
+    pub fn try_send_cancel(&self, stage_id: u32, partition: u32) {
+        let header = MppFrameHeader::cancel(stage_id, partition, self.header.sender_proc());
         let mut buf = [0u8; MPP_FRAME_HEADER_SIZE];
         header.write_to(&mut buf);
         for _ in 0..10_000 {
@@ -850,10 +850,10 @@ impl MppSender {
         let t_wait_start = Instant::now();
         loop {
             drain.check_interrupt()?;
-            // The consumer cancelled this stage, so end the send cleanly and let the producer
+            // The consumer cancelled this stream, so end the send cleanly and let the producer
             // fragment complete. Checked before the send so a cancel that landed mid-spin stops
             // the next iteration.
-            if drain.stage_cancelled(self.header.stage_id) {
+            if drain.stream_cancelled(self.header.stage_id, self.header.partition) {
                 return Ok(());
             }
             if self.spin_try_send_bytes(scratch).await? {
@@ -930,10 +930,10 @@ impl MppSender {
         // siblings if any are ready, mostly a no-op under today's linear MPP topology.
         loop {
             drain.check_interrupt()?;
-            // The consumer cancelled this stage, so end the send cleanly and let the producer
+            // The consumer cancelled this stream, so end the send cleanly and let the producer
             // fragment complete. Checked before the send so a cancel that landed mid-spin stops
             // the next iteration.
-            if drain.stage_cancelled(self.header.stage_id) {
+            if drain.stream_cancelled(self.header.stage_id, self.header.partition) {
                 return Ok(());
             }
             if self.spin_try_send_bytes(scratch).await? {
@@ -1167,7 +1167,7 @@ pub(super) enum RecvBatchOutcome {
         header: MppFrameHeader,
         metrics: pb::TaskMetrics,
     },
-    /// Consumer abandoned `header.stage_id`; its producers stop sending that stage.
+    /// Consumer abandoned the `header.(stage_id, partition)` stream; its producer stops sending it.
     Cancel {
         header: MppFrameHeader,
     },
@@ -1249,10 +1249,11 @@ pub struct DrainHandle {
     /// pending-or-waiting shape as the feed registry: a frame arriving before the task asks
     /// buffers in `Pending`; a task asking first parks a oneshot the drain fulfills.
     set_plan_registry: Mutex<SetPlanRegistry>,
-    /// Stages this proc's consumers abandoned, learned from inbound `Cancel` frames. A producer
-    /// blocked on a full outbound checks it in its send spin and ends that stage's stream cleanly,
-    /// so a consumer that stopped reading early doesn't leave it spinning to the statement timeout.
-    cancelled_stages: Mutex<HashSet<u32>>,
+    /// `(stage_id, partition)` streams this proc's consumers abandoned, learned from inbound
+    /// `Cancel` frames. A producer blocked on a full outbound checks it in its send spin and ends
+    /// that stream cleanly, so a consumer that stopped reading early doesn't leave it spinning to
+    /// the statement timeout.
+    cancelled_streams: Mutex<HashSet<(u32, u32)>>,
 }
 
 #[derive(Default)]
@@ -1325,20 +1326,26 @@ impl DrainHandle {
             task_metrics_tx,
             task_metrics_rx: Mutex::new(Some(task_metrics_rx)),
             set_plan_registry: Mutex::new(SetPlanRegistry::default()),
-            cancelled_stages: Mutex::new(HashSet::default()),
+            cancelled_streams: Mutex::new(HashSet::default()),
         }
     }
 
-    /// Record a `Cancel` frame: the consumer abandoned `stage_id`, so this proc's producers stop
-    /// sending it. Idempotent.
-    fn note_cancel(&self, stage_id: u32) {
-        self.cancelled_stages.lock().unwrap().insert(stage_id);
+    /// Record a `Cancel` frame: the consumer abandoned the `(stage_id, partition)` stream, so this
+    /// proc's producer of it stops. Idempotent.
+    fn note_cancel(&self, stage_id: u32, partition: u32) {
+        self.cancelled_streams
+            .lock()
+            .unwrap()
+            .insert((stage_id, partition));
     }
 
-    /// Whether a consumer cancelled `stage_id`. Read by the send spin to end a producer's stream
-    /// cleanly when the consumer stopped reading.
-    pub(super) fn stage_cancelled(&self, stage_id: u32) -> bool {
-        self.cancelled_stages.lock().unwrap().contains(&stage_id)
+    /// Whether a consumer cancelled the `(stage_id, partition)` stream. Read by the send spin to
+    /// end a producer's stream cleanly when the consumer stopped reading.
+    pub(super) fn stream_cancelled(&self, stage_id: u32, partition: u32) -> bool {
+        self.cancelled_streams
+            .lock()
+            .unwrap()
+            .contains(&(stage_id, partition))
     }
 
     /// Take the receiving end of the `TaskMetrics` frame stream. The embedder (the leader)
@@ -1663,7 +1670,7 @@ impl DrainHandle {
                         self.route_set_plan(header.stage_id, header.partition, frame);
                     }
                     RecvBatchOutcome::Cancel { header } => {
-                        self.note_cancel(header.stage_id);
+                        self.note_cancel(header.stage_id, header.partition);
                     }
                     RecvBatchOutcome::Empty => break,
                     RecvBatchOutcome::Detached => {
@@ -2030,7 +2037,7 @@ mod tests {
 
     #[test]
     fn frame_round_trips_cancel() {
-        let header = MppFrameHeader::cancel(4, 0);
+        let header = MppFrameHeader::cancel(4, 2, 0);
         let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
         header.write_to(&mut buf);
 
@@ -2038,38 +2045,43 @@ mod tests {
         assert_eq!(parsed, header);
         assert_eq!(parsed.kind().unwrap(), MppFrameKind::Cancel);
         assert_eq!(parsed.stage_id, 4);
+        assert_eq!(parsed.partition, 2);
         assert!(matches!(body, FrameBody::Cancel));
     }
 
     #[test]
-    fn drain_records_cancel_scoped_to_its_stage() {
+    fn drain_records_cancel_scoped_to_its_stream() {
         let drain = DrainHandle::cooperative(0, Vec::new());
-        assert!(!drain.stage_cancelled(7));
-        drain.note_cancel(7);
-        assert!(drain.stage_cancelled(7));
-        // A cancel for one stage leaves the others alive, the way gRPC closes one stream.
-        assert!(!drain.stage_cancelled(8));
+        assert!(!drain.stream_cancelled(7, 1));
+        drain.note_cancel(7, 1);
+        assert!(drain.stream_cancelled(7, 1));
+        // A cancel for one stream leaves the others alive, the way gRPC closes one stream: same
+        // stage but a different partition, and a different stage, both stay live.
+        assert!(!drain.stream_cancelled(7, 2));
+        assert!(!drain.stream_cancelled(8, 1));
     }
 
     /// The producer-side half of the early-termination fix: a producer blocked on a full outbound
-    /// ends its send cleanly once a `Cancel` for its stage lands on its inbox. The test hangs if the
-    /// spin doesn't observe the cancel.
+    /// ends its send cleanly once a `Cancel` for its `(stage, partition)` stream lands on its inbox.
+    /// The test hangs if the spin doesn't observe the cancel.
     #[tokio::test(flavor = "current_thread")]
-    async fn producer_send_ends_when_consumer_cancels_the_stage() {
+    async fn producer_send_ends_when_consumer_cancels_the_stream() {
         // Outbound to a consumer that never drains: capacity 1, so the second send finds it full.
         let (out_tx, _out_rx) = in_proc_channel(1);
-        // The producer's inbox, where the leader's `Cancel` frame lands.
+        // The producer's inbox, where the consumer's `Cancel` frame lands.
         let (inbox_tx, inbox_rx) = in_proc_channel(4);
         let drain = Arc::new(DrainHandle::cooperative(
             1,
             vec![(ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox_rx)))],
         ));
+        // Producer of the `(stage 7, partition 0)` stream.
         let sender = MppSender::with_header(Arc::new(out_tx), MppFrameHeader::batch(7, 0, 1))
             .with_cooperative_drain(Arc::clone(&drain) as Arc<dyn CooperativeDrainSet>);
 
-        // The leader abandons stage 7 (it stopped reading before EOF): a `Cancel` reaches the inbox.
+        // The consumer abandons that stream (it stopped reading before EOF): a `Cancel` reaches the
+        // inbox.
         let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
-        MppFrameHeader::cancel(7, 0).write_to(&mut buf);
+        MppFrameHeader::cancel(7, 0, 0).write_to(&mut buf);
         inbox_tx.send_bytes(&buf).unwrap();
 
         let mut stats = SendBatchStats::default();

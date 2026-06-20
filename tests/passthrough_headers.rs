@@ -1,4 +1,4 @@
-#[cfg(all(feature = "integration", test))]
+#[cfg(all(feature = "integration", feature = "flight", test))]
 mod tests {
     use datafusion::common::exec_datafusion_err;
     use datafusion::error::DataFusionError;

@@ -1,5 +1,6 @@
 pub mod in_memory_channel_resolver;
 pub mod insta;
+#[cfg(feature = "flight")]
 pub mod localhost;
 pub mod metrics;
 pub mod mock_exec;

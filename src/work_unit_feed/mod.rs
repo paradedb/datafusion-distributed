@@ -8,8 +8,11 @@ mod work_unit_feed_registry;
 
 pub(crate) use coordinator::collect_task_work_unit_feeds;
 pub(crate) use remote_work_unit_feed::{
-    RemoteWorkUnitFeedRegistry, RemoteWorkUnitFeedTxs, build_work_unit_batch_msg,
-    set_received_time, set_sent_time, set_work_unit_received_time, set_work_unit_send_time,
+    RemoteWorkUnitFeedRegistry, RemoteWorkUnitFeedTxs, set_received_time, set_sent_time,
+};
+#[cfg(feature = "flight")]
+pub(crate) use remote_work_unit_feed::{
+    build_work_unit_batch_msg, set_work_unit_received_time, set_work_unit_send_time,
 };
 pub(crate) use work_unit_feed_registry::{WorkUnitFeedRegistry, set_distributed_work_unit_feed};
 

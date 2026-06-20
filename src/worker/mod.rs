@@ -1,11 +1,14 @@
+#[cfg(feature = "flight")]
 mod flight;
 pub(crate) mod generated;
+#[cfg(feature = "flight")]
 mod impl_coordinator_channel;
 mod impl_execute_task;
 mod impl_set_plan;
 mod in_memory;
 mod session_builder;
 mod single_write_multi_read;
+#[cfg(feature = "flight")]
 mod spawn_select_all;
 mod task_data;
 #[cfg(any(test, feature = "integration"))]
@@ -14,9 +17,13 @@ mod transport;
 mod worker_connection_pool;
 mod worker_service;
 
+#[cfg(feature = "flight")]
 pub(crate) use single_write_multi_read::SingleWriteMultiRead;
-pub(crate) use worker_connection_pool::{LocalWorkerContext, WorkerConnectionPool};
+#[cfg(feature = "flight")]
+pub(crate) use worker_connection_pool::LocalWorkerContext;
+pub(crate) use worker_connection_pool::WorkerConnectionPool;
 
+#[cfg(feature = "flight")]
 pub use flight::FlightWorkerTransport;
 pub use in_memory::InMemoryWorkerTransport;
 pub use transport::{WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerTransport};

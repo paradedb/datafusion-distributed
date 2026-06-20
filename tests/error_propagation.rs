@@ -1,4 +1,4 @@
-#[cfg(all(feature = "integration", test))]
+#[cfg(all(feature = "integration", feature = "flight", test))]
 mod tests {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::error::DataFusionError;

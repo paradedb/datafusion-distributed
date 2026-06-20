@@ -36,10 +36,13 @@ pub use metrics::{
     MaxLatencyMetric, MinLatencyMetric, P50LatencyMetric, P75LatencyMetric, P95LatencyMetric,
     P99LatencyMetric, rewrite_distributed_plan_with_metrics,
 };
+#[cfg(feature = "flight")]
 pub use networking::{
-    BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, WorkerResolver,
-    create_worker_client, get_distributed_channel_resolver, get_distributed_worker_resolver,
-    get_distributed_worker_transport,
+    BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, create_worker_client,
+    get_distributed_channel_resolver,
+};
+pub use networking::{
+    WorkerResolver, get_distributed_worker_resolver, get_distributed_worker_transport,
 };
 pub use stage::{
     DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
@@ -47,25 +50,34 @@ pub use stage::{
 pub use work_unit_feed::{
     DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
 };
+#[cfg(feature = "flight")]
+pub use worker::FlightWorkerTransport;
+#[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
+#[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
 pub use worker::{
-    DefaultSessionBuilder, FlightWorkerTransport, InMemoryWorkerTransport,
-    MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt, TaskData, Worker, WorkerConnection,
-    WorkerDispatch, WorkerDispatchRequest, WorkerQueryContext, WorkerSessionBuilder,
-    WorkerTransport,
+    DefaultSessionBuilder, InMemoryWorkerTransport, MappedWorkerSessionBuilder,
+    MappedWorkerSessionBuilderExt, TaskData, Worker, WorkerConnection, WorkerDispatch,
+    WorkerDispatchRequest, WorkerQueryContext, WorkerSessionBuilder, WorkerTransport,
 };
 
 pub use observability::{
     GetClusterWorkersRequest, GetClusterWorkersResponse, GetTaskProgressRequest,
-    GetTaskProgressResponse, ObservabilityService, ObservabilityServiceClient,
-    ObservabilityServiceImpl, ObservabilityServiceServer, PingRequest, PingResponse, TaskProgress,
-    TaskStatus, WorkerMetrics,
+    GetTaskProgressResponse, PingRequest, PingResponse, TaskProgress, TaskStatus, WorkerMetrics,
+};
+#[cfg(feature = "flight")]
+pub use observability::{
+    ObservabilityService, ObservabilityServiceClient, ObservabilityServiceImpl,
+    ObservabilityServiceServer,
 };
 
 #[cfg(any(feature = "integration", test))]
 pub use execution_plans::benchmarks::{
-    LocalRepartitionBench, LocalRepartitionFixture, LocalRepartitionMode, ShuffleBench,
-    ShuffleFixture, TransportBench, TransportBenchMode, TransportFixture,
+    LocalRepartitionBench, LocalRepartitionFixture, LocalRepartitionMode,
+};
+#[cfg(all(feature = "flight", any(feature = "integration", test)))]
+pub use execution_plans::benchmarks::{
+    ShuffleBench, ShuffleFixture, TransportBench, TransportBenchMode, TransportFixture,
 };

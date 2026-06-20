@@ -1,4 +1,4 @@
-#[cfg(all(feature = "integration", test))]
+#[cfg(all(feature = "integration", feature = "flight", test))]
 mod tests {
     use datafusion::common::assert_contains;
     use datafusion::physical_plan::execute_stream;

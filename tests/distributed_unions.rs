@@ -1,4 +1,4 @@
-#[cfg(all(feature = "integration", test))]
+#[cfg(all(feature = "integration", feature = "flight", test))]
 mod tests {
     use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::execution::TaskContext;

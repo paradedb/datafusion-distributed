@@ -1,4 +1,4 @@
-#[cfg(all(feature = "integration", feature = "tpch", test))]
+#[cfg(all(feature = "integration", feature = "flight", feature = "tpch", test))]
 mod tests {
     use datafusion::physical_plan::execute_stream;
     use datafusion::prelude::SessionContext;

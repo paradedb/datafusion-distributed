@@ -1,4 +1,9 @@
-#[cfg(all(feature = "integration", feature = "clickbench", test))]
+#[cfg(all(
+    feature = "integration",
+    feature = "flight",
+    feature = "clickbench",
+    test
+))]
 mod tests {
     use datafusion::error::Result;
     use datafusion_distributed::test_utils::in_memory_channel_resolver::start_in_memory_context;

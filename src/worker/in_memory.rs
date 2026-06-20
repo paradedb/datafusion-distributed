@@ -399,4 +399,22 @@ mod tests {
         assert_eq!(distributed, expected);
         Ok(())
     }
+
+    // With `flight` compiled out, no transport is registered here: the query must run through the
+    // process-wide default, which is the in-memory transport.
+    #[cfg(not(feature = "flight"))]
+    #[tokio::test]
+    async fn no_flight_default_runs_distributed_queries() -> Result<()> {
+        let ctx = distributed_ctx(None);
+        register_temp_parquet_table("t", sample_batch().schema(), vec![sample_batch()], &ctx)
+            .await?;
+
+        let (display, results) = run(&ctx).await?;
+        assert!(
+            display.contains("NetworkShuffleExec"),
+            "the query did not distribute:\n{display}"
+        );
+        assert!(results.contains("tag0"));
+        Ok(())
+    }
 }

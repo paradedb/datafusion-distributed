@@ -41,6 +41,19 @@ jobs:
       - uses: ./.github/actions/setup
       - run: cargo test --features integration
 
+  # Builds with the `flight` feature off: no `tonic` / `arrow-flight`, and the in-memory transport
+  # becomes the default. Uses `build`/`clippy` (not `test`): the benchmarks dev-dependency pulls the
+  # crate in with `flight` on, so a `cargo test` here would not actually exercise the no-flight path.
+  no-flight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          components: clippy
+      - run: cargo build --no-default-features --features integration
+      - run: cargo clippy --no-default-features --features integration -- -D warnings
+
   tpch-test:
     runs-on: ubuntu-latest
     steps:

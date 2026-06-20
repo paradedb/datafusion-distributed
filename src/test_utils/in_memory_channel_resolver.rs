@@ -1,27 +1,39 @@
-use crate::worker::generated::worker::worker_service_client::WorkerServiceClient;
-use crate::{
-    BoxCloneSyncChannel, ChannelResolver, DefaultSessionBuilder, DistributedExt,
-    MappedWorkerSessionBuilderExt, SessionStateBuilderExt, Worker, WorkerResolver,
-    WorkerSessionBuilder, create_worker_client,
-};
-use async_trait::async_trait;
+use crate::WorkerResolver;
 use datafusion::common::DataFusionError;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
-use hyper_util::rt::TokioIo;
-use tonic::transport::{Endpoint, Server};
 use url::Url;
 
+#[cfg(feature = "flight")]
+use crate::worker::generated::worker::worker_service_client::WorkerServiceClient;
+#[cfg(feature = "flight")]
+use crate::{
+    BoxCloneSyncChannel, ChannelResolver, DefaultSessionBuilder, DistributedExt,
+    MappedWorkerSessionBuilderExt, SessionStateBuilderExt, Worker, WorkerSessionBuilder,
+    create_worker_client,
+};
+#[cfg(feature = "flight")]
+use async_trait::async_trait;
+#[cfg(feature = "flight")]
+use datafusion::execution::SessionStateBuilder;
+#[cfg(feature = "flight")]
+use datafusion::prelude::{SessionConfig, SessionContext};
+#[cfg(feature = "flight")]
+use hyper_util::rt::TokioIo;
+#[cfg(feature = "flight")]
+use tonic::transport::{Endpoint, Server};
+
+#[cfg(feature = "flight")]
 const DUMMY_URL: &str = "http://localhost:50051";
 const DUMMY_URL_PREFIX: &str = "http://url-";
 
 /// [ChannelResolver] implementation that returns gRPC clients backed by an in-memory
 /// tokio duplex rather than a TCP connection.
+#[cfg(feature = "flight")]
 #[derive(Clone)]
 pub struct InMemoryChannelResolver {
     channel: WorkerServiceClient<BoxCloneSyncChannel>,
 }
 
+#[cfg(feature = "flight")]
 impl InMemoryChannelResolver {
     /// Build an [InMemoryChannelResolver] with a custom [WorkerSessionBuilder].
     /// This allows you to inject your own DataFusion extensions in the in-memory worker
@@ -72,12 +84,14 @@ impl InMemoryChannelResolver {
     }
 }
 
+#[cfg(feature = "flight")]
 impl Default for InMemoryChannelResolver {
     fn default() -> Self {
         Self::from_session_builder(DefaultSessionBuilder)
     }
 }
 
+#[cfg(feature = "flight")]
 #[async_trait]
 impl ChannelResolver for InMemoryChannelResolver {
     async fn get_worker_client_for_url(
@@ -107,6 +121,7 @@ impl WorkerResolver for InMemoryWorkerResolver {
     }
 }
 
+#[cfg(feature = "flight")]
 /// Creates a distributed session context backed by a single in-memory worker service.
 /// The set of produced worker URLs is deterministic, taking the form http://worker-<i>.
 pub async fn start_in_memory_context(
@@ -123,6 +138,7 @@ pub async fn start_in_memory_context(
     SessionContext::from(state)
 }
 
+#[cfg(feature = "flight")]
 /// Creates a distributed session context backed by a configurable in-memory worker service.
 ///
 /// Like [crate::test_utils::localhost::start_localhost_context], this uses tiny file-scan

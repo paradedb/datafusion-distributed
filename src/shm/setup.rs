@@ -77,12 +77,18 @@ pub unsafe fn region_total(base: *const c_void) -> usize {
 /// The dispatcher `clone_with_header`s these per output partition before sending, so the
 /// placeholder header is never observed on the wire. Slot `this_proc` stays `None` until the
 /// self-loop install.
+///
+/// Returns `(data, cancel)`. `data` is the producer's output senders. `cancel` is a control-plane
+/// sibling onto each peer inbox, used by [`MppMesh::cancel_stream`]: a consumer reaches its producer
+/// without counting as one of that producer's data senders, so a held `Cancel` sender never masks
+/// the producer-gone `detached` signal.
 fn build_outbound_senders(
     this_proc: u32,
     total_procs: u32,
     peer_senders: Vec<DsmMpscSender>,
-) -> Vec<Option<MppSender>> {
+) -> (Vec<Option<MppSender>>, Vec<Option<MppSender>>) {
     let mut senders: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
+    let mut cancel: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
     for (peer_idx, dsm_send) in peer_senders.into_iter().enumerate() {
         let target_proc = peer_proc_for_index(this_proc, peer_idx as u32);
         // A `peer_proc_for_index` regression that maps a peer onto the self slot would be
@@ -96,6 +102,12 @@ fn build_outbound_senders(
             target_proc < total_procs,
             "peer index {peer_idx} mapped to proc {target_proc} >= total {total_procs}"
         );
+        let control: Arc<dyn BatchChannelSender> =
+            Arc::new(DsmInboxSender::new(dsm_send.to_control()));
+        cancel[target_proc as usize] = Some(MppSender::with_header(
+            control,
+            MppFrameHeader::batch(0, 0, this_proc),
+        ));
         let shared: Arc<dyn BatchChannelSender> = Arc::new(DsmInboxSender::new(dsm_send));
         senders[target_proc as usize] = Some(MppSender::with_header(
             shared,
@@ -104,7 +116,7 @@ fn build_outbound_senders(
             MppFrameHeader::batch(0, 0, this_proc),
         ));
     }
-    senders
+    (senders, cancel)
 }
 
 /// What [`leader_setup`] hands back to the embedder.
@@ -171,7 +183,10 @@ pub unsafe fn leader_setup(
     // work-unit frames (and later dynamic filters) flow leader -> worker through them. Empty
     // when the embedder did not opt in: a ring latches `detached` once its sender count hits
     // zero, so senders that might drop before every worker attached must never exist.
-    let outbound_senders = build_outbound_senders(0, n_procs, attach.outbound_senders);
+    // The leader's `Cancel` senders are wired by the embedder (it shares the same outbound senders
+    // it holds for plan delivery and releases before the DSM unmaps), so drop the cancel set here.
+    let (outbound_senders, _cancel_senders) =
+        build_outbound_senders(0, n_procs, attach.outbound_senders);
     Ok(LeaderAttach {
         mesh: Arc::new(MppMesh::new(0, n_procs, inbound, interrupt)),
         outbound_senders,
@@ -261,7 +276,8 @@ pub unsafe fn worker_setup(
             .map_err(DataFusionError::Internal)?;
     let total_procs = header.n_procs;
 
-    let mut outbound = build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
+    let (mut outbound, cancel) =
+        build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
 
     // Self-loop in-proc channel: peer-mesh routing can land a producer and its consumer on the same
     // proc, and an MPSC inbox has no slot for a proc sending to itself. The unified drain pulls from
@@ -283,6 +299,10 @@ pub unsafe fn worker_setup(
         ],
     ));
     let mesh = Arc::new(MppMesh::new(proc_idx, total_procs, inbound, interrupt));
+    // A worker consumes shuffle inputs, so it can be the consumer that stops a stream early. Give
+    // its mesh the control-plane cancel senders; they drop with the mesh at the end of the worker's
+    // run, well before the DSM unmaps, so no explicit release is needed.
+    mesh.set_cancel_senders(Arc::new(std::sync::Mutex::new(cancel)));
     Ok(WorkerAttach {
         mesh,
         outbound_senders: outbound,
@@ -322,6 +342,11 @@ pub async fn run_worker_fragment(
                         continue;
                     }
                     sink.send(&batch).await?;
+                    // Consumer abandoned this stream. Stop pulling: dropping `stream` ends the
+                    // upstream scan and cascades the cancel to its own producers.
+                    if sink.cancelled() {
+                        break;
+                    }
                 }
                 Ok(())
             }

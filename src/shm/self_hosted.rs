@@ -923,6 +923,12 @@ impl TaskDriver {
                                 continue;
                             }
                             sink.send(&batch).await?;
+                            // A downstream worker abandoned this stream (its mesh carries the cancel
+                            // senders): stop pulling so the cancel cascades to this fragment's own
+                            // producers, matching the embedder's `run_worker_fragment` loop.
+                            if sink.cancelled() {
+                                break;
+                            }
                         }
                         Ok(())
                     }

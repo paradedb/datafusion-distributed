@@ -497,6 +497,32 @@ mod tests {
         ctx.register_table("t", Arc::new(table)).unwrap();
     }
 
+    /// A worker is a consumer too (it reads shuffle inputs), so when one of its input streams drops
+    /// early it has to cancel that stream's producer, not just the leader. This checks the wiring
+    /// end-to-end: a worker proc's `cancel_stream` reaches the producing proc's inbox through the
+    /// control senders `worker_setup` installs, and the producer records it. The producer then ends
+    /// the stream cleanly, which `producer_send_ends_when_consumer_cancels_the_stream` covers.
+    #[test]
+    fn worker_consumer_cancels_its_producer() {
+        use crate::shm::transport::CooperativeDrainSet;
+
+        // procs: leader 0, plus workers 1 and 2.
+        let boot = bootstrap_mesh(3);
+        let consumer = Arc::clone(&boot.workers[0].1); // proc 1
+        let producer = Arc::clone(&boot.workers[1].1); // proc 2
+
+        assert!(!producer.stream_cancelled(7, 0));
+
+        // Proc 1 abandons the `(stage 7, partition 0)` stream it reads from proc 2.
+        consumer.cancel_stream(2, 7, 0);
+
+        // Proc 2 drains its inbox and sees the cancel its consumer sent.
+        producer.try_drain_pass().unwrap();
+        assert!(producer.stream_cancelled(7, 0));
+        // Scoped to that one stream: a sibling partition stays live.
+        assert!(!producer.stream_cancelled(7, 1));
+    }
+
     fn build_session(mesh: Arc<MppMesh>) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(N_WORKERS as usize);
         let state = SessionStateBuilder::new()

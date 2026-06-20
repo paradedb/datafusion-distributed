@@ -24,6 +24,13 @@ pub trait PartitionSink: Send {
     async fn send(&mut self, batch: &RecordBatch) -> Result<()>;
     /// Per-channel EOF, independent of the underlying link. Async for the same reason as `send`.
     async fn finish(self: Box<Self>) -> Result<()>;
+    /// Whether the consumer cancelled this stream. The produce loop stops pulling its input when
+    /// this turns true, so a cancel doesn't just skip the send, it ends the upstream scan and drops
+    /// the input stream, cascading the cancel further up. Default `false` for links that don't carry
+    /// a cancel signal.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// The producer (write) side: opens a [PartitionSink] per output partition, symmetric to

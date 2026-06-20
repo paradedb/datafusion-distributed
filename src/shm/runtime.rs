@@ -33,7 +33,7 @@
 //! substitute internally under the old `in_process_mode` flag.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::proto as pb;
 use crate::{
@@ -48,7 +48,12 @@ use datafusion::physical_plan::metrics::MetricBuilder;
 use futures::stream::BoxStream;
 use url::Url;
 
-use super::transport::{CooperativeDrainSet, DrainHandle, DrainItem, Interrupt};
+use super::transport::{CooperativeDrainSet, DrainHandle, DrainItem, Interrupt, MppSender};
+
+/// A proc's outbound senders to each peer inbox, shared between the mesh (for `Cancel` frames) and
+/// the embedder that owns their lifetime. Indexed by destination `proc_idx`; this proc's own slot
+/// is `None`.
+pub type PeerSenders = Arc<Mutex<Vec<Option<MppSender>>>>;
 
 /// `task_idx → proc_idx` round-robin over the worker procs. The leader is `proc_idx = 0`
 /// (consumer-only), workers are `1..n_procs` (each hosts producer fragments).
@@ -87,6 +92,11 @@ pub struct MppMesh {
     /// Cancellation hook, injected by the embedder, checked at the transport's block points (the
     /// cooperative send spin and the consumer pull loop).
     interrupt: Arc<dyn Interrupt>,
+    /// This proc's outbound senders to each peer inbox, shared with the embedder that owns their
+    /// lifetime (it clears the `Vec` before the DSM unmaps). Used by [`Self::cancel_stream`] to ship
+    /// a `Cancel` frame to a producing proc when this proc abandons a stream. `None` until the
+    /// embedder installs it.
+    cancel_senders: Mutex<Option<PeerSenders>>,
 }
 
 impl MppMesh {
@@ -102,6 +112,32 @@ impl MppMesh {
             n_procs,
             inbound_receiver,
             interrupt,
+            cancel_senders: Mutex::new(None),
+        }
+    }
+
+    /// Share this proc's outbound senders so [`Self::cancel_stream`] can reach the producers. The
+    /// embedder keeps owning their lifetime: it passes a clone of the same `Arc` it releases before
+    /// the DSM unmaps, so the mesh never extends the senders past teardown.
+    pub fn set_cancel_senders(&self, senders: PeerSenders) {
+        *self.cancel_senders.lock().unwrap() = Some(senders);
+    }
+
+    /// Tell the producer on `producer_proc` to stop the `(stage_id, partition)` stream: this proc's
+    /// consumer of it stopped reading before EOF. Ships one `Cancel` frame, leaving the rings
+    /// healthy for metrics and every other stream. A no-op when no senders are installed (the
+    /// embedder hasn't wired this proc, or teardown cleared them).
+    ///
+    /// Stream-level so any consumer can cancel its own input: every `(producer_proc, stage,
+    /// partition)` channel has a single consumer, so one stream's drop never cuts off a sibling's.
+    pub fn cancel_stream(&self, producer_proc: u32, stage_id: u32, partition: u32) {
+        let guard = self.cancel_senders.lock().unwrap();
+        let Some(senders) = guard.as_ref() else {
+            return;
+        };
+        let senders = senders.lock().unwrap();
+        if let Some(Some(sender)) = senders.get(producer_proc as usize) {
+            sender.try_send_cancel(stage_id, partition);
         }
     }
 
@@ -183,6 +219,10 @@ impl CooperativeDrainSet for MppMesh {
 
     fn check_interrupt(&self) -> Result<(), DataFusionError> {
         self.interrupt.check()
+    }
+
+    fn stream_cancelled(&self, stage_id: u32, partition: u32) -> bool {
+        self.inbound_receiver.stream_cancelled(stage_id, partition)
     }
 }
 
@@ -316,6 +356,28 @@ struct ShmMqWorkerConnection {
     stage_id: u32,
 }
 
+/// Cancels one `(stage_id, partition)` stream if its consumer drops before EOF, telling the
+/// producer on `producer_proc` to stop. A consumer that stops pulling early (a top-N `LIMIT`, an
+/// inner merge join exhausting a side, etc.) would otherwise leave that producer spinning on the
+/// full inbox until the statement timeout. Disarmed on a clean EOF: there the producer already
+/// finished, so there's nothing to cancel.
+struct StreamCancelGuard {
+    mesh: Arc<MppMesh>,
+    producer_proc: u32,
+    stage_id: u32,
+    partition: u32,
+    armed: bool,
+}
+
+impl Drop for StreamCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.mesh
+                .cancel_stream(self.producer_proc, self.stage_id, self.partition);
+        }
+    }
+}
+
 impl WorkerConnection for ShmMqWorkerConnection {
     fn execute(&self, partition: usize) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let partition_u32 = u32::try_from(partition).map_err(|_| {
@@ -341,7 +403,18 @@ impl WorkerConnection for ShmMqWorkerConnection {
         // into the registry, pops one batch to yield, then yields back to Tokio so sibling tasks
         // (e.g. the leader's own producer subplan) advance. The send side runs the same interrupt
         // check inside `MppSender`'s retry spin.
+        let stage_id = self.stage_id;
+        let producer_proc = self.sender_proc;
         let stream = async_stream::stream! {
+            // Any consumer cancels its own input stream when it drops early. The mesh no-ops the
+            // send until the embedder wires this proc's outbound senders.
+            let mut cancel_guard = StreamCancelGuard {
+                mesh: Arc::clone(&mesh),
+                producer_proc,
+                stage_id,
+                partition: partition_u32,
+                armed: true,
+            };
             loop {
                 if let Err(e) = mesh.check_interrupt() {
                     yield Err(e);
@@ -353,7 +426,11 @@ impl WorkerConnection for ShmMqWorkerConnection {
                 }
                 match buffer.try_pop() {
                     Some(DrainItem::Batch(batch)) => yield Ok(batch),
-                    Some(DrainItem::Eof) => break,
+                    Some(DrainItem::Eof) => {
+                        // Clean end: the producer already EOF'd, so there's nothing to cancel.
+                        cancel_guard.armed = false;
+                        break;
+                    }
                     Some(DrainItem::Failed(msg)) => {
                         yield Err(DataFusionError::Execution(msg));
                         return;

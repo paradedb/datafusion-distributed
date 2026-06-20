@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use datafusion::common::HashMap;
+use datafusion::common::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::RecordBatch;
@@ -74,6 +74,12 @@ pub(super) enum MppFrameKind {
     FeedEof = 3,
     TaskMetrics = 4,
     SetPlan = 5,
+    /// Consumer -> producer: stop producing the `(stage_id, partition)` stream, the consumer
+    /// stopped reading it before EOF (a top-N `LIMIT`, an inner merge join exhausting a side, etc.).
+    /// The producer ends that one stream cleanly. Scoped to the stream, not the connection, so the
+    /// ring stays healthy for metrics and every other stream, the way gRPC closes one stream
+    /// without dropping the channel.
+    Cancel = 6,
 }
 
 /// Payload of a `SetPlan` frame: the plan-delivery message a worker needs to run one task,
@@ -166,6 +172,12 @@ const FRAME_SENDER_SHIFT: u32 = 16;
 /// overflow becomes a hard error in the producer rather than silent flag corruption on the wire.
 pub const MPP_MAX_SENDER_PROC: u32 = 0xFFFF;
 
+/// Spin bound for landing a control or metrics frame on a peer inbox that may be momentarily full.
+/// A live peer drains its inbox within this many tries, so the frame lands well inside the bound;
+/// it only runs out if the peer already exited, where the leader's wait-for-workers surfaces the
+/// failure instead of hanging here.
+const MAX_CONTROL_SEND_SPINS: usize = 10_000;
+
 const _: () = {
     // shm_mq slot layout calculations depend on this being exact.
     assert!(std::mem::size_of::<MppFrameHeader>() == MPP_FRAME_HEADER_SIZE);
@@ -247,6 +259,17 @@ impl MppFrameHeader {
         }
     }
 
+    /// Build a `Cancel` header for the `(stage_id, partition)` stream, stamped with the consumer's
+    /// `sender_proc`. Carries no payload; the producer reads it as "stop sending this stream."
+    pub fn cancel(stage_id: u32, partition: u32, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::Cancel, sender_proc),
+            stage_id,
+            partition,
+        }
+    }
+
     /// The mesh peer that wrote this frame. The drain demuxes incoming frames into the
     /// per-channel buffer registry by `(sender_proc, stage_id, partition)`.
     pub fn sender_proc(&self) -> u32 {
@@ -271,6 +294,7 @@ impl MppFrameHeader {
             3 => Ok(MppFrameKind::FeedEof),
             4 => Ok(MppFrameKind::TaskMetrics),
             5 => Ok(MppFrameKind::SetPlan),
+            6 => Ok(MppFrameKind::Cancel),
             other => Err(DataFusionError::Internal(format!(
                 "mpp: unknown frame kind {other:#x}"
             ))),
@@ -390,6 +414,7 @@ enum FrameBody {
     FeedEof,
     TaskMetrics(pb::TaskMetrics),
     SetPlan(SetPlanFrame),
+    Cancel,
 }
 
 /// Inverse of the frame encoders. Parses the 16-byte header and decodes the payload according
@@ -398,7 +423,7 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
     let header = MppFrameHeader::parse(bytes)?;
     let payload = &bytes[MPP_FRAME_HEADER_SIZE..];
     match header.kind()? {
-        MppFrameKind::Eof | MppFrameKind::FeedEof => {
+        MppFrameKind::Eof | MppFrameKind::FeedEof | MppFrameKind::Cancel => {
             if bytes.len() != MPP_FRAME_HEADER_SIZE {
                 return Err(DataFusionError::Internal(format!(
                     "mpp: payload-less frame carries payload ({} > {})",
@@ -408,6 +433,7 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
             }
             match header.kind()? {
                 MppFrameKind::Eof => Ok((header, FrameBody::Eof)),
+                MppFrameKind::Cancel => Ok((header, FrameBody::Cancel)),
                 _ => Ok((header, FrameBody::FeedEof)),
             }
         }
@@ -621,6 +647,13 @@ pub trait CooperativeDrainSet: Send + Sync {
     fn check_interrupt(&self) -> Result<(), DataFusionError> {
         Ok(())
     }
+
+    /// Whether a consumer cancelled the `(stage_id, partition)` stream (a `Cancel` frame arrived on
+    /// this proc's inbox). The send spin ends the producer's stream cleanly when it's set. Default
+    /// `false` for drains that don't carry inbound control frames (in-proc test channels).
+    fn stream_cancelled(&self, _stage_id: u32, _partition: u32) -> bool {
+        false
+    }
 }
 
 /// Cancellation extension point, checked at the transport's block points (the send spin and the consumer
@@ -641,6 +674,10 @@ impl Interrupt for NoInterrupt {
 impl CooperativeDrainSet for DrainHandle {
     fn try_drain_pass(&self) -> Result<(), DataFusionError> {
         DrainHandle::try_drain_pass(self)
+    }
+
+    fn stream_cancelled(&self, stage_id: u32, partition: u32) -> bool {
+        DrainHandle::stream_cancelled(self, stage_id, partition)
     }
 }
 
@@ -710,6 +747,15 @@ impl MppSender {
         }
     }
 
+    /// Whether the consumer of this sender's `(stage, partition)` stream cancelled it. Read by the
+    /// produce loop to stop pulling its input, not just skip the send. `false` without a drain
+    /// (in-proc test channels carry no inbound cancel).
+    pub(super) fn stream_cancelled(&self) -> bool {
+        self.cooperative_drain
+            .as_ref()
+            .is_some_and(|d| d.stream_cancelled(self.header.stage_id, self.header.partition))
+    }
+
     /// Attach a [`CooperativeDrainSet`] so `Self::send_batch_traced`'s spin
     /// can drain inbound peer traffic while waiting for outbound space.
     /// Required for peer-mesh fragments where every worker is both sender and
@@ -776,6 +822,27 @@ impl MppSender {
         result
     }
 
+    /// Bounded synchronous send of a `Cancel` frame for the `(stage_id, partition)` stream. The
+    /// consumer calls it on the sender to the producing proc when it abandons that stream.
+    /// Synchronous so it can run from the consumer stream's drop, where `await` isn't available.
+    ///
+    /// The bound doesn't risk a stuck producer. A live producer drains its own inbox in its send
+    /// spin, so a slot frees and the frame lands well inside the bound even when the inbox is
+    /// backed up. The bound only runs out if the producer already exited or died, and a dead worker
+    /// makes the leader's wait-for-workers error out rather than hang.
+    pub fn try_send_cancel(&self, stage_id: u32, partition: u32) {
+        let header = MppFrameHeader::cancel(stage_id, partition, self.header.sender_proc());
+        let mut buf = [0u8; MPP_FRAME_HEADER_SIZE];
+        header.write_to(&mut buf);
+        for _ in 0..MAX_CONTROL_SEND_SPINS {
+            match self.channel.try_send_bytes(&buf) {
+                Ok(true) => return,
+                Ok(false) => std::thread::yield_now(),
+                Err(_) => return, // the producer's inbox is gone; nothing left to cancel
+            }
+        }
+    }
+
     async fn send_eof_with_scratch(
         &self,
         scratch: &mut Vec<u8>,
@@ -797,8 +864,13 @@ impl MppSender {
         let t_wait_start = Instant::now();
         loop {
             drain.check_interrupt()?;
-            let send_ok = self.spin_try_send_bytes(scratch).await?;
-            if send_ok {
+            // The consumer cancelled this stream, so end the send cleanly and let the producer
+            // fragment complete. Checked before the send so a cancel that landed mid-spin stops
+            // the next iteration.
+            if drain.stream_cancelled(self.header.stage_id, self.header.partition) {
+                return Ok(());
+            }
+            if self.spin_try_send_bytes(scratch).await? {
                 if !first_try {
                     stats.send_wait += t_wait_start.elapsed();
                 }
@@ -872,8 +944,13 @@ impl MppSender {
         // siblings if any are ready, mostly a no-op under today's linear MPP topology.
         loop {
             drain.check_interrupt()?;
-            let send_ok = self.spin_try_send_bytes(scratch).await?;
-            if send_ok {
+            // The consumer cancelled this stream, so end the send cleanly and let the producer
+            // fragment complete. Checked before the send so a cancel that landed mid-spin stops
+            // the next iteration.
+            if drain.stream_cancelled(self.header.stage_id, self.header.partition) {
+                return Ok(());
+            }
+            if self.spin_try_send_bytes(scratch).await? {
                 if !first_try {
                     stats.send_wait += t_wait_start.elapsed();
                 }
@@ -962,9 +1039,11 @@ impl MppSender {
         let result = async {
             encode_prost_frame_into(self.header, metrics, &mut scratch)?;
             let _send_guard = self.channel.send_lock().lock().await;
-            // Bounded so a worker exiting after the leader stopped draining cannot wedge on a
-            // full ring; one small frame against a mostly-drained inbox lands on the first try.
-            for _ in 0..10_000 {
+            // The consumer stops reading the data path early but keeps draining at teardown to
+            // collect these metrics, so the frame lands once the data the cancel stopped drains out
+            // and a slot frees. Bounded so a leader that really went away can't wedge the worker on
+            // a full ring.
+            for _ in 0..MAX_CONTROL_SEND_SPINS {
                 match self.channel.try_send_bytes(&scratch) {
                     Ok(true) => return Ok(()),
                     Ok(false) => tokio::task::yield_now().await,
@@ -1030,6 +1109,10 @@ impl crate::PartitionSink for MppPartitionSink {
     async fn finish(mut self: Box<Self>) -> datafusion::common::Result<()> {
         self.sender.send_eof_traced(&mut self.stats).await
     }
+
+    fn cancelled(&self) -> bool {
+        self.sender.stream_cancelled()
+    }
 }
 
 /// High-level receiver: pulls bytes via the underlying channel and decodes them
@@ -1058,6 +1141,7 @@ impl MppReceiver {
                 Ok((header, FrameBody::SetPlan(frame))) => {
                     RecvBatchOutcome::SetPlan { header, frame }
                 }
+                Ok((header, FrameBody::Cancel)) => RecvBatchOutcome::Cancel { header },
                 Err(e) => RecvBatchOutcome::Error(e),
             },
             RecvOutcome::Empty => RecvBatchOutcome::Empty,
@@ -1100,6 +1184,10 @@ pub(super) enum RecvBatchOutcome {
     TaskMetrics {
         header: MppFrameHeader,
         metrics: pb::TaskMetrics,
+    },
+    /// Consumer abandoned the `header.(stage_id, partition)` stream; its producer stops sending it.
+    Cancel {
+        header: MppFrameHeader,
     },
     Empty,
     Detached,
@@ -1179,6 +1267,11 @@ pub struct DrainHandle {
     /// pending-or-waiting shape as the feed registry: a frame arriving before the task asks
     /// buffers in `Pending`; a task asking first parks a oneshot the drain fulfills.
     set_plan_registry: Mutex<SetPlanRegistry>,
+    /// `(stage_id, partition)` streams this proc's consumers abandoned, learned from inbound
+    /// `Cancel` frames. A producer blocked on a full outbound checks it in its send spin and ends
+    /// that stream cleanly, so a consumer that stopped reading early doesn't leave it spinning to
+    /// the statement timeout.
+    cancelled_streams: Mutex<HashSet<(u32, u32)>>,
 }
 
 #[derive(Default)]
@@ -1251,7 +1344,26 @@ impl DrainHandle {
             task_metrics_tx,
             task_metrics_rx: Mutex::new(Some(task_metrics_rx)),
             set_plan_registry: Mutex::new(SetPlanRegistry::default()),
+            cancelled_streams: Mutex::new(HashSet::default()),
         }
+    }
+
+    /// Record a `Cancel` frame: the consumer abandoned the `(stage_id, partition)` stream, so this
+    /// proc's producer of it stops. Idempotent.
+    fn note_cancel(&self, stage_id: u32, partition: u32) {
+        self.cancelled_streams
+            .lock()
+            .unwrap()
+            .insert((stage_id, partition));
+    }
+
+    /// Whether a consumer cancelled the `(stage_id, partition)` stream. Read by the send spin to
+    /// end a producer's stream cleanly when the consumer stopped reading.
+    pub(super) fn stream_cancelled(&self, stage_id: u32, partition: u32) -> bool {
+        self.cancelled_streams
+            .lock()
+            .unwrap()
+            .contains(&(stage_id, partition))
     }
 
     /// Take the receiving end of the `TaskMetrics` frame stream. The embedder (the leader)
@@ -1575,6 +1687,9 @@ impl DrainHandle {
                     RecvBatchOutcome::SetPlan { header, frame } => {
                         self.route_set_plan(header.stage_id, header.partition, frame);
                     }
+                    RecvBatchOutcome::Cancel { header } => {
+                        self.note_cancel(header.stage_id, header.partition);
+                    }
                     RecvBatchOutcome::Empty => break,
                     RecvBatchOutcome::Detached => {
                         // Only THIS receiver is dead. The drain holds multiple receivers
@@ -1869,7 +1984,8 @@ mod tests {
                     RecvBatchOutcome::WorkUnit { .. }
                     | RecvBatchOutcome::FeedEof { .. }
                     | RecvBatchOutcome::TaskMetrics { .. }
-                    | RecvBatchOutcome::SetPlan { .. } => {}
+                    | RecvBatchOutcome::SetPlan { .. }
+                    | RecvBatchOutcome::Cancel { .. } => {}
                     RecvBatchOutcome::Empty => {}
                     RecvBatchOutcome::Detached => {
                         done[i] = true;
@@ -1935,6 +2051,69 @@ mod tests {
         assert_eq!(header, MppFrameHeader::eof(2, 5, 0));
         assert_eq!(header.kind().unwrap(), MppFrameKind::Eof);
         assert!(matches!(body, FrameBody::Eof));
+    }
+
+    #[test]
+    fn frame_round_trips_cancel() {
+        let header = MppFrameHeader::cancel(4, 2, 0);
+        let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
+        header.write_to(&mut buf);
+
+        let (parsed, body) = decode_frame(&buf).expect("decode_frame");
+        assert_eq!(parsed, header);
+        assert_eq!(parsed.kind().unwrap(), MppFrameKind::Cancel);
+        assert_eq!(parsed.stage_id, 4);
+        assert_eq!(parsed.partition, 2);
+        assert!(matches!(body, FrameBody::Cancel));
+    }
+
+    #[test]
+    fn drain_records_cancel_scoped_to_its_stream() {
+        let drain = DrainHandle::cooperative(0, Vec::new());
+        assert!(!drain.stream_cancelled(7, 1));
+        drain.note_cancel(7, 1);
+        assert!(drain.stream_cancelled(7, 1));
+        // A cancel for one stream leaves the others alive, the way gRPC closes one stream: same
+        // stage but a different partition, and a different stage, both stay live.
+        assert!(!drain.stream_cancelled(7, 2));
+        assert!(!drain.stream_cancelled(8, 1));
+    }
+
+    /// The producer-side half of the early-termination fix: a producer blocked on a full outbound
+    /// ends its send cleanly once a `Cancel` for its `(stage, partition)` stream lands on its inbox.
+    /// The test hangs if the spin doesn't observe the cancel.
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_send_ends_when_consumer_cancels_the_stream() {
+        // Outbound to a consumer that never drains: capacity 1, so the second send finds it full.
+        let (out_tx, _out_rx) = in_proc_channel(1);
+        // The producer's inbox, where the consumer's `Cancel` frame lands.
+        let (inbox_tx, inbox_rx) = in_proc_channel(4);
+        let drain = Arc::new(DrainHandle::cooperative(
+            1,
+            vec![(ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox_rx)))],
+        ));
+        // Producer of the `(stage 7, partition 0)` stream.
+        let sender = MppSender::with_header(Arc::new(out_tx), MppFrameHeader::batch(7, 0, 1))
+            .with_cooperative_drain(Arc::clone(&drain) as Arc<dyn CooperativeDrainSet>);
+
+        // The consumer abandons that stream (it stopped reading before EOF): a `Cancel` reaches the
+        // inbox.
+        let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
+        MppFrameHeader::cancel(7, 0, 0).write_to(&mut buf);
+        inbox_tx.send_bytes(&buf).unwrap();
+
+        let mut stats = SendBatchStats::default();
+        // First batch fills the one slot.
+        sender
+            .send_batch_traced(&sample_batch(1), &mut stats)
+            .await
+            .unwrap();
+        // The second batch would block forever on the full slot. Instead the spin drains the inbox,
+        // sees the cancel, and ends the send cleanly.
+        sender
+            .send_batch_traced(&sample_batch(1), &mut stats)
+            .await
+            .unwrap();
     }
 
     #[test]

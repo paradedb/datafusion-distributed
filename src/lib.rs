@@ -51,9 +51,10 @@ pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
 pub use worker::{
-    DefaultSessionBuilder, FlightWorkerTransport, MappedWorkerSessionBuilder,
-    MappedWorkerSessionBuilderExt, TaskData, Worker, WorkerConnection, WorkerDispatch,
-    WorkerDispatchRequest, WorkerQueryContext, WorkerSessionBuilder, WorkerTransport,
+    DefaultSessionBuilder, FlightWorkerTransport, InMemoryWorkerTransport,
+    MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt, TaskData, Worker, WorkerConnection,
+    WorkerDispatch, WorkerDispatchRequest, WorkerQueryContext, WorkerSessionBuilder,
+    WorkerTransport,
 };
 
 pub use observability::{

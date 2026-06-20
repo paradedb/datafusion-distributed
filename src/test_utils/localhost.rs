@@ -1,4 +1,6 @@
+use crate::InMemoryWorkerTransport;
 use crate::WorkerResolver;
+use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
 use crate::{DistributedExt, SessionStateBuilderExt, Worker, WorkerSessionBuilder};
 use async_trait::async_trait;
 use datafusion::common::DataFusionError;
@@ -81,8 +83,10 @@ where
     (SessionContext::from(state), join_set, workers)
 }
 
-/// The generic test cluster used by the integration suite. Runs over the Flight transport; a
-/// transport-agnostic in-process variant replaces this body once the in-memory transport lands.
+/// Workers and context with a fixed number of target partitions, hosted in-process by a
+/// [InMemoryWorkerTransport] built from `session_builder`. Every cross-stage byte moves through the
+/// in-process worker, so the integration suite runs without the Flight stack. Nothing listens on localhost; the returned [Worker]s are handles onto the
+/// shared in-process task registry.
 pub async fn start_localhost_context<B>(
     num_workers: usize,
     session_builder: B,
@@ -91,7 +95,28 @@ where
     B: WorkerSessionBuilder + Send + Sync + 'static,
     B: Clone,
 {
-    start_localhost_flight_context(num_workers, session_builder).await
+    // CI runs this same suite over Flight as a separate job, so both transports get full coverage.
+    if std::env::var("DATAFUSION_DISTRIBUTED_TEST_TRANSPORT").as_deref() == Ok("flight") {
+        return start_localhost_flight_context(num_workers, session_builder).await;
+    }
+    let transport = InMemoryWorkerTransport::from_session_builder(session_builder);
+    let workers = (0..num_workers)
+        .map(|_| transport.worker().clone())
+        .collect();
+
+    let mut state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_distributed_planner()
+        .with_distributed_worker_resolver(InMemoryWorkerResolver::new(num_workers))
+        .with_distributed_worker_transport(transport)
+        // Tiny test datasets: budget one byte per partition so the estimator fans scans out across
+        // the whole (small) cluster and the distributed paths actually run.
+        .with_distributed_file_scan_config_bytes_per_partition(1)
+        .unwrap()
+        .build();
+    state.config_mut().options_mut().execution.target_partitions = 3;
+
+    (SessionContext::from(state), JoinSet::new(), workers)
 }
 
 #[derive(Clone)]

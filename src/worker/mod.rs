@@ -6,6 +6,7 @@ mod impl_coordinator_channel;
 mod impl_execute_task;
 mod impl_set_plan;
 mod in_memory;
+pub use in_memory::InMemoryWorkerTransport;
 mod session_builder;
 mod single_write_multi_read;
 mod spawn_select_all;

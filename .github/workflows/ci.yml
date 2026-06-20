@@ -60,6 +60,17 @@ jobs:
       - uses: ./.github/actions/setup
       - run: cargo test --no-default-features --features integration
 
+  # The whole generic suite over the Flight transport, so the gRPC path gets full coverage,
+  # not just the Flight-specific tests.
+  unit-test-flight-transport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: ./.github/actions/setup
+      - run: DATAFUSION_DISTRIBUTED_TEST_TRANSPORT=flight cargo test --features integration
+
   tpch-test:
     runs-on: ubuntu-latest
     steps:

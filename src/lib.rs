@@ -60,9 +60,10 @@ pub use worker::generated::worker::{
     GetWorkerInfoRequest, GetWorkerInfoResponse, SetPlanRequest, TaskKey, TaskMetrics,
 };
 pub use worker::{
-    DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt,
-    PartitionSink, TaskData, Worker, WorkerConnection, WorkerDispatch, WorkerDispatchRequest,
-    WorkerQueryContext, WorkerSessionBuilder, WorkerSink, WorkerTransport,
+    DefaultSessionBuilder, InMemoryWorkerTransport, MappedWorkerSessionBuilder,
+    MappedWorkerSessionBuilderExt, PartitionSink, TaskData, Worker, WorkerConnection,
+    WorkerDispatch, WorkerDispatchRequest, WorkerQueryContext, WorkerSessionBuilder, WorkerSink,
+    WorkerTransport,
 };
 
 pub use observability::{

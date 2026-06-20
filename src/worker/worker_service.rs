@@ -100,7 +100,6 @@ impl Worker {
 
     /// The registry of in-flight tasks this worker owns. In-crate transports read it to
     /// execute stored tasks directly.
-    #[allow(dead_code)]
     pub(crate) fn task_data_entries(&self) -> &Arc<TaskDataEntries> {
         &self.task_data_entries
     }

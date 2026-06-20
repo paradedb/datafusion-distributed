@@ -1,5 +1,6 @@
 use crate::DistributedConfig;
 use crate::config_extension_ext::set_distributed_option_extension;
+#[cfg(feature = "flight")]
 use crate::worker::FlightWorkerTransport;
 use crate::worker::WorkerTransport;
 use datafusion::prelude::SessionConfig;
@@ -27,8 +28,17 @@ pub(crate) fn set_distributed_worker_transport(
 // The default Flight transport carries no per-runtime state (it consults the channel resolver each
 // time), so a single process-wide instance is sufficient for callers that have not registered
 // their own.
+#[cfg(feature = "flight")]
 static DEFAULT_WORKER_TRANSPORT: LazyLock<Arc<dyn WorkerTransport>> =
     LazyLock::new(|| Arc::new(FlightWorkerTransport));
+
+// With Flight compiled out the default is the self-hosted shared-memory transport: every task
+// runs in the current process through the default worker session, with the data moving through
+// the shared-memory mesh. A custom session (UDFs, codecs) or multi-process execution still needs
+// a registered transport.
+#[cfg(not(feature = "flight"))]
+static DEFAULT_WORKER_TRANSPORT: LazyLock<Arc<dyn WorkerTransport>> =
+    LazyLock::new(|| Arc::new(crate::InMemoryWorkerTransport::default()));
 
 /// Returns the [WorkerTransport] registered on the provided session config, or a process-wide
 /// default if none has been set. This is what `WorkerConnectionPool` consults at execute time

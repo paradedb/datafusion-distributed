@@ -9,6 +9,7 @@ mod tests {
     use datafusion::physical_plan::{ExecutionPlan, execute_stream};
     use datafusion::prelude::SessionContext;
     use datafusion_distributed::test_utils::localhost::start_localhost_context;
+    #[cfg(feature = "flight")]
     use datafusion_distributed::test_utils::localhost::start_localhost_flight_context;
     use datafusion_distributed::test_utils::parquet::register_parquet_tables;
     use datafusion_distributed::test_utils::test_work_unit_feed::{
@@ -19,6 +20,7 @@ mod tests {
         DefaultSessionBuilder, DistributedExt, DistributedLeafExec, DistributedMetricsFormat,
         WorkerQueryContext, display_plan_ascii, rewrite_distributed_plan_with_metrics,
     };
+    #[cfg(feature = "flight")]
     use datafusion_distributed::{NetworkCoalesceExec, NetworkShuffleExec};
     use futures::TryStreamExt;
     use std::sync::Arc;
@@ -141,6 +143,7 @@ mod tests {
 
     // Flight-only: `bytes_transferred` / `max_mem_used` / `network_latency_*` come from the
     // gRPC read connection; the in-memory transport reads locally and never registers them.
+    #[cfg(feature = "flight")]
     #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
     #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]

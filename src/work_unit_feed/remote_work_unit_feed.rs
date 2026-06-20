@@ -85,6 +85,7 @@ pub(crate) fn set_received_time(work_unit: &mut pb::WorkUnit) {
 
 /// Wraps an encoded [`pb::WorkUnit`] in the Flight coordinator-to-worker envelope. One unit per
 /// batch for now; chunking several units into a `WorkUnitBatch` is a later optimization.
+#[cfg(feature = "flight")]
 pub(crate) fn build_work_unit_msg(work_unit: pb::WorkUnit) -> pb::CoordinatorToWorkerMsg {
     pb::CoordinatorToWorkerMsg {
         inner: Some(pb::coordinator_to_worker_msg::Inner::WorkUnitBatch(
@@ -95,6 +96,7 @@ pub(crate) fn build_work_unit_msg(work_unit: pb::WorkUnit) -> pb::CoordinatorToW
     }
 }
 
+#[cfg(feature = "flight")]
 pub(crate) fn set_work_unit_send_time(
     mut msg: pb::CoordinatorToWorkerMsg,
 ) -> pb::CoordinatorToWorkerMsg {
@@ -109,6 +111,7 @@ pub(crate) fn set_work_unit_send_time(
     msg
 }
 
+#[cfg(feature = "flight")]
 pub(crate) fn set_work_unit_received_time(
     mut msg: pb::CoordinatorToWorkerMsg,
 ) -> pb::CoordinatorToWorkerMsg {

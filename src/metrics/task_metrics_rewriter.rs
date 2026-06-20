@@ -281,7 +281,7 @@ pub fn stage_metrics_rewriter(
         .map(|v| v.data)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "flight"))]
 mod tests {
     use crate::coordinator::MetricsStore;
     use crate::metrics::DISTRIBUTED_DATAFUSION_TASK_ID_LABEL;

@@ -7,7 +7,7 @@ mod network_broadcast;
 mod network_coalesce;
 mod network_shuffle;
 
-#[cfg(any(test, feature = "integration"))]
+#[cfg(all(feature = "flight", any(test, feature = "integration")))]
 pub mod benchmarks;
 
 pub use broadcast::BroadcastExec;

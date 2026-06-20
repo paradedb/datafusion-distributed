@@ -1,6 +1,6 @@
 // Flight-only: the URL-emitter test utils identify workers by their dialed URL, which only
 // the gRPC transport has.
-#[cfg(all(feature = "integration", test))]
+#[cfg(all(feature = "integration", feature = "flight", test))]
 mod tests {
     use std::sync::Arc;
 

@@ -1,6 +1,6 @@
 // Flight-only: the test harness builds the cluster through the in-memory channel resolver, which
 // implements the gRPC `ChannelResolver` and so only exists with the `flight` feature.
-#[cfg(all(feature = "integration", test))]
+#[cfg(all(feature = "integration", feature = "flight", test))]
 mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};

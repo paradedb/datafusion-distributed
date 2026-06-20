@@ -1,16 +1,24 @@
 use crate::InMemoryWorkerTransport;
+#[cfg(feature = "flight")]
 use crate::WorkerResolver;
 use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
 use crate::{DistributedExt, SessionStateBuilderExt, Worker, WorkerSessionBuilder};
+#[cfg(feature = "flight")]
 use async_trait::async_trait;
+#[cfg(feature = "flight")]
 use datafusion::common::DataFusionError;
 use datafusion::common::runtime::JoinSet;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
+#[cfg(feature = "flight")]
 use std::error::Error;
+#[cfg(feature = "flight")]
 use std::time::Duration;
+#[cfg(feature = "flight")]
 use tokio::net::TcpListener;
+#[cfg(feature = "flight")]
 use tonic::transport::Server;
+#[cfg(feature = "flight")]
 use url::Url;
 
 /// Create workers and context on localhost with a fixed number of target partitions, behind the
@@ -22,6 +30,7 @@ use url::Url;
 /// to spawn a flight service behind each listener.
 ///
 /// Returns a session context aware of these workers, and a join set of all spawned worker tasks.
+#[cfg(feature = "flight")]
 pub async fn start_localhost_flight_context<B>(
     num_workers: usize,
     session_builder: B,
@@ -96,6 +105,7 @@ where
     B: Clone,
 {
     // CI runs this same suite over Flight as a separate job, so both transports get full coverage.
+    #[cfg(feature = "flight")]
     if std::env::var("DATAFUSION_DISTRIBUTED_TEST_TRANSPORT").as_deref() == Ok("flight") {
         return start_localhost_flight_context(num_workers, session_builder).await;
     }
@@ -119,11 +129,13 @@ where
     (SessionContext::from(state), JoinSet::new(), workers)
 }
 
+#[cfg(feature = "flight")]
 #[derive(Clone)]
 pub struct LocalHostWorkerResolver {
     ports: Vec<u16>,
 }
 
+#[cfg(feature = "flight")]
 impl LocalHostWorkerResolver {
     pub fn new<N: TryInto<u16>, I: IntoIterator<Item = N>>(ports: I) -> Self
     where
@@ -135,6 +147,7 @@ impl LocalHostWorkerResolver {
     }
 }
 
+#[cfg(feature = "flight")]
 #[async_trait]
 impl WorkerResolver for LocalHostWorkerResolver {
     fn get_urls(&self) -> Result<Vec<Url>, DataFusionError> {
@@ -146,6 +159,7 @@ impl WorkerResolver for LocalHostWorkerResolver {
     }
 }
 
+#[cfg(feature = "flight")]
 pub async fn spawn_worker_service(
     session_builder: impl WorkerSessionBuilder + Send + Sync + 'static,
     incoming: TcpListener,
@@ -160,6 +174,7 @@ pub async fn spawn_worker_service(
         .await?)
 }
 
+#[cfg(feature = "flight")]
 fn external_err(err: impl Error + Send + Sync + 'static) -> DataFusionError {
     DataFusionError::External(Box::new(err))
 }

@@ -9,10 +9,12 @@ mod passthrough_headers;
 mod stage;
 // With `flight` off the in-memory transport keeps this machinery live; what remains dormant is
 // the gRPC envelope side: the generated stream messages and the Flight-only `Worker` accessors.
+#[cfg_attr(not(feature = "flight"), allow(dead_code))]
 mod worker;
 
 mod distributed_planner;
 mod networking;
+#[cfg(feature = "flight")]
 mod observability;
 mod protobuf;
 pub use protobuf::DistributedCodec;
@@ -39,6 +41,7 @@ pub use metrics::{
     MaxLatencyMetric, MinLatencyMetric, P50LatencyMetric, P75LatencyMetric, P95LatencyMetric,
     P99LatencyMetric, rewrite_distributed_plan_with_metrics,
 };
+#[cfg(feature = "flight")]
 pub use networking::{
     BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, create_worker_client,
     get_distributed_channel_resolver,
@@ -53,8 +56,11 @@ pub use stage::{
 pub use work_unit_feed::{
     DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
 };
+#[cfg(feature = "flight")]
 pub use worker::FlightWorkerTransport;
+#[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
+#[cfg(feature = "flight")]
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
 pub use worker::generated::worker::{
     GetWorkerInfoRequest, GetWorkerInfoResponse, SetPlanRequest, TaskKey, TaskMetrics,
@@ -66,6 +72,7 @@ pub use worker::{
     WorkerTransport,
 };
 
+#[cfg(feature = "flight")]
 pub use observability::{
     GetClusterWorkersRequest, GetClusterWorkersResponse, GetTaskProgressRequest,
     GetTaskProgressResponse, ObservabilityService, ObservabilityServiceClient,
@@ -73,7 +80,7 @@ pub use observability::{
     TaskStatus, WorkerMetrics,
 };
 
-#[cfg(any(feature = "integration", test))]
+#[cfg(all(feature = "flight", any(feature = "integration", test)))]
 pub use execution_plans::benchmarks::{
     LocalRepartitionBench, LocalRepartitionFixture, LocalRepartitionMode, ShuffleBench,
     ShuffleFixture, TransportBench, TransportBenchMode, TransportFixture,

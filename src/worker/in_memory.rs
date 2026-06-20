@@ -411,6 +411,7 @@ mod tests {
 
     // With `flight` compiled out nothing is registered here: the query must run through the
     // process-wide default transport.
+    #[cfg(not(feature = "flight"))]
     #[tokio::test]
     async fn no_flight_default_runs_distributed_queries() -> Result<()> {
         let ctx = distributed_ctx(None);

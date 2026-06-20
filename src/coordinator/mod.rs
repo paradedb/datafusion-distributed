@@ -6,3 +6,4 @@ mod query_coordinator;
 
 pub use distributed::DistributedExec;
 pub(crate) use metrics_store::MetricsStore;
+pub(crate) use query_coordinator::FlightWorkerDispatch;

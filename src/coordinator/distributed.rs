@@ -1,10 +1,11 @@
 use crate::common::{require_one_child, serialize_uuid};
 use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
-use crate::coordinator::query_coordinator::QueryCoordinator;
 use crate::distributed_planner::NetworkBoundaryExt;
+use crate::networking::get_distributed_worker_transport;
 use crate::worker::generated::worker::TaskKey;
 use datafusion::common::internal_datafusion_err;
+use datafusion::common::runtime::JoinSet;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, exec_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -185,20 +186,27 @@ impl ExecutionPlan for DistributedExec {
         let base_plan = Arc::clone(&self.base_plan);
         let plan_for_viz = Arc::clone(&self.plan_for_viz);
         let head_stage = Arc::clone(&self.head_stage);
-
-        let query_coordinator = QueryCoordinator::new(
-            Arc::clone(&context),
-            &self.metrics,
-            self.metrics_store.clone(),
-        );
+        let metrics = self.metrics.clone();
+        let metrics_store = self.metrics_store.clone();
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 1);
         let tx = builder.tx();
 
         builder.spawn(async move {
-            let _guard = query_coordinator.end_query_guard();
+            let dispatcher =
+                get_distributed_worker_transport(context.session_config()).dispatcher();
+            // The query owns the join set: background plan-delivery and metrics tasks spawned by the
+            // dispatcher run on it, so draining it below is what waits for the workers to finish.
+            let mut join_set = JoinSet::new();
 
-            let result = prepare_static_plan(&query_coordinator, &base_plan)?;
+            let result = prepare_static_plan(
+                &base_plan,
+                &context,
+                dispatcher.as_ref(),
+                &mut join_set,
+                &metrics,
+                metrics_store.as_ref(),
+            )?;
 
             plan_for_viz
                 .lock()
@@ -215,7 +223,12 @@ impl ExecutionPlan for DistributedExec {
                 }
             }
             drop(tx);
-            query_coordinator.drain_pending_tasks().await?;
+            for res in join_set.join_all().await {
+                res?;
+            }
+            // Dropping the dispatcher ends the coordinator->worker streams, propagating EOS so the
+            // workers can clean up. It is held until here so those streams stay open during draining.
+            drop(dispatcher);
             Ok(())
         });
 

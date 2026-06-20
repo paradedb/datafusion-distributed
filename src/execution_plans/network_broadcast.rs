@@ -242,7 +242,7 @@ impl ExecutionPlan for NetworkBroadcastExec {
         };
 
         let task_context = DistributedTaskContext::from_ctx(&context);
-        let p_c = self.properties.partitioning.partition_count();
+        let p_c = self.partitions_per_consumer_task();
         let off = p_c * task_context.task_index;
         let mut streams = Vec::with_capacity(self.input_stage.task_count());
 

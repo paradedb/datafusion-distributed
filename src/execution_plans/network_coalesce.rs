@@ -180,6 +180,20 @@ impl NetworkBoundary for NetworkCoalesceExec {
     fn producer_head(&self, _consumer_task_count: usize) -> ProducerHead {
         ProducerHead::None
     }
+
+    /// Coalesce consumers read whole per-producer-task groups, not the sliced
+    /// `global = P_c * consumer_task + local` layout, and the consumer task is a function of the
+    /// producer task index rather than the output partition. The default routing math would
+    /// silently send everything to task `0`.
+    fn route_partition(
+        &self,
+        output_partition: usize,
+    ) -> Result<crate::distributed_planner::PartitionRoute> {
+        internal_err!(
+            "NetworkCoalesceExec routes by producer task group, not by output partition; \
+             partition {output_partition} has no slice-layout route"
+        )
+    }
 }
 
 impl DisplayAs for NetworkCoalesceExec {

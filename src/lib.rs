@@ -26,8 +26,8 @@ pub use common::get_distributed_cancellation_token;
 pub use coordinator::{DistributedExec, MetricsStore};
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
-    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, ProducerHead, SessionStateBuilderExt,
-    TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
+    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, PartitionRoute, ProducerHead,
+    SessionStateBuilderExt, TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
 };
 pub use execution_plans::{
     BroadcastExec, DistributedLeafExec, NetworkBroadcastExec, NetworkCoalesceExec,

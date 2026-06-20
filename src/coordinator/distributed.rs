@@ -1,20 +1,27 @@
-use crate::common::{require_one_child, serialize_uuid};
+use crate::DistributedConfig;
+use crate::common::{
+    DistributedCancellationToken, on_drop_stream, require_one_child, serialize_uuid,
+    task_ctx_with_extension,
+};
 use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
-use crate::coordinator::query_coordinator::QueryCoordinator;
 use crate::distributed_planner::NetworkBoundaryExt;
 use crate::worker::generated::worker::TaskKey;
 use datafusion::common::internal_datafusion_err;
+use datafusion::common::runtime::JoinSet;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, exec_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr_common::metrics::MetricsSet;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
 use std::fmt::Formatter;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// [ExecutionPlan] that executes the inner plan in distributed mode.
 /// Before executing it, two modifications are lazily performed on the plan:
@@ -25,39 +32,22 @@ use std::sync::{Arc, Mutex};
 ///    over the wire.
 #[derive(Debug)]
 pub struct DistributedExec {
-    /// Initial [ExecutionPlan] present before execution.
-    /// - If the plan was distributed statically, this will be the final distributed plan with all
-    ///   the appropriate network boundaries in it.
-    /// - If the plan is going to be distributed dynamically during execution, this is the initial
-    ///   non-distributed plan.
-    base_plan: Arc<dyn ExecutionPlan>,
-    /// Resulting [ExecutionPlan] after execution ready for visualization purposes.
-    /// - If the plan was distributed statically, this is equal to the base plan.
-    /// - If the plan is going to be distributed dynamically during execution, this is the resulting
-    ///   plan re-calculated based on runtime statistics.
-    plan_for_viz: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
-    /// The head stage meant to be executed locally on [DistributedExec::execute].
-    head_stage: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
-    /// DataFusion metrics.
+    plan: Arc<dyn ExecutionPlan>,
+    prepared_plan: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     metrics: ExecutionPlanMetricsSet,
-    /// Storage where metrics collected from workers at runtime will place their results as they
-    /// finish their respective remote tasks.
     pub(crate) metrics_store: Option<Arc<MetricsStore>>,
 }
 
 pub(super) struct PreparedPlan {
-    /// The head stage meant to be executed locally by the coordinator.
     pub(super) head_stage: Arc<dyn ExecutionPlan>,
-    /// A final representation of the plan for visualization purposes.
-    pub(super) plan_for_viz: Arc<dyn ExecutionPlan>,
+    pub(super) join_set: JoinSet<Result<()>>,
 }
 
 impl DistributedExec {
-    pub fn new(base_plan: Arc<dyn ExecutionPlan>) -> Self {
+    pub fn new(plan: Arc<dyn ExecutionPlan>) -> Self {
         Self {
-            base_plan,
-            plan_for_viz: Arc::new(Mutex::new(None)),
-            head_stage: Arc::new(Mutex::new(None)),
+            plan,
+            prepared_plan: Arc::new(Mutex::new(None)),
             metrics: ExecutionPlanMetricsSet::new(),
             metrics_store: None,
         }
@@ -72,6 +62,13 @@ impl DistributedExec {
         self
     }
 
+    /// The store worker task metrics land in when collection is enabled. An embedder driving
+    /// its own workers fills it (e.g. from transport frames) before rewriting the plan for
+    /// display.
+    pub fn metrics_store(&self) -> Option<Arc<MetricsStore>> {
+        self.metrics_store.clone()
+    }
+
     /// Waits until all worker tasks have reported their metrics back via the coordinator channel.
     ///
     /// Metrics are delivered asynchronously after query execution completes, so callers that need
@@ -84,10 +81,12 @@ impl DistributedExec {
         let Some(task_metrics) = &self.metrics_store else {
             return;
         };
-        let Some(plan) = self.plan_for_viz.lock().unwrap().as_ref().cloned() else {
+        // An unexecuted plan has no workers feeding metrics, so waiting for them would block
+        // forever. `prepared_plan` is only set once `execute()` ran.
+        if self.prepared_plan.lock().unwrap().is_none() {
             return;
-        };
-        let _ = plan.apply(|plan| {
+        }
+        let _ = self.plan.apply(|plan| {
             if let Some(boundary) = plan.as_network_boundary() {
                 let stage = boundary.input_stage();
                 for i in 0..stage.task_count() {
@@ -109,11 +108,82 @@ impl DistributedExec {
             .await;
     }
 
+    /// Prepares the plan for in-process execution through the registered [`crate::WorkerTransport`]
+    /// and returns the head stage, ready to `execute()`.
+    ///
+    /// For embedders that drive worker fragments themselves (PG parallel workers, threads) instead
+    /// of dispatching plans over the wire. Each network boundary is converted to a remote stage so
+    /// it routes through the transport's `open()`; the transport's dispatcher does whatever the
+    /// embedder needs (a no-op when its workers already hold the plan).
+    ///
+    /// What the embedder signs up for:
+    /// - Call this once per query. Every call re-dispatches every boundary, and default routing
+    ///   re-samples its starting URL.
+    /// - Register a [`crate::WorkerResolver`]. Default routing needs at least one URL from it,
+    ///   even a placeholder one when the transport routes by `target_task`; a custom
+    ///   `route_tasks` has no such requirement.
+    /// - Deliver plans synchronously inside dispatch. The query `join_set` is dropped on return,
+    ///   so a dispatcher that spawned onto it gets an error rather than a silent abort. The
+    ///   check runs after all boundaries dispatched, so whatever was already delivered stays
+    ///   delivered.
+    ///
+    /// What this path does not do:
+    /// - No cancellation token: teardown is the embedder's job.
+    /// - No work-unit feeds: Flight pumps those from dispatch-spawned tasks, which don't exist
+    ///   here, so feed-declaring plans are rejected.
+    /// - No metrics delivery: the prepared plan is recorded, so
+    ///   [`crate::rewrite_distributed_plan_with_metrics`] applies once the embedder fills
+    ///   [`Self::metrics_store`] itself (e.g. from its transport's metrics frames).
+    pub fn prepare_in_process_plan(
+        &self,
+        ctx: &Arc<TaskContext>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Feeds are pumped by dispatch-spawned background tasks, which this path does not run; a
+        // plan that declares feeds would stall its worker fragments on channels nothing fills.
+        let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
+        let registry = &d_cfg.__private_work_unit_feed_registry;
+        let mut has_feeds = false;
+        self.plan.apply(|plan| {
+            if registry.get_work_unit_feed(plan).is_some() {
+                has_feeds = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        if has_feeds {
+            return exec_err!(
+                "the plan declares work-unit feeds, which are not delivered on the in-process path"
+            );
+        }
+
+        let PreparedPlan {
+            head_stage,
+            join_set,
+        } = prepare_static_plan(&self.plan, &self.metrics, &self.metrics_store, ctx)?;
+        // Dropping the join_set aborts anything still on it, which would kill an async delivery
+        // mid-flight and surface as a hang far from the cause. Reject instead.
+        if !join_set.is_empty() {
+            return exec_err!(
+                "the registered transport spawned background delivery work; \
+                 prepare_in_process_plan requires a transport whose dispatch completes \
+                 synchronously"
+            );
+        }
+        {
+            let mut guard = self
+                .prepared_plan
+                .lock()
+                .map_err(|e| internal_datafusion_err!("Failed to lock prepared plan: {e}"))?;
+            *guard = Some(head_stage.clone());
+        }
+        Ok(head_stage)
+    }
+
     /// Returns the plan which is lazily prepared on `execute()` and actually gets executed.
     /// It is updated on every call to `execute()`. Returns an error if `.execute()` has not been
     /// called.
-    pub(crate) fn plan_for_viz(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        self.plan_for_viz
+    pub(crate) fn prepared_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        self.prepared_plan
             .lock()
             .map_err(|e| internal_datafusion_err!("Failed to lock prepared plan: {}", e))?
             .clone()
@@ -122,16 +192,17 @@ impl DistributedExec {
             })
     }
 
-    /// Returns the head stage that was actually executed. Unlike [`Self::plan_for_viz`] (which is
-    /// reconstructed for visualization, with `Stage::Local` boundaries and rebuilt ancestor
-    /// `Arc`s), this returns the original `Arc` instances whose metrics were populated during
-    /// execution.
+    /// The head stage whose original `Arc`s carry the metrics populated during execution. The
+    /// metrics collector reads from here.
     pub(crate) fn head_stage(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        self.head_stage
-            .lock()
-            .map_err(|e| internal_datafusion_err!("Failed to lock head stage: {}", e))?
-            .clone()
-            .ok_or_else(|| internal_datafusion_err!("No head stage found. Was execute() called?"))
+        self.prepared_plan()
+    }
+
+    /// The plan the rewriter annotates with metrics for display. `prepare_static_plan` transforms
+    /// a clone, so `self.plan` still has its boundaries in `Stage::Local` state, which is the shape
+    /// the rewriter walks. Metrics come from [`Self::head_stage`], not from here.
+    pub(crate) fn plan_for_viz(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::clone(&self.plan))
     }
 }
 
@@ -147,11 +218,11 @@ impl ExecutionPlan for DistributedExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        self.base_plan.properties()
+        self.plan.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.base_plan]
+        vec![&self.plan]
     }
 
     fn with_new_children(
@@ -159,9 +230,8 @@ impl ExecutionPlan for DistributedExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DistributedExec {
-            base_plan: require_one_child(&children)?,
-            plan_for_viz: Arc::new(Mutex::new(None)),
-            head_stage: Arc::new(Mutex::new(None)),
+            plan: require_one_child(&children)?,
+            prepared_plan: self.prepared_plan.clone(),
             metrics: self.metrics.clone(),
             metrics_store: self.metrics_store.clone(),
         }))
@@ -182,47 +252,182 @@ impl ExecutionPlan for DistributedExec {
             );
         }
 
-        let base_plan = Arc::clone(&self.base_plan);
-        let plan_for_viz = Arc::clone(&self.plan_for_viz);
-        let head_stage = Arc::clone(&self.head_stage);
+        // Mint one cancellation token for this execution and attach it to the context before the
+        // plan is prepared, so the dispatch contexts handed to the transport carry it too, not
+        // just the head-stage consume path. Producers and consumers watch it; dropping the head
+        // stream fires it.
+        let cancel = CancellationToken::new();
+        let context = Arc::new(task_ctx_with_extension(
+            &context,
+            DistributedCancellationToken(cancel.clone()),
+        ));
 
-        let query_coordinator = QueryCoordinator::new(
-            Arc::clone(&context),
-            &self.metrics,
-            self.metrics_store.clone(),
-        );
+        let PreparedPlan {
+            head_stage,
+            join_set,
+        } = prepare_static_plan(&self.plan, &self.metrics, &self.metrics_store, &context)?;
+        {
+            let mut guard = self
+                .prepared_plan
+                .lock()
+                .map_err(|e| internal_datafusion_err!("Failed to lock prepared plan: {e}"))?;
+            *guard = Some(head_stage.clone());
+        }
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 1);
         let tx = builder.tx();
-
+        // Spawn the task that pulls data from child...
         builder.spawn(async move {
-            let _guard = query_coordinator.end_query_guard();
-
-            let result = prepare_static_plan(&query_coordinator, &base_plan)?;
-
-            plan_for_viz
-                .lock()
-                .expect("poisoned lock")
-                .replace(result.plan_for_viz);
-            head_stage
-                .lock()
-                .expect("poisoned lock")
-                .replace(Arc::clone(&result.head_stage));
-            let mut stream = result.head_stage.execute(partition, context)?;
+            let mut stream = head_stage.execute(partition, context)?;
             while let Some(msg) = stream.next().await {
                 if tx.send(msg).await.is_err() {
                     break; // channel closed
                 }
             }
-            drop(tx);
-            query_coordinator.drain_pending_tasks().await?;
             Ok(())
         });
-
-        Ok(builder.build())
+        // ...in parallel to the one that feeds the plan to workers.
+        builder.spawn(async move {
+            for res in join_set.join_all().await {
+                res?;
+            }
+            Ok(())
+        });
+        let schema = self.schema();
+        let stream = on_drop_stream(builder.build(), move || cancel.cancel());
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stage::{LocalStage, Stage};
+    use crate::worker::{WorkerConnection, WorkerDispatch, WorkerDispatchRequest, WorkerTransport};
+    use crate::{DistributedExt, NetworkShuffleExec, WorkerResolver};
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::physical_plan::Partitioning;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::prelude::SessionConfig;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use url::Url;
+    use uuid::Uuid;
+
+    struct OneUrlResolver;
+
+    impl WorkerResolver for OneUrlResolver {
+        fn get_urls(&self) -> Result<Vec<Url>> {
+            Ok(vec![Url::parse("mem://0").unwrap()])
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        dispatches: Arc<AtomicUsize>,
+        spawn_on_dispatch: bool,
+    }
+
+    struct RecordingDispatch {
+        dispatches: Arc<AtomicUsize>,
+        spawn_on_dispatch: bool,
+    }
+
+    impl WorkerTransport for RecordingTransport {
+        fn open(
+            &self,
+            _input_stage: &crate::stage::RemoteStage,
+            _target_partitions: Range<usize>,
+            _target_task: usize,
+            _producer_head: crate::ProducerHead,
+            _ctx: &Arc<TaskContext>,
+            _metrics: &ExecutionPlanMetricsSet,
+        ) -> Result<Box<dyn WorkerConnection>> {
+            datafusion::common::internal_err!("not used by this test")
+        }
+
+        fn dispatcher(&self) -> Box<dyn WorkerDispatch> {
+            Box::new(RecordingDispatch {
+                dispatches: Arc::clone(&self.dispatches),
+                spawn_on_dispatch: self.spawn_on_dispatch,
+            })
+        }
+    }
+
+    impl WorkerDispatch for RecordingDispatch {
+        fn dispatch(&self, request: WorkerDispatchRequest<'_>) -> Result<()> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            if self.spawn_on_dispatch {
+                request.join_set.spawn(async { Ok(()) });
+            }
+            Ok(())
+        }
+    }
+
+    fn single_boundary_exec() -> DistributedExec {
+        let child = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        let plan =
+            Arc::new(RepartitionExec::try_new(child, Partitioning::RoundRobinBatch(2)).unwrap());
+        let properties = Arc::clone(plan.properties());
+        let stage = LocalStage {
+            query_id: Uuid::new_v4(),
+            num: 0,
+            plan,
+            tasks: 2,
+        };
+        DistributedExec::new(Arc::new(NetworkShuffleExec::from_stage(
+            Stage::Local(stage),
+            properties,
+        )))
+    }
+
+    fn ctx_with(transport: RecordingTransport) -> Arc<TaskContext> {
+        let mut cfg = SessionConfig::new();
+        cfg.set_distributed_worker_transport(transport);
+        cfg.set_distributed_worker_resolver(OneUrlResolver);
+        Arc::new(TaskContext::default().with_session_config(cfg))
+    }
+
+    #[test]
+    fn prepare_in_process_converts_boundaries_and_dispatches_once() -> Result<()> {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let ctx = ctx_with(RecordingTransport {
+            dispatches: Arc::clone(&dispatches),
+            spawn_on_dispatch: false,
+        });
+
+        let head = single_boundary_exec().prepare_in_process_plan(&ctx)?;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+        let mut boundaries = 0;
+        head.apply(|plan| {
+            if let Some(boundary) = plan.as_network_boundary() {
+                boundaries += 1;
+                assert!(matches!(boundary.input_stage(), Stage::Remote(_)));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(boundaries, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_in_process_rejects_async_dispatch() {
+        let ctx = ctx_with(RecordingTransport {
+            dispatches: Arc::new(AtomicUsize::new(0)),
+            spawn_on_dispatch: true,
+        });
+
+        let err = single_boundary_exec()
+            .prepare_in_process_plan(&ctx)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("completes"), "unexpected error: {err}");
     }
 }

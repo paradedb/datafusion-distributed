@@ -7,6 +7,8 @@ mod execution_plans;
 mod metrics;
 mod passthrough_headers;
 mod stage;
+// With `flight` off the in-memory transport keeps this machinery live; what remains dormant is
+// the gRPC envelope side: the generated stream messages and the Flight-only `Worker` accessors.
 mod worker;
 
 mod distributed_planner;
@@ -20,10 +22,11 @@ pub mod test_utils;
 mod work_unit_feed;
 
 pub use arrow_ipc::CompressionType;
-pub use coordinator::DistributedExec;
+pub use common::get_distributed_cancellation_token;
+pub use coordinator::{DistributedExec, MetricsStore};
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
-    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
+    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, ProducerHead, SessionStateBuilderExt,
     TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
 };
 pub use execution_plans::{
@@ -37,21 +40,29 @@ pub use metrics::{
     P99LatencyMetric, rewrite_distributed_plan_with_metrics,
 };
 pub use networking::{
-    BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, WorkerResolver,
-    create_worker_client, get_distributed_channel_resolver, get_distributed_worker_resolver,
+    BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, create_worker_client,
+    get_distributed_channel_resolver,
+};
+pub use networking::{
+    WorkerResolver, get_distributed_worker_resolver, get_distributed_worker_transport,
 };
 pub use stage::{
-    DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
+    DistributedTaskContext, LocalStage, RemoteStage, Stage, display_plan_ascii,
+    display_plan_graphviz, explain_analyze,
 };
 pub use work_unit_feed::{
     DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
 };
+pub use worker::FlightWorkerTransport;
 pub use worker::generated::worker::worker_service_client::WorkerServiceClient;
 pub use worker::generated::worker::worker_service_server::WorkerServiceServer;
-pub use worker::generated::worker::{GetWorkerInfoRequest, GetWorkerInfoResponse, TaskKey};
+pub use worker::generated::worker::{
+    GetWorkerInfoRequest, GetWorkerInfoResponse, SetPlanRequest, TaskKey, TaskMetrics,
+};
 pub use worker::{
-    DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt, TaskData,
-    Worker, WorkerQueryContext, WorkerSessionBuilder,
+    DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt,
+    PartitionSink, TaskData, Worker, WorkerConnection, WorkerDispatch, WorkerDispatchRequest,
+    WorkerQueryContext, WorkerSessionBuilder, WorkerSink, WorkerTransport,
 };
 
 pub use observability::{

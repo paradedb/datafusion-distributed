@@ -1,19 +1,19 @@
+pub use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
+use datafusion::common::DataFusionError;
+
 use crate::worker::generated::worker::worker_service_client::WorkerServiceClient;
 use crate::{
     BoxCloneSyncChannel, ChannelResolver, DefaultSessionBuilder, DistributedExt,
-    MappedWorkerSessionBuilderExt, SessionStateBuilderExt, Worker, WorkerResolver,
-    WorkerSessionBuilder, create_worker_client,
+    MappedWorkerSessionBuilderExt, SessionStateBuilderExt, Worker, WorkerSessionBuilder,
+    create_worker_client,
 };
 use async_trait::async_trait;
-use datafusion::common::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Endpoint, Server};
-use url::Url;
 
 const DUMMY_URL: &str = "http://localhost:50051";
-const DUMMY_URL_PREFIX: &str = "http://url-";
 
 /// [ChannelResolver] implementation that returns gRPC clients backed by an in-memory
 /// tokio duplex rather than a TCP connection.
@@ -85,25 +85,6 @@ impl ChannelResolver for InMemoryChannelResolver {
         _: &url::Url,
     ) -> Result<WorkerServiceClient<BoxCloneSyncChannel>, DataFusionError> {
         Ok(self.channel.clone())
-    }
-}
-
-pub struct InMemoryWorkerResolver {
-    n_workers: usize,
-}
-
-impl InMemoryWorkerResolver {
-    pub fn new(n_workers: usize) -> Self {
-        Self { n_workers }
-    }
-}
-
-impl WorkerResolver for InMemoryWorkerResolver {
-    fn get_urls(&self) -> Result<Vec<Url>, DataFusionError> {
-        (0..self.n_workers)
-            .map(|i| Url::parse(&format!("{}{}", DUMMY_URL_PREFIX, i)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| DataFusionError::External(Box::new(err)))
     }
 }
 

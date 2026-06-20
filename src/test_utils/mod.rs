@@ -1,4 +1,7 @@
+// Flight-only: it spins a real gRPC worker over an in-memory duplex. The transport-neutral
+// worker resolver lives in its own module so no-flight tests keep it.
 pub mod in_memory_channel_resolver;
+pub mod in_memory_worker_resolver;
 pub mod insta;
 pub mod localhost;
 pub mod metrics;

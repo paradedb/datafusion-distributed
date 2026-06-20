@@ -1,26 +1,24 @@
-#[cfg(test)]
 use super::parquet::register_parquet_tables;
 use crate::NetworkBoundaryExt;
 use crate::common::serialize_uuid;
 use crate::coordinator::DistributedExec;
+use crate::distributed_ext::DistributedExt;
 use crate::stage::Stage;
+use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
 use crate::worker::generated::worker::TaskKey;
 #[cfg(test)]
 use crate::{
-    DistributedConfig, DistributedExt, SessionStateBuilderExt, TaskEstimation, TaskEstimator,
-    display_plan_ascii, test_utils::in_memory_channel_resolver::InMemoryWorkerResolver,
+    DistributedConfig, SessionStateBuilderExt, TaskEstimation, TaskEstimator, display_plan_ascii,
 };
 #[cfg(test)]
-use datafusion::{
-    common::Result,
-    config::ConfigOptions,
-    execution::{SessionState, context::SessionContext, session_state::SessionStateBuilder},
-    physical_plan::displayable,
-    prelude::SessionConfig,
-};
+use datafusion::config::ConfigOptions;
+#[cfg(test)]
+use datafusion::{common::Result, execution::SessionState};
 use datafusion::{
     common::{HashMap, HashSet},
-    physical_plan::ExecutionPlan,
+    execution::{SessionStateBuilder, context::SessionContext},
+    physical_plan::{ExecutionPlan, displayable},
+    prelude::SessionConfig,
 };
 use std::sync::Arc;
 
@@ -89,6 +87,66 @@ fn find_input_stages(plan: &dyn ExecutionPlan) -> Vec<&Stage> {
         }
     }
     result
+}
+
+/// Creates a physical plan from SQL without applying broadcast insertion or distribution.
+/// Used for snapshotting the baseline physical plan in tests.
+pub async fn sql_to_physical_plan(
+    query: &str,
+    target_partitions: usize,
+    num_workers: usize,
+) -> String {
+    let config = SessionConfig::new()
+        .with_target_partitions(target_partitions)
+        .with_information_schema(true);
+
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(config)
+        .with_distributed_worker_resolver(InMemoryWorkerResolver::new(num_workers))
+        .build();
+
+    let ctx = SessionContext::new_with_state(state);
+    register_parquet_tables(&ctx).await.unwrap();
+
+    let df = ctx.sql(query).await.unwrap();
+    let physical_plan = df.create_physical_plan().await.unwrap();
+
+    format!("{}", displayable(physical_plan.as_ref()).indent(true))
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct BuildSideOneTaskEstimator;
+
+#[cfg(test)]
+impl TaskEstimator for BuildSideOneTaskEstimator {
+    fn task_estimation(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        _: &ConfigOptions,
+    ) -> Option<TaskEstimation> {
+        if !plan.children().is_empty() {
+            return None;
+        }
+        let schema = plan.schema();
+        let has_min_temp = schema.fields().iter().any(|f| f.name() == "MinTemp");
+        let has_max_temp = schema.fields().iter().any(|f| f.name() == "MaxTemp");
+        if has_min_temp && !has_max_temp {
+            Some(TaskEstimation::maximum(1))
+        } else {
+            None
+        }
+    }
+
+    fn scale_up_leaf_node(
+        &self,
+        _: &Arc<dyn ExecutionPlan>,
+        _: usize,
+        _: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 }
 
 /// Create a plan from a context and queries
@@ -311,39 +369,5 @@ impl Default for TestPlanBuilder {
             distributed_children_isolator_unions: None,
             distributed_max_tasks_per_stage: None,
         }
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct BuildSideOneTaskEstimator;
-
-#[cfg(test)]
-impl TaskEstimator for BuildSideOneTaskEstimator {
-    fn task_estimation(
-        &self,
-        plan: &Arc<dyn ExecutionPlan>,
-        _: &ConfigOptions,
-    ) -> Option<TaskEstimation> {
-        if !plan.children().is_empty() {
-            return None;
-        }
-        let schema = plan.schema();
-        let has_min_temp = schema.fields().iter().any(|f| f.name() == "MinTemp");
-        let has_max_temp = schema.fields().iter().any(|f| f.name() == "MaxTemp");
-        if has_min_temp && !has_max_temp {
-            Some(TaskEstimation::maximum(1))
-        } else {
-            None
-        }
-    }
-
-    fn scale_up_leaf_node(
-        &self,
-        _: &Arc<dyn ExecutionPlan>,
-        _: usize,
-        _: &ConfigOptions,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(None)
     }
 }

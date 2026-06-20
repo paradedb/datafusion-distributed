@@ -172,9 +172,9 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
     }
 
     /// Reconstructs a [`WorkUnitFeed`] from its serialized form. The resulting feed is in
-    /// the **remote** variant — it will read work units off the network using the
-    /// `RemoteWorkUnitFeedRegistry` installed in the worker's session config. Used by
-    /// physical plan codecs when deserializing a plan on a worker.
+    /// the **remote** variant: it reads work units off the wire through the feed channels
+    /// installed in the worker's session config. Used by physical plan codecs when
+    /// deserializing a plan on a worker.
     pub fn from_proto(proto: WorkUnitFeedProto) -> Result<Self> {
         let id = deserialize_uuid(&proto.id)?;
         Ok(WorkUnitFeed {

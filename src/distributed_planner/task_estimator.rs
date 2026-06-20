@@ -155,6 +155,9 @@ pub struct TaskRoutingContext<'a> {
     pub plan: &'a Arc<dyn ExecutionPlan>,
     /// The number of tasks to be assigned.
     pub task_count: usize,
+    /// The worker URLs the resolver returned, so a custom router can place tasks without
+    /// re-resolving them.
+    pub available_urls: &'a [url::Url],
 }
 
 impl TaskEstimator for usize {
@@ -389,7 +392,7 @@ impl TaskEstimator for CombinedTaskEstimator {
 mod tests {
     use super::*;
     use crate::networking::WorkerResolverExtension;
-    use crate::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver;
+    use crate::test_utils::in_memory_worker_resolver::InMemoryWorkerResolver;
     use crate::test_utils::parquet::register_parquet_tables;
     use datafusion::error::DataFusionError;
     use datafusion::prelude::SessionContext;

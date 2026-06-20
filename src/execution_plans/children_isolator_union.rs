@@ -197,6 +197,8 @@ impl ChildrenIsolatorUnionExec {
 
     /// Trims out all the children that are going to be ignored based on the provided
     /// task index. These children are replaced by [EmptyExec] as placeholders.
+    /// Specialization happens at plan delivery (one plan shipped per task), shared by every
+    /// transport's dispatch path through `encode_task_plan`.
     pub(crate) fn to_task_specialized(&self, task_i: usize) -> Self {
         let mut children_to_keep = vec![];
         for (child_i, _) in &self.task_idx_map[task_i] {

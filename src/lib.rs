@@ -19,6 +19,10 @@ mod coordinator;
 pub mod test_utils;
 mod work_unit_feed;
 
+// Public so an embedder (e.g. pg_search's shared-memory MPP) consumes the transport directly, and
+// so its in-process test runs a real distributed query through it in this crate's CI.
+pub mod shm;
+
 pub use arrow_ipc::CompressionType;
 pub use common::{
     TreeNodeExt, deserialize_uuid, get_distributed_cancellation_token, serialize_uuid,
@@ -53,6 +57,7 @@ pub use networking::{
     set_distributed_worker_transport,
 };
 pub use passthrough_headers::get_passthrough_headers;
+pub use shm::{PartitionSink, WorkerSink};
 pub use stage::{
     DistributedTaskContext, RemoteStage, Stage, display_plan_ascii, display_plan_graphviz,
     explain_analyze,

@@ -1,7 +1,7 @@
 #[cfg(feature = "flight")]
 use crate::WorkerResolver;
+use crate::shm::SelfHostedShmTransport;
 use crate::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver;
-use crate::worker::InMemoryWorkerTransport;
 use crate::{DistributedExt, SessionStateBuilderExt, Worker, WorkerSessionBuilder};
 #[cfg(feature = "flight")]
 use async_trait::async_trait;
@@ -92,11 +92,11 @@ where
     (SessionContext::from(state), join_set, workers)
 }
 
-/// Workers and context with a fixed number of target partitions, hosted in-process by an
-/// [InMemoryWorkerTransport] built from `session_builder`. Plans are delivered with a function call
-/// and partitions are read straight from the local registry, so this is what the integration suite
-/// exercises by default in both build configurations. Nothing listens on localhost; the returned
-/// [Worker]s are handles onto the shared in-process task registry.
+/// Workers and context with a fixed number of target partitions, hosted in-process by a
+/// [SelfHostedShmTransport] built from `session_builder`. Every cross-stage byte moves through the
+/// shared-memory mesh, so this is what the integration suite exercises by default in both build
+/// configurations. Nothing listens on localhost; the returned [Worker]s are handles onto the shared
+/// in-process task registry.
 pub async fn start_localhost_context<B>(
     num_workers: usize,
     session_builder: B,
@@ -110,7 +110,7 @@ where
     if std::env::var("DATAFUSION_DISTRIBUTED_TEST_TRANSPORT").as_deref() == Ok("flight") {
         return start_localhost_flight_context(num_workers, session_builder).await;
     }
-    let transport = InMemoryWorkerTransport::from_session_builder(session_builder);
+    let transport = SelfHostedShmTransport::from_session_builder(session_builder);
     let workers = (0..num_workers)
         .map(|_| transport.worker().clone())
         .collect();

@@ -2,14 +2,14 @@ use crate::DistributedConfig;
 use crate::config_extension_ext::set_distributed_option_extension;
 #[cfg(feature = "flight")]
 use crate::worker::FlightWorkerTransport;
-#[cfg(not(feature = "flight"))]
-use crate::worker::InMemoryWorkerTransport;
 use crate::worker::WorkerTransport;
 use datafusion::prelude::SessionConfig;
 use std::sync::Arc;
 
-/// The transport used when none is registered: Arrow-Flight with the `flight` feature on (the
-/// default), the in-process transport when it is off so distributed plans still run.
+/// The transport used when none is registered. With `flight` on it is the Arrow-Flight gRPC
+/// transport; with it off it is the self-hosted shared-memory transport, so every task runs in the
+/// current process and the data moves through the shared-memory mesh. A custom session (UDFs,
+/// codecs) or multi-process execution still needs a registered transport.
 fn default_worker_transport() -> Arc<dyn WorkerTransport> {
     #[cfg(feature = "flight")]
     {
@@ -17,7 +17,7 @@ fn default_worker_transport() -> Arc<dyn WorkerTransport> {
     }
     #[cfg(not(feature = "flight"))]
     {
-        Arc::new(InMemoryWorkerTransport::default())
+        Arc::new(crate::shm::SelfHostedShmTransport::default())
     }
 }
 
@@ -40,10 +40,10 @@ pub fn set_distributed_worker_transport(
     }
 }
 
-/// Returns the [WorkerTransport] in scope, defaulting to the Arrow-Flight gRPC transport. Network
-/// boundaries call this at execute time to open connections and dispatch plans, so a custom
-/// transport set via [crate::DistributedExt::with_distributed_worker_transport] takes over both the
-/// read and write sides.
+/// Returns the [WorkerTransport] in scope, falling back to [default_worker_transport] when none is
+/// registered. Network boundaries call this at execute time to open connections and dispatch plans,
+/// so a custom transport set via [crate::DistributedExt::with_distributed_worker_transport] takes
+/// over both the read and write sides.
 pub fn get_distributed_worker_transport(cfg: &SessionConfig) -> Arc<dyn WorkerTransport> {
     cfg.options()
         .extensions

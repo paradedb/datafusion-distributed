@@ -27,6 +27,8 @@ arrow-flight = { version = "58", optional = true }
 arrow-select = "58"
 arrow-ipc = { version = "58", features = ["zstd"] }
 async-trait = "0.1.89"
+async-stream = "0.3"
+log = "0.4"
 tokio = { version = "1.48", features = ["full"] }
 tonic = { version = "0.14.1", features = ["transport"], optional = true }
 tower = { version = "0.5.2", optional = true }

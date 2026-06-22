@@ -32,8 +32,8 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  # The generic suite runs over the in-memory transport (what `start_localhost_context` builds by
-  # default), so it covers the distributed paths without a gRPC server.
+  # The generic suite runs over the shared-memory transport (what `start_localhost_context` builds
+  # by default), so it covers the distributed paths without a gRPC server.
   unit-test:
     runs-on: ubuntu-latest
     steps:
@@ -56,10 +56,11 @@ jobs:
       - uses: ./.github/actions/setup
       - run: cargo test --features integration
 
-  # Builds the lib and the suite with `flight` off: no `tonic` / `arrow-flight`, in-memory transport
-  # as the default. The dataset suites moved to the benchmarks crate, so the suite no longer drags
-  # the benchmarks dev-dependency in (which re-enabled `flight` through feature unification).
-  # Examples are left out: they demo the Flight cluster, so `--all-features` clippy covers them.
+  # Builds the lib and the suite with `flight` off: no `tonic` / `arrow-flight`, the shared-memory
+  # transport as the default. The dataset suites moved to the benchmarks crate, so the suite no
+  # longer drags the benchmarks dev-dependency in (which re-enabled `flight` through feature
+  # unification). Examples are left out: they demo the Flight cluster, so `--all-features` clippy
+  # covers them.
   no-flight:
     runs-on: ubuntu-latest
     steps:
@@ -70,8 +71,8 @@ jobs:
       - run: cargo build --no-default-features --features integration
       - run: cargo clippy --no-default-features --features integration --lib --tests -- -D warnings
 
-  # The integration suite over the in-memory transport with `flight` off, so the no-flight runtime
-  # path is run, not just built. Flight-specific tests gate themselves out.
+  # The integration suite over the shared-memory transport with `flight` off, so the no-flight
+  # runtime path is run, not just built. Flight-specific tests gate themselves out.
   unit-test-no-flight:
     runs-on: ubuntu-latest
     steps:

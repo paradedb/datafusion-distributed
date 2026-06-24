@@ -273,6 +273,9 @@ pub(super) enum RecvOutcome {
 /// Caller-visible handle for the single consumer.
 pub(super) struct DsmMpscReceiver {
     ring: NonNull<DsmMpscRingHeader>,
+    /// Out-of-DSM liveness: `false` once the embedder detaches the segment, so every DSM access
+    /// no-ops instead of dereferencing a `ring` that points into freed memory.
+    alive: Arc<AtomicBool>,
 }
 
 /// Caller-visible handle for any of the N-1 producers.
@@ -286,6 +289,9 @@ pub(super) struct DsmMpscSender {
     /// Control senders (a consumer's `Cancel` path) don't: they target a peer's inbox without being
     /// one of its producers, so counting them would mask that peer's own producer-gone signal.
     counts_as_data: bool,
+    /// Out-of-DSM liveness: `false` once the embedder detaches the segment, so every DSM access
+    /// no-ops instead of dereferencing a `ring` that points into freed memory.
+    alive: Arc<AtomicBool>,
 }
 
 // SAFETY: the ring is a `repr(C)` blob in shared memory whose atomic operations are the
@@ -421,8 +427,8 @@ impl DsmMpscReceiver {
     /// `ring` must point to a header initialized by [`create_at`] and not yet
     /// deallocated. The caller guarantees no other `DsmMpscReceiver` exists for the
     /// same ring (single-consumer invariant).
-    pub(super) unsafe fn new(ring: NonNull<DsmMpscRingHeader>) -> Self {
-        Self { ring }
+    pub(super) unsafe fn new(ring: NonNull<DsmMpscRingHeader>, alive: Arc<AtomicBool>) -> Self {
+        Self { ring, alive }
     }
 
     /// Register the consumer's opaque wakeup token. Producers Acquire-load it as a single
@@ -430,6 +436,9 @@ impl DsmMpscReceiver {
     /// The token is the embedder's to interpret: a PG embedder packs `(pgprocno, pid)`; an
     /// in-process embedder packs a registry key. Must not be [`NO_RECEIVER_TOKEN`].
     pub(super) fn set_receiver(&self, token: u64) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
         let header = unsafe { self.ring.as_ref() };
         header.receiver_packed.store(token, Ordering::Release);
     }
@@ -446,6 +455,10 @@ impl DsmMpscReceiver {
     /// but a future pass should add an explicit `PGPROC` liveness check to
     /// force-detach on producer death.
     pub(super) fn try_recv(&self, out: &mut Vec<u8>) -> RecvOutcome {
+        if !self.alive.load(Ordering::Acquire) {
+            // Segment detached: no DSM left to read, so report drained.
+            return RecvOutcome::Detached;
+        }
         let header = unsafe { self.ring.as_ref() };
         let head = header.head.load(Ordering::Relaxed);
         let slot_idx = (head % header.ring_size as u64) as u32;
@@ -624,13 +637,18 @@ impl DsmMpscSender {
     /// # Safety
     /// `ring` must point to a header initialized by [`create_at`] and not yet
     /// deallocated.
-    pub(super) unsafe fn new(ring: NonNull<DsmMpscRingHeader>, wakeup: Arc<dyn Wakeup>) -> Self {
+    pub(super) unsafe fn new(
+        ring: NonNull<DsmMpscRingHeader>,
+        wakeup: Arc<dyn Wakeup>,
+        alive: Arc<AtomicBool>,
+    ) -> Self {
         let header = unsafe { ring.as_ref() };
         header.sender_count.fetch_add(1, Ordering::AcqRel);
         Self {
             ring,
             wakeup,
             counts_as_data: true,
+            alive,
         }
     }
 
@@ -643,6 +661,7 @@ impl DsmMpscSender {
             ring: self.ring,
             wakeup: Arc::clone(&self.wakeup),
             counts_as_data: false,
+            alive: Arc::clone(&self.alive),
         }
     }
 
@@ -669,6 +688,9 @@ impl DsmMpscSender {
     /// `tail.compare_exchange(T, T + n_slots)`, so other producers can't
     /// interleave their fragments. See [`FragmentKind`].
     pub(super) fn try_send(&self, bytes: &[u8]) -> Result<(), SendError> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(SendError::Detached);
+        }
         let header = unsafe { self.ring.as_ref() };
         // Control senders ignore `detached`: a `Cancel` still has to reach a producer whose own
         // inbox already detached because its upstream finished while it's mid-output.
@@ -872,6 +894,10 @@ impl DsmMpscSender {
 
 impl Drop for DsmMpscSender {
     fn drop(&mut self) {
+        if !self.alive.load(Ordering::Acquire) {
+            // Segment detached: the `sender_count.fetch_sub` below would write into freed DSM.
+            return;
+        }
         if !self.counts_as_data {
             // Control senders never joined `sender_count`, so there's nothing to release and no
             // detach to trigger.
@@ -978,8 +1004,9 @@ mod tests {
         let nn = NonNull::new(header_ptr).expect("create_at returned null");
         // Unsafe: we hand ownership of the same pointer to two handles. Safe because the
         // ring is the synchronization point; the handles are stateless wrappers.
-        let receiver = unsafe { DsmMpscReceiver::new(nn) };
-        let sender = unsafe { DsmMpscSender::new(nn, noop_wakeup()) };
+        let alive = Arc::new(AtomicBool::new(true));
+        let receiver = unsafe { DsmMpscReceiver::new(nn, Arc::clone(&alive)) };
+        let sender = unsafe { DsmMpscSender::new(nn, noop_wakeup(), alive) };
         (region, receiver, sender)
     }
 
@@ -988,8 +1015,9 @@ mod tests {
         let bytes = DsmMpscRingHeader::region_bytes(4, 64);
         let region = AlignedRegion::new(bytes);
         let nn = NonNull::new(unsafe { create_at(region.as_mut_ptr(), 4, 64) }).unwrap();
-        let rx = unsafe { DsmMpscReceiver::new(nn) };
-        let data = unsafe { DsmMpscSender::new(nn, noop_wakeup()) };
+        let alive = Arc::new(AtomicBool::new(true));
+        let rx = unsafe { DsmMpscReceiver::new(nn, Arc::clone(&alive)) };
+        let data = unsafe { DsmMpscSender::new(nn, noop_wakeup(), alive) };
         let control = data.to_control();
 
         let mut buf = Vec::new();
@@ -1081,7 +1109,9 @@ mod tests {
             // Construct the sender on this thread so the closure captures DsmMpscSender
             // (Send via unsafe impl) rather than the inner NonNull (Rust 2021 disjoint
             // capture would otherwise project to the NonNull field and fail Send).
-            let tx = unsafe { DsmMpscSender::new(ring_nn.0, noop_wakeup()) };
+            let tx = unsafe {
+                DsmMpscSender::new(ring_nn.0, noop_wakeup(), Arc::clone(&tx_template.alive))
+            };
             let h = std::thread::spawn(move || {
                 let mut sent = 0u32;
                 while sent < M_PER_PRODUCER {
@@ -1144,7 +1174,9 @@ mod tests {
         let ring_nn = SharedRing(tx_template.ring);
         let mut handles = Vec::with_capacity(K_PRODUCERS);
         for producer_id in 0..K_PRODUCERS {
-            let tx = unsafe { DsmMpscSender::new(ring_nn.0, noop_wakeup()) };
+            let tx = unsafe {
+                DsmMpscSender::new(ring_nn.0, noop_wakeup(), Arc::clone(&tx_template.alive))
+            };
             handles.push(std::thread::spawn(move || {
                 let mut sent = 0u32;
                 while sent < M_PER_PRODUCER {
@@ -1254,7 +1286,9 @@ mod tests {
         let ring_nn = SharedRing(tx_template.ring);
         let mut handles = Vec::with_capacity(K_PRODUCERS);
         for producer_id in 0..K_PRODUCERS {
-            let tx = unsafe { DsmMpscSender::new(ring_nn.0, noop_wakeup()) };
+            let tx = unsafe {
+                DsmMpscSender::new(ring_nn.0, noop_wakeup(), Arc::clone(&tx_template.alive))
+            };
             handles.push(std::thread::spawn(move || {
                 let mut payload = [0u8; 8];
                 payload[0..4].copy_from_slice(&(producer_id as u32).to_le_bytes());
@@ -1404,7 +1438,9 @@ mod tests {
         let ring_nn = SharedRing(tx_template.ring);
         let mut handles = Vec::with_capacity(K_PRODUCERS);
         for producer_id in 0..K_PRODUCERS {
-            let tx = unsafe { DsmMpscSender::new(ring_nn.0, noop_wakeup()) };
+            let tx = unsafe {
+                DsmMpscSender::new(ring_nn.0, noop_wakeup(), Arc::clone(&tx_template.alive))
+            };
             handles.push(std::thread::spawn(move || {
                 let mut sent = 0u32;
                 while sent < M_PER_PRODUCER {
@@ -1473,9 +1509,10 @@ mod tests {
             .expect("create_at returned null");
         let ring = SharedRing(nn);
         let wakeup = Arc::new(ThreadWakeup::default());
+        let alive = Arc::new(AtomicBool::new(true));
         const TOKEN: u64 = 7;
 
-        let receiver = unsafe { DsmMpscReceiver::new(nn) };
+        let receiver = unsafe { DsmMpscReceiver::new(nn, Arc::clone(&alive)) };
         // Register this thread as the wake target before publishing the token, so a producer that
         // races ahead still finds us.
         wakeup.register(TOKEN, std::thread::current());
@@ -1483,11 +1520,12 @@ mod tests {
 
         let producer = {
             let wakeup = Arc::clone(&wakeup) as Arc<dyn Wakeup>;
+            let alive = Arc::clone(&alive);
             std::thread::spawn(move || {
                 // Rebind the whole `Send` wrapper so the closure captures it (not the bare
                 // `NonNull` field, which edition-2024 disjoint capture would otherwise grab).
                 let ring = ring;
-                let tx = unsafe { DsmMpscSender::new(ring.0, wakeup) };
+                let tx = unsafe { DsmMpscSender::new(ring.0, wakeup, alive) };
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 assert_eq!(tx.try_send(b"hello"), Ok(()));
             })

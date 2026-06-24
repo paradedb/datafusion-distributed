@@ -46,6 +46,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::mesh::{align_up_maxalign_checked, aligned_queue_bytes};
 use super::mpsc_ring::{self, DsmMpscReceiver, DsmMpscRingHeader, DsmMpscSender, Wakeup};
@@ -259,6 +260,9 @@ pub(super) struct ProcAttach {
     pub(super) outbound_senders: Vec<DsmMpscSender>,
     /// This process's own MPSC inbox receiver. Drained inline by `DrainHandle`.
     pub(super) inbound_receiver: DsmMpscReceiver,
+    /// Shared liveness flag for every handle minted from this attach. The embedder flips it to
+    /// `false` from its dsm-detach callback so handles dropped afterward never touch freed memory.
+    pub(super) alive: Arc<AtomicBool>,
 }
 
 /// Read `region_total` out of the header at the start of an initialized region.
@@ -370,6 +374,9 @@ unsafe fn attach_proc(
 
     let (ring_slots, slot_capacity) = ring_dims_for(header.queue_bytes as usize);
 
+    // One liveness flag shared by every handle this attach mints.
+    let alive = Arc::new(AtomicBool::new(true));
+
     if attach_senders {
         for peer_idx in 0..(n_procs - 1) {
             let r = peer_proc_for_index(this_proc, peer_idx);
@@ -377,7 +384,8 @@ unsafe fn attach_proc(
             let inbox_addr = unsafe { base.add(off) };
             let nn = unsafe { mpsc_ring::attach_at(inbox_addr, ring_slots, slot_capacity) }
                 .expect("DsmMpscRing attach_at: leader-initialized region must validate");
-            outbound_senders.push(unsafe { DsmMpscSender::new(nn, Arc::clone(&wakeup)) });
+            outbound_senders
+                .push(unsafe { DsmMpscSender::new(nn, Arc::clone(&wakeup), Arc::clone(&alive)) });
         }
     }
 
@@ -386,11 +394,12 @@ unsafe fn attach_proc(
     let own_inbox_addr = unsafe { base.add(own_off) };
     let own_nn = unsafe { mpsc_ring::attach_at(own_inbox_addr, ring_slots, slot_capacity) }
         .expect("DsmMpscRing attach_at: own inbox must validate");
-    let inbound_receiver = unsafe { DsmMpscReceiver::new(own_nn) };
+    let inbound_receiver = unsafe { DsmMpscReceiver::new(own_nn, Arc::clone(&alive)) };
 
     ProcAttach {
         outbound_senders,
         inbound_receiver,
+        alive,
     }
 }
 

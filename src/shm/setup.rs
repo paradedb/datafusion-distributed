@@ -188,7 +188,7 @@ pub unsafe fn leader_setup(
     let (outbound_senders, _cancel_senders) =
         build_outbound_senders(0, n_procs, attach.outbound_senders);
     Ok(LeaderAttach {
-        mesh: Arc::new(MppMesh::new(0, n_procs, inbound, interrupt)),
+        mesh: Arc::new(MppMesh::new(0, n_procs, inbound, interrupt, attach.alive)),
         outbound_senders,
     })
 }
@@ -298,7 +298,13 @@ pub unsafe fn worker_setup(
             (ReceiverScope::SelfLoop, MppReceiver::new(Box::new(self_rx))),
         ],
     ));
-    let mesh = Arc::new(MppMesh::new(proc_idx, total_procs, inbound, interrupt));
+    let mesh = Arc::new(MppMesh::new(
+        proc_idx,
+        total_procs,
+        inbound,
+        interrupt,
+        attach.alive,
+    ));
     // A worker consumes shuffle inputs, so it can be the consumer that stops a stream early. Give
     // its mesh the control-plane cancel senders; they drop with the mesh at the end of the worker's
     // run, well before the DSM unmaps, so no explicit release is needed.

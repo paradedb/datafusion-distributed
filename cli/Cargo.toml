@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 datafusion = { workspace = true }
 datafusion-distributed = { path = "..", features = ["avro", "integration"] }
-datafusion-cli = { git = "https://github.com/apache/datafusion", rev = "bde8e5b24e772210885ea5272e5cb06b52c939c3", default-features = false }
+datafusion-cli = { git = "https://github.com/gene-bordegaray/datafusion", branch = "gene.bordegaray/2026/06/range-partitioned-joins", default-features = false }
 tokio = { version = "1.48", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"

@@ -281,9 +281,6 @@ pub fn df_metric_to_proto(metric: Arc<Metric>) -> Result<pb::Metric, DataFusionE
             partition,
             labels,
         }),
-        MetricValue::PeakMemoryUsage { .. } => {
-            internal_err!("{}", UNSUPPORTED_METRICS)
-        },
     }
 }
 

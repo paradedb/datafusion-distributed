@@ -2,8 +2,8 @@
 members = ["benchmarks", "cli", "console"]
 
 [workspace.dependencies]
-datafusion = { git = "https://github.com/apache/datafusion", rev = "bde8e5b24e772210885ea5272e5cb06b52c939c3", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/datafusion", rev = "bde8e5b24e772210885ea5272e5cb06b52c939c3" }
+datafusion = { git = "https://github.com/gene-bordegaray/datafusion", branch = "gene.bordegaray/2026/06/range-partitioned-joins", default-features = false }
+datafusion-proto = { git = "https://github.com/gene-bordegaray/datafusion", branch = "gene.bordegaray/2026/06/range-partitioned-joins" }
 
 [package]
 name = "datafusion-distributed"

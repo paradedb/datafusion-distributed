@@ -33,7 +33,7 @@
 //! substitute internally under the old `in_process_mode` flag.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::proto as pb;
@@ -49,6 +49,7 @@ use datafusion::physical_plan::metrics::MetricBuilder;
 use futures::stream::BoxStream;
 use url::Url;
 
+use super::AliveFlag;
 use super::transport::{CooperativeDrainSet, DrainHandle, DrainItem, Interrupt, MppSender};
 
 /// A proc's outbound senders to each peer inbox, shared between the mesh (for `Cancel` frames) and
@@ -98,10 +99,7 @@ pub struct MppMesh {
     /// a `Cancel` frame to a producing proc when this proc abandons a stream. `None` until the
     /// embedder installs it.
     cancel_senders: Mutex<Option<PeerSenders>>,
-    /// Shared liveness flag for every ring handle minted from this proc's attach. The embedder
-    /// flips it via [`Self::mark_detached`] while the segment is still mapped, so handles dropped
-    /// afterward no-op instead of touching freed DSM.
-    alive: Arc<AtomicBool>,
+    alive: AliveFlag,
 }
 
 impl MppMesh {
@@ -111,7 +109,7 @@ impl MppMesh {
         n_procs: u32,
         inbound_receiver: Arc<DrainHandle>,
         interrupt: Arc<dyn Interrupt>,
-        alive: Arc<AtomicBool>,
+        alive: AliveFlag,
     ) -> Self {
         Self {
             this_proc,
@@ -132,7 +130,7 @@ impl MppMesh {
 
     /// The raw liveness flag shared with every ring handle, for embedders that register a C
     /// dsm-detach callback against it directly.
-    pub fn detached_flag(&self) -> Arc<AtomicBool> {
+    pub fn detached_flag(&self) -> AliveFlag {
         Arc::clone(&self.alive)
     }
 

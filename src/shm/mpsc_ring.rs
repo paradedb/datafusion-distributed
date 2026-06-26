@@ -71,6 +71,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use std::sync::Arc;
 
+use super::AliveFlag;
+
 /// Wakes the ring's single consumer after a producer publishes a frame.
 ///
 /// The ring is transport-agnostic: the consumer registers an opaque `u64` token via
@@ -273,9 +275,7 @@ pub(super) enum RecvOutcome {
 /// Caller-visible handle for the single consumer.
 pub(super) struct DsmMpscReceiver {
     ring: NonNull<DsmMpscRingHeader>,
-    /// Out-of-DSM liveness: `false` once the embedder detaches the segment, so every DSM access
-    /// no-ops instead of dereferencing a `ring` that points into freed memory.
-    alive: Arc<AtomicBool>,
+    alive: AliveFlag,
 }
 
 /// Caller-visible handle for any of the N-1 producers.
@@ -289,9 +289,7 @@ pub(super) struct DsmMpscSender {
     /// Control senders (a consumer's `Cancel` path) don't: they target a peer's inbox without being
     /// one of its producers, so counting them would mask that peer's own producer-gone signal.
     counts_as_data: bool,
-    /// Out-of-DSM liveness: `false` once the embedder detaches the segment, so every DSM access
-    /// no-ops instead of dereferencing a `ring` that points into freed memory.
-    alive: Arc<AtomicBool>,
+    alive: AliveFlag,
 }
 
 // SAFETY: the ring is a `repr(C)` blob in shared memory whose atomic operations are the
@@ -427,7 +425,7 @@ impl DsmMpscReceiver {
     /// `ring` must point to a header initialized by [`create_at`] and not yet
     /// deallocated. The caller guarantees no other `DsmMpscReceiver` exists for the
     /// same ring (single-consumer invariant).
-    pub(super) unsafe fn new(ring: NonNull<DsmMpscRingHeader>, alive: Arc<AtomicBool>) -> Self {
+    pub(super) unsafe fn new(ring: NonNull<DsmMpscRingHeader>, alive: AliveFlag) -> Self {
         Self { ring, alive }
     }
 
@@ -640,7 +638,7 @@ impl DsmMpscSender {
     pub(super) unsafe fn new(
         ring: NonNull<DsmMpscRingHeader>,
         wakeup: Arc<dyn Wakeup>,
-        alive: Arc<AtomicBool>,
+        alive: AliveFlag,
     ) -> Self {
         let header = unsafe { ring.as_ref() };
         header.sender_count.fetch_add(1, Ordering::AcqRel);

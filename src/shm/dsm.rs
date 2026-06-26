@@ -48,6 +48,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use super::AliveFlag;
 use super::mesh::{align_up_maxalign_checked, aligned_queue_bytes};
 use super::mpsc_ring::{self, DsmMpscReceiver, DsmMpscRingHeader, DsmMpscSender, Wakeup};
 
@@ -260,9 +261,7 @@ pub(super) struct ProcAttach {
     pub(super) outbound_senders: Vec<DsmMpscSender>,
     /// This process's own MPSC inbox receiver. Drained inline by `DrainHandle`.
     pub(super) inbound_receiver: DsmMpscReceiver,
-    /// Shared liveness flag for every handle minted from this attach. The embedder flips it to
-    /// `false` from its dsm-detach callback so handles dropped afterward never touch freed memory.
-    pub(super) alive: Arc<AtomicBool>,
+    pub(super) alive: AliveFlag,
 }
 
 /// Read `region_total` out of the header at the start of an initialized region.

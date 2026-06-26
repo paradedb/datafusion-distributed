@@ -2,8 +2,8 @@
 members = ["benchmarks", "cli", "console"]
 
 [workspace.dependencies]
-datafusion = { version = "54.0.0", default-features = false }
-datafusion-proto = { version = "54.0.0" }
+datafusion = { git = "https://github.com/apache/datafusion", rev = "bde8e5b24e772210885ea5272e5cb06b52c939c3", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/datafusion", rev = "bde8e5b24e772210885ea5272e5cb06b52c939c3" }
 
 [package]
 name = "datafusion-distributed"
@@ -15,7 +15,7 @@ documentation = "https://datafusion-contrib.github.io/datafusion-distributed/"
 repository = "https://github.com/datafusion-contrib/datafusion-distributed"
 
 [dependencies]
-chrono = { version = "0.4.44" }
+chrono = { version = "0.4.45" }
 datafusion = { workspace = true, features = [
   "parquet",
   "sql",
@@ -23,9 +23,9 @@ datafusion = { workspace = true, features = [
   "datetime_expressions",
 ] }
 datafusion-proto = { workspace = true }
-arrow-flight = { version = "58", optional = true }
-arrow-select = "58"
-arrow-ipc = { version = "58", features = ["zstd"] }
+arrow-flight = { version = "59", optional = true }
+arrow-select = "59"
+arrow-ipc = { version = "59", features = ["zstd"] }
 async-trait = "0.1.89"
 async-stream = "0.3"
 log = "0.4"
@@ -55,8 +55,8 @@ tonic-prost = { version = "0.14.2", optional = true }
 
 # integration_tests deps
 insta = { version = "1.46.0", features = ["filters"], optional = true }
-parquet = { version = "58", optional = true }
-arrow = { version = "58", optional = true, features = ["test_utils"] }
+parquet = { version = "59", optional = true }
+arrow = { version = "59", optional = true, features = ["test_utils"] }
 hyper-util = { version = "0.1.16", optional = true }
 
 [features]
@@ -78,8 +78,8 @@ sysinfo = ["dep:sysinfo"]
 [dev-dependencies]
 structopt = "0.3"
 insta = { version = "1.46.0", features = ["filters"] }
-parquet = "58"
-arrow = { version = "58", features = ["test_utils"] }
+parquet = "59"
+arrow = { version = "59", features = ["test_utils"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 hyper-util = "0.1.16"
 pretty_assertions = "1.4"
@@ -88,3 +88,21 @@ test-case = "3.3.1"
 [workspace.lints.clippy]
 disallowed_types = "deny"
 disallowed-methods = "deny"
+
+[[example]]
+name = "custom_execution_plan"
+required-features = ["integration"]
+
+[[example]]
+name = "custom_distributed_partial_reduction_tree"
+required-features = ["integration"]
+
+[[example]]
+name = "custom_worker_url_routing"
+required-features = ["integration"]
+
+[[example]]
+name = "work_unit_feed"
+required-features = ["integration"]
+
+

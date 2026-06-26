@@ -32,11 +32,11 @@ pub trait WorkerSessionBuilder {
     /// struct CustomExecCodec;
     ///
     /// impl PhysicalExtensionCodec for CustomExecCodec {
-    ///     fn try_decode(&self, buf: &[u8], inputs: &[Arc<dyn ExecutionPlan>], ctx: &TaskContext) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-    ///         todo!()
+    ///     fn try_decode(&self, buf: &[u8], inputs: &[Arc<dyn ExecutionPlan>], ctx: &TaskContext, _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    ///         unimplemented!()
     ///     }
-    ///
-    ///     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> datafusion::common::Result<()> {
+    /// 
+    ///     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>, _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension) -> datafusion::common::Result<()> {
     ///         todo!()
     ///     }
     /// }

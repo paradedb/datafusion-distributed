@@ -51,6 +51,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let DistributedExecProto {
             node: Some(distributed_exec_node),
@@ -236,7 +237,12 @@ impl PhysicalExtensionCodec for DistributedCodec {
         }
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         fn encode_stage_proto(stage: &Stage) -> Result<StageProto, DataFusionError> {
             Ok(match stage {
                 Stage::Local(local) => StageProto {
@@ -582,9 +588,9 @@ mod tests {
             Arc::new(new_network_hash_shuffle_exec(part, schema, dummy_stage()));
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -612,9 +618,9 @@ mod tests {
             Arc::new(NetworkCoalesceExec::try_new(union.clone(), 1, 1)?);
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[union], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[union], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -645,9 +651,9 @@ mod tests {
             Arc::new(NetworkCoalesceExec::try_new(sort.clone(), 1, 1)?);
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[sort], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[sort], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -666,9 +672,9 @@ mod tests {
         ));
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -688,9 +694,9 @@ mod tests {
         ));
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[empty_exec()], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[empty_exec()], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -709,9 +715,9 @@ mod tests {
         ));
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[empty_exec()], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[empty_exec()], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -733,9 +739,9 @@ mod tests {
             Arc::new(NetworkCoalesceExec::try_new(flight.clone(), 1, 1)?);
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[flight], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[flight], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -763,9 +769,9 @@ mod tests {
             Arc::new(NetworkCoalesceExec::try_new(union.clone(), 1, 1)?);
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[union], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[union], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
@@ -796,9 +802,9 @@ mod tests {
             )?);
 
         let mut buf = Vec::new();
-        codec.try_encode(plan.clone(), &mut buf)?;
+        codec.try_encode(plan.clone(), &mut buf, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
 
-        let decoded = codec.try_decode(&buf, &[left, right], &ctx)?;
+        let decoded = codec.try_decode(&buf, &[left, right], &ctx, &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {})?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())

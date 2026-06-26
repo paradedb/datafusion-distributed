@@ -36,14 +36,14 @@ mod tests {
         let physical_distributed_str = display_plan_ascii(physical_distributed.as_ref(), false);
 
         assert_snapshot!(physical_distributed_str,
-            @r"
+            @"
         ┌───── DistributedExec ── Tasks: t0:[p0]
         │ SortPreservingMergeExec: [count(*)@1 ASC NULLS LAST]
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── Tasks: t0:[p0..p2] t1:[p0..p2]
-          │ SortExec: expr=[count(*)@1 ASC NULLS LAST], preserve_partitioning=[true]
-          │   ProjectionExec: expr=[test_udf(weather.RainToday)@0 as test_udf(weather.RainToday), count(Int64(1))@1 as count(*)]
+          │ ProjectionExec: expr=[test_udf(weather.RainToday)@0 as test_udf(weather.RainToday), count(Int64(1))@1 as count(*)]
+          │   SortExec: expr=[count(Int64(1))@1 ASC NULLS LAST], preserve_partitioning=[true]
           │     AggregateExec: mode=FinalPartitioned, gby=[test_udf(weather.RainToday)@0 as test_udf(weather.RainToday)], aggr=[count(Int64(1))]
           │       [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=3
           └──────────────────────────────────────────────────

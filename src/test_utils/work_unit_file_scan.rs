@@ -9,8 +9,8 @@ use crate::{DistributedConfig, TaskCountAnnotation, TaskEstimation, TaskEstimato
 use crate::{WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider};
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DataFusionError, Statistics, internal_err};
 use datafusion::common::{Result, internal_datafusion_err};
-use datafusion::common::{Statistics, internal_err};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSource;
@@ -21,6 +21,7 @@ use datafusion::physical_plan::execution_plan::SchedulingType;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning};
+use datafusion_proto::TryFromProto;
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
 };
@@ -73,8 +74,7 @@ impl WorkUnitFeedProvider for FileScanWorkUnitProvider {
             return Ok(futures::stream::empty().boxed());
         };
         let stream = futures::stream::iter(file_group.files().to_vec()).map(|file| {
-            let file_proto: df_proto::PartitionedFile = (&file)
-                .try_into()
+            let file_proto = df_proto::PartitionedFile::try_from_proto(&file)
                 .map_err(|e| internal_datafusion_err!("{e}"))?;
             Ok(FileScanWorkUnit {
                 file: Some(file_proto),
@@ -128,8 +128,10 @@ impl DataSource for WorkUnitFileScanConfig {
             .map(move |work_unit| {
                 let file = work_unit?.file.expect("missing file");
 
-                let single_file_group = df_proto::FileGroup { files: vec![file] };
-                let single_file_group = FileGroup::try_from(&single_file_group)?;
+                let df_file =
+                    datafusion::datasource::listing::PartitionedFile::try_from_proto(&file)
+                        .map_err(|e: DataFusionError| e)?;
+                let single_file_group = FileGroup::from(vec![df_file]);
 
                 let new_config = FileScanConfigBuilder::from(inner.clone())
                     .with_file_groups(vec![single_file_group])
@@ -237,6 +239,7 @@ impl PhysicalExtensionCodec for WorkUnitFileScanCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !inputs.is_empty() {
             return internal_err!(
@@ -271,7 +274,12 @@ impl PhysicalExtensionCodec for WorkUnitFileScanCodec {
         }))
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         let Some(dse) = node.downcast_ref::<DataSourceExec>() else {
             return internal_err!(
                 "Expected DataSourceExec wrapping a WorkUnitFileScanConfig, got {}",

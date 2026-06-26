@@ -24,6 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".worker.FlightDescriptor",
             "::arrow_flight::FlightDescriptor",
         )
+        .client_mod_attribute(".", "#[cfg(feature = \"flight\")]")
+        .server_mod_attribute(".", "#[cfg(feature = \"flight\")]")
         .compile_protos(&[proto_file], &[proto_dir])?;
 
     println!("Successfully generated worker proto code");

@@ -502,6 +502,7 @@ impl PhysicalExtensionCodec for TestWorkUnitFeedExecCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
+        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !inputs.is_empty() {
             return internal_err!(
@@ -530,7 +531,12 @@ impl PhysicalExtensionCodec for TestWorkUnitFeedExecCodec {
         )))
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         let Some(exec) = node.downcast_ref::<RowGeneratorExec>() else {
             return internal_err!("Expected RowGeneratorExec, but was {}", node.name());
         };

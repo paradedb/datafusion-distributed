@@ -201,6 +201,7 @@ mod tests {
             buf: &[u8],
             inputs: &[Arc<dyn ExecutionPlan>],
             _ctx: &TaskContext,
+            _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
         ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
             let _node = CustomConfigExtensionRequiredExecProto::decode(buf)
                 .map_err(|err| internal_datafusion_err!("{err}"))?;
@@ -221,6 +222,7 @@ mod tests {
             &self,
             _node: Arc<dyn ExecutionPlan>,
             buf: &mut Vec<u8>,
+            _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
         ) -> datafusion::common::Result<()> {
             CustomConfigExtensionRequiredExecProto::default()
                 .encode(buf)

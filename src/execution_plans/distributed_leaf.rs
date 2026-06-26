@@ -2,7 +2,9 @@ use crate::DistributedTaskContext;
 use datafusion::common::{Result, Statistics, exec_err, not_impl_err, plan_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr_common::metrics::MetricsSet;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, StatisticsArgs,
+};
 use std::fmt::Formatter;
 use std::sync::Arc;
 
@@ -184,7 +186,7 @@ impl ExecutionPlan for DistributedLeafExec {
         self.original.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.original.partition_statistics(partition)
+    fn statistics_with_args(&self, args: &StatisticsArgs) -> Result<Arc<Statistics>> {
+        self.original.statistics_with_args(args)
     }
 }

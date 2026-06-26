@@ -36,6 +36,9 @@
 //!   buffers the in-flight intermediate result in process memory. The rings in shared memory
 //!   stay bounded; the overflow lives on the consumer's heap.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 mod dsm;
 mod mesh;
 mod mpsc_ring;
@@ -59,6 +62,11 @@ pub use transport::{
     CooperativeDrainSet, Interrupt, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
     SendBatchStats, SetPlanFrame,
 };
+
+/// Out-of-DSM liveness flag shared by the ring handles from one attach. The embedder flips it to
+/// `false` from its dsm-detach callback while the segment is still mapped, so a handle dropped
+/// afterward (e.g. by a memory-context reset) no-ops instead of dereferencing freed memory.
+pub type AliveFlag = Arc<AtomicBool>;
 
 // In-process instantiation + the end-to-end test that runs a real distributed query through the
 // transport with no Postgres. Test-only: it's how an upstream rebase that breaks the transport

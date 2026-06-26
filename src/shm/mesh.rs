@@ -204,8 +204,11 @@ mod tests {
         let header_ptr =
             unsafe { mpsc_ring::create_at(region.as_mut_ptr(), ring_size, slot_capacity) };
         let nn = std::ptr::NonNull::new(header_ptr).expect("create_at returned null");
-        let sender = DsmInboxSender::new(unsafe { DsmMpscSender::new(nn, test_wakeup()) });
-        let receiver = DsmInboxReceiver::new(unsafe { DsmMpscReceiver::new(nn) });
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sender = DsmInboxSender::new(unsafe {
+            DsmMpscSender::new(nn, test_wakeup(), std::sync::Arc::clone(&alive))
+        });
+        let receiver = DsmInboxReceiver::new(unsafe { DsmMpscReceiver::new(nn, alive) });
         (region, sender, receiver)
     }
 

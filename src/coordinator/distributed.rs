@@ -1,11 +1,10 @@
-use crate::DistributedConfig;
-use crate::common::{require_one_child, serialize_uuid};
+use crate::common::require_one_child;
 use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_dynamic_plan::prepare_dynamic_plan;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
 use crate::coordinator::query_coordinator::QueryCoordinator;
 use crate::distributed_planner::NetworkBoundaryExt;
-use crate::worker::generated::worker::TaskKey;
+use crate::{DistributedConfig, TaskKey};
 use datafusion::common::internal_datafusion_err;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, exec_err};
@@ -94,9 +93,9 @@ impl DistributedExec {
                 let stage = boundary.input_stage();
                 for i in 0..stage.task_count() {
                     expected_keys.push(TaskKey {
-                        query_id: serialize_uuid(&stage.query_id()),
-                        stage_id: stage.num() as u64,
-                        task_number: i as u64,
+                        query_id: stage.query_id(),
+                        stage_id: stage.num(),
+                        task_number: i,
                     });
                 }
             }
@@ -198,7 +197,7 @@ impl ExecutionPlan for DistributedExec {
         let tx = builder.tx();
 
         builder.spawn(async move {
-            let _guard = query_coordinator.end_query_guard();
+            let guard = query_coordinator.end_query_guard();
 
             let d_cfg = DistributedConfig::from_config_options(context.session_config().options())?;
             let result = match d_cfg.dynamic_task_count {
@@ -221,6 +220,7 @@ impl ExecutionPlan for DistributedExec {
                 }
             }
             drop(tx);
+            drop(guard);
             query_coordinator.drain_pending_tasks().await?;
             Ok(())
         });

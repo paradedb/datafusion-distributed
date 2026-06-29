@@ -20,8 +20,8 @@ use crate::work_unit_feed::{build_work_unit_batch_msg, set_work_unit_send_time};
 use crate::{
     CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedGetterExt,
     DistributedTaskContext, DistributedWorkUnitFeedContext, LoadInfo, LocalWorkerContext,
-    MaybeEncoded, SetPlanRequest, TaskCompletedDynamicFilters, TaskKey, TaskMetrics,
-    WorkUnitFeedDeclaration, WorkerToCoordinatorMsg, get_distributed_channel_resolver,
+    MaybeEncoded, NetworkBoundaryExt, SetPlanRequest, TaskCompletedDynamicFilters, TaskKey,
+    TaskMetrics, WorkUnitFeedDeclaration, WorkerToCoordinatorMsg, get_distributed_channel_resolver,
 };
 use datafusion::common::Result;
 use datafusion::common::instant::Instant;
@@ -496,6 +496,11 @@ impl<'a> StageCoordinator<'a> {
                     ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
                 )?;
                 return Ok(Transformed::yes(local_repartion_exec));
+            }
+
+            if let Some(nb) = plan.as_network_boundary() {
+                let fresh_nb = nb.with_input_stage(nb.input_stage().clone())?;
+                return Ok(Transformed::yes(fresh_nb));
             }
             // we are explicitly not retransforming the entire plan. if other operators cause shared state errors they will error out.
             Ok(Transformed::no(plan))

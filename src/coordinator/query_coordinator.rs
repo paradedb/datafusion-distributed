@@ -12,8 +12,8 @@ use crate::work_unit_feed::WorkUnitFeedRegistry;
 use crate::work_unit_feed::{build_work_unit_batch_msg, set_work_unit_send_time};
 use crate::{
     CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedTaskContext,
-    DistributedWorkUnitFeedContext, LoadInfo, LocalWorkerContext, MaybeEncoded, SetPlanRequest,
-    TaskCompletedDynamicFilters, TaskKey, TaskMetrics, WorkUnitFeedDeclaration,
+    DistributedWorkUnitFeedContext, LoadInfo, LocalWorkerContext, MaybeEncoded, NetworkBoundaryExt,
+    SetPlanRequest, TaskCompletedDynamicFilters, TaskKey, TaskMetrics, WorkUnitFeedDeclaration,
     WorkerToCoordinatorMsg, get_distributed_channel_resolver,
 };
 use datafusion::common::DataFusionError;
@@ -394,6 +394,11 @@ impl<'a> StageCoordinator<'a> {
             if let Some(dle) = plan.downcast_ref::<DistributedLeafExec>() {
                 let specialized = dle.to_task_specialized(d_ctx.task_index);
                 return Ok(Transformed::yes(specialized));
+            }
+
+            if let Some(nb) = plan.as_network_boundary() {
+                let fresh_nb = nb.with_input_stage(nb.input_stage().clone())?;
+                return Ok(Transformed::yes(fresh_nb));
             }
 
             Ok(Transformed::no(plan))

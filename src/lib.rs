@@ -39,6 +39,10 @@ pub mod test_utils;
 #[cfg(feature = "grpc")]
 pub use protocol::grpc;
 
+/// The worker-protocol prost message types, independent of any transport. A non-gRPC transport
+/// reaches for these to speak the same wire shape the gRPC path serializes.
+pub use protocol::generated::worker as proto;
+
 pub use codec::DistributedCodec;
 pub use worker_resolver::{WorkerResolver, get_distributed_worker_resolver};
 
@@ -53,11 +57,12 @@ pub use stage::{
     DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
 };
 pub use work_unit_feed::{
-    DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
+    DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto,
+    WorkUnitFeedProvider, set_received_time,
 };
 pub use worker::{
     DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt, TaskData,
-    Worker, WorkerQueryContext, WorkerSessionBuilder,
+    Worker, WorkerQueryContext, WorkerSessionBuilder, collect_plan_metrics_protos,
 };
 
 #[cfg(any(feature = "integration", test))]

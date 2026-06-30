@@ -43,6 +43,9 @@ pub fn df_metrics_set_to_proto(
 }
 
 /// metrics_set_proto_to_df converts a [pb::MetricsSet] to a [MetricsSet].
+// The decode direction has no caller when `grpc` is off: the gRPC client consumes it, and so will a
+// push transport that receives metrics frames.
+#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
 pub fn metrics_set_proto_to_df(
     metrics_set_proto: &pb::MetricsSet,
 ) -> Result<MetricsSet, DataFusionError> {
@@ -283,6 +286,7 @@ pub fn df_metric_to_proto(metric: Arc<Metric>) -> Result<pb::Metric, DataFusionE
 }
 
 /// metric_proto_to_df converts a `pb::Metric` to a `Metric`. It consumes the pb::Metric.
+#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
 pub fn metric_proto_to_df(metric: pb::Metric) -> Result<Arc<Metric>, DataFusionError> {
     let partition = metric.partition.map(|p| p as usize);
     let labels = metric

@@ -539,6 +539,7 @@ pub struct MaxGauge {
     pub value: u64,
 }
 /// Generated client implementations.
+#[cfg(feature = "grpc")]
 pub mod worker_service_client {
     #![allow(
         unused_variables,
@@ -688,6 +689,7 @@ pub mod worker_service_client {
     }
 }
 /// Generated server implementations.
+#[cfg(feature = "grpc")]
 pub mod worker_service_server {
     #![allow(
         unused_variables,

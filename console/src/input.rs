@@ -130,25 +130,21 @@ fn handle_worker_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Tab => {
             app.current_view = View::ClusterOverview;
         }
-        KeyCode::Left | KeyCode::Char('h') => {
+        KeyCode::Left | KeyCode::Char('h') if !app.workers.is_empty() => {
             // Previous worker
-            if !app.workers.is_empty() {
-                if app.worker_state.worker_idx == 0 {
-                    app.worker_state.worker_idx = app.workers.len() - 1;
-                } else {
-                    app.worker_state.worker_idx -= 1;
-                }
-                app.worker_state.active_table = Default::default();
-                app.worker_state.completed_table = Default::default();
+            if app.worker_state.worker_idx == 0 {
+                app.worker_state.worker_idx = app.workers.len() - 1;
+            } else {
+                app.worker_state.worker_idx -= 1;
             }
+            app.worker_state.active_table = Default::default();
+            app.worker_state.completed_table = Default::default();
         }
-        KeyCode::Right | KeyCode::Char('l') => {
+        KeyCode::Right | KeyCode::Char('l') if !app.workers.is_empty() => {
             // Next worker
-            if !app.workers.is_empty() {
-                app.worker_state.worker_idx = (app.worker_state.worker_idx + 1) % app.workers.len();
-                app.worker_state.active_table = Default::default();
-                app.worker_state.completed_table = Default::default();
-            }
+            app.worker_state.worker_idx = (app.worker_state.worker_idx + 1) % app.workers.len();
+            app.worker_state.active_table = Default::default();
+            app.worker_state.completed_table = Default::default();
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let worker = &app.workers[app.worker_state.worker_idx];

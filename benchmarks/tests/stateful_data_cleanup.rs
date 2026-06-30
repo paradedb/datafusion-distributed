@@ -1,4 +1,4 @@
-#[cfg(all(feature = "integration", feature = "tpch", test))]
+#[cfg(all(feature = "tpch", test))]
 mod tests {
     use datafusion::common::{Result, instant::Instant};
     use datafusion::physical_plan::execute_stream;

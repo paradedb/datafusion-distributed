@@ -65,7 +65,7 @@ pub use worker::{
     Worker, WorkerQueryContext, WorkerSessionBuilder, collect_plan_metrics_protos,
 };
 
-#[cfg(any(feature = "integration", test))]
+#[cfg(all(feature = "grpc", any(feature = "integration", test)))]
 pub use execution_plans::benchmarks::{
     LocalRepartitionBench, LocalRepartitionFixture, LocalRepartitionMode, ShuffleBench,
     ShuffleFixture, TransportBench, TransportBenchMode, TransportFixture,

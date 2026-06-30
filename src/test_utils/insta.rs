@@ -18,6 +18,7 @@ pub fn settings() -> insta::Settings {
     let cwd = env::current_dir().unwrap();
     let cwd = cwd.to_str().unwrap();
     settings.add_filter(cwd.trim_start_matches("/"), "");
+    settings.add_filter(env!("CARGO_MANIFEST_DIR").trim_start_matches("/"), "");
     settings.add_filter(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         "UUID",

@@ -1,4 +1,4 @@
-#[cfg(all(feature = "integration", feature = "tpch", test))]
+#[cfg(all(feature = "tpch", test))]
 mod tests {
     use datafusion::physical_plan::execute_stream;
     use datafusion::prelude::SessionContext;
@@ -209,7 +209,6 @@ mod tests {
             scale_factor: sf,
             layout: ParquetLayout {
                 max_file_size,
-                sorted: true,
                 ..ParquetLayout::default()
             },
         };

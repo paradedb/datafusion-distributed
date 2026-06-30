@@ -2,6 +2,7 @@ use arrow::{
     array::{Int64Array, RecordBatch, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
+use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::{
@@ -25,7 +26,6 @@ use futures::stream;
 use prost::Message;
 use std::{fmt::Formatter, sync::Arc};
 use tokio::sync::Mutex;
-use tonic::async_trait;
 use url::Url;
 
 use crate::{

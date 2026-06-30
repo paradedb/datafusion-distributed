@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let proto_dir = repo_root.join("src/protocol/grpc");
     let proto_file = proto_dir.join("worker.proto");
-    let out_dir = repo_root.join("src/protocol/grpc/generated");
+    let out_dir = repo_root.join("src/protocol/generated");
 
     fs::create_dir_all(&out_dir)?;
 

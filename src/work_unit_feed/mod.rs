@@ -9,6 +9,9 @@ pub(crate) use remote_work_unit_feed::{
     RemoteWorkUnitFeedRegistry, build_work_unit_batch_msg, set_work_unit_received_time,
     set_work_unit_send_time,
 };
+// Re-exported for an out-of-crate transport that consumes it downstream; unused on this branch.
+#[allow(unused_imports)]
+pub(crate) use remote_work_unit_feed::RemoteWorkUnitFeedTxs;
 pub(crate) use work_unit_feed_registry::{WorkUnitFeedRegistry, set_distributed_work_unit_feed};
 
 pub use remote_work_unit_feed::set_received_time;

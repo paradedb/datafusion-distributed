@@ -11,6 +11,9 @@ mod execution_plans;
 mod metrics;
 mod passthrough_headers;
 mod protocol;
+// Not feature-gated: the shared-memory mesh is the no-gRPC transport, so it has to build in both
+// the `grpc`-on and `grpc`-off configs.
+pub mod shm;
 mod stage;
 mod work_unit_feed;
 mod worker;
@@ -48,6 +51,10 @@ pub use protocol::generated::worker as proto;
 
 pub use codec::DistributedCodec;
 pub use dispatch_plan_source::{DispatchPlanSource, get_distributed_dispatch_plan_source};
+// The producer-side sink traits live in `shm` because only a push-based transport produces through
+// them; re-exported at the crate root so `crate::PartitionSink` resolves the way the shm core spells
+// it.
+pub use shm::{PartitionSink, WorkerSink};
 pub use worker_resolver::{WorkerResolver, get_distributed_worker_resolver};
 
 /// TODO: do not expose this yet.

@@ -80,8 +80,8 @@ pub struct LoadInfo {
     /// The amount of rows that were pulled from leaf nodes while this partition was sampling data.
     #[prost(uint64, tag = "8")]
     pub rows_pulled_from_leaf: u64,
-    /// Whether the sampled partition stream reached end-of-stream by the time this LoadInfo was
-    /// captured.
+    /// Whether the sampled partition stream reached end-of-stream (i.e. the partition finished
+    /// producing all of its output) by the time this LoadInfo was captured.
     #[prost(bool, tag = "9")]
     pub reached_eos: bool,
 }
@@ -474,6 +474,7 @@ pub struct MaxGauge {
     pub value: u64,
 }
 /// Generated client implementations.
+#[cfg(feature = "grpc")]
 pub mod worker_service_client {
     #![allow(
         unused_variables,
@@ -623,6 +624,7 @@ pub mod worker_service_client {
     }
 }
 /// Generated server implementations.
+#[cfg(feature = "grpc")]
 pub mod worker_service_server {
     #![allow(
         unused_variables,

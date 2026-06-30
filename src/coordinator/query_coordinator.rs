@@ -24,7 +24,9 @@ use datafusion::physical_expr_common::metrics::{ExecutionPlanMetricsSet, Label, 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::Count;
 use datafusion::prelude::SessionConfig;
-use datafusion_proto::physical_plan::{AsExecutionPlan, DefaultPhysicalProtoConverter};
+use datafusion_proto::physical_plan::{
+    AsExecutionPlan, DefaultPhysicalProtoConverter, PhysicalPlanNodeExt,
+};
 use datafusion_proto::protobuf;
 use futures::{Stream, StreamExt, TryStreamExt};
 use std::ops::DerefMut;

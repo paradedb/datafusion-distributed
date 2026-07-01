@@ -220,7 +220,9 @@ pub fn collect_task_metrics(
                 task_count,
             },
         ),
-        task_metrics: None,
+        // This path has no task-level stamps, but the decoder requires the field present, so report
+        // an empty set rather than `None`.
+        task_metrics: Some(pb::MetricsSet::default()),
     }
 }
 

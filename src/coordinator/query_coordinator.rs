@@ -21,6 +21,7 @@ use crate::{
     DistributedTaskContext, DistributedWorkUnitFeedContext, LoadInfo, LocalWorkerContext,
     MaybeEncoded, NetworkBoundaryExt, SetPlanRequest, TaskCompletedDynamicFilters, TaskKey,
     TaskMetrics, WorkUnitFeedDeclaration, WorkerToCoordinatorMsg, get_distributed_channel_resolver,
+    get_distributed_dispatch_plan_source,
 };
 use datafusion::common::Result;
 use datafusion::common::instant::Instant;
@@ -164,19 +165,28 @@ impl<'a> StageCoordinator<'a> {
         let session_config = self.task_ctx.session_config();
 
         let TaskSpecializedPlan {
-            plan,
+            plan: specialized,
             work_unit_feed_declarations,
             dynamic_filter_remote_producer_ids,
         } = self.task_specialized_plan(task_i)?;
 
+        // An embedder can serialize the dispatch bytes for this stage itself (e.g. with a codec
+        // the config's extension point cannot express) instead of the coordinator encoding the
+        // plan. Either way the bytes describe `specialized`, the ready-to-run per-task plan.
         let task_key = TaskKey {
             query_id: self.query_id,
             stage_id: self.stage_id,
             task_number: task_i,
         };
+        let plan = match get_distributed_dispatch_plan_source(session_config)
+            .and_then(|source| source.dispatch_plan_proto(&task_key, &specialized))
+        {
+            Some(bytes) => MaybeEncoded::Encoded(bytes?),
+            None => MaybeEncoded::Decoded(Arc::clone(&specialized)),
+        };
 
         self.dynamic_filter_registry
-            .register_task(&plan, task_key)?;
+            .register_task(&specialized, task_key)?;
 
         let mut headers = get_config_extension_propagation_headers(session_config)?;
         headers.extend(get_passthrough_headers(session_config));
@@ -215,7 +225,7 @@ impl<'a> StageCoordinator<'a> {
             let set_plan_request = SetPlanRequest {
                 task_key,
                 task_count: self.task_count,
-                plan: MaybeEncoded::Decoded(Arc::clone(&plan)),
+                plan: plan.clone(),
                 dynamic_filter_remote_producer_ids: dynamic_filter_remote_producer_ids.clone(),
                 work_unit_feed_declarations: work_unit_feed_declarations.clone(),
                 target_worker_url: url.clone(),
@@ -261,7 +271,7 @@ impl<'a> StageCoordinator<'a> {
             task_ctx: self.task_ctx,
             metrics: self.metrics_set,
             worker_resolver: worker_resolver.as_ref(),
-            task_specialized_plan: &plan,
+            task_specialized_plan: &specialized,
             task_key,
             task_count: self.task_count,
             dialer: &dialer,

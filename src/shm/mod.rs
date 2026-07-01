@@ -44,6 +44,7 @@ use std::sync::atomic::AtomicBool;
 mod dsm;
 mod mesh;
 mod mpsc_ring;
+mod plan_codec;
 mod runtime;
 // Deferred: the self-hosting default transport was built on the removed `WorkerTransport`/
 // `WorkerDispatch` dispatch umbrella, which the `ChannelResolver` model has no analog for; its
@@ -58,6 +59,7 @@ mod transport;
 // Curated public surface an embedder consumes. The embedder allocates the shared buffer and
 // supplies the two extension points (`Wakeup`, `Interrupt`); everything else is built here.
 pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
+pub use plan_codec::ShmDiscardedPlanCodec;
 pub use runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
 pub use setup::{
     LeaderAttach, WorkerAttach, collect_task_metrics, dsm_region_bytes, install_work_unit_channels,

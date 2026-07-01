@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 ///    channel resolver and assigned to each task in each stage.
 /// 2. Encodes all the plans in protobuf format so that network boundary nodes can send them
 ///    over the wire.
-#[derive(Debug)]
 pub struct DistributedExec {
     /// Initial [ExecutionPlan] present before execution.
     /// - If the plan was distributed statically, this will be the final distributed plan with all
@@ -44,6 +43,19 @@ pub struct DistributedExec {
     /// Storage where metrics collected from workers at runtime will place their results as they
     /// finish their respective remote tasks.
     pub(crate) metrics_store: Option<Arc<MetricsStore>>,
+    /// Kept alive only on the [DistributedExec::prepare_in_process_plan] path. That path dispatches
+    /// every stage through the coordinator's background join-set, so the coordinator must outlive
+    /// the call for the embedder to drive the returned head stage; dropping it aborts the in-flight
+    /// dispatch.
+    in_process_coordinator: Mutex<Option<QueryCoordinator>>,
+}
+
+impl std::fmt::Debug for DistributedExec {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        f.debug_struct("DistributedExec")
+            .field("base_plan", &self.base_plan)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(super) struct PreparedPlan {
@@ -61,7 +73,15 @@ impl DistributedExec {
             head_stage: Arc::new(Mutex::new(None)),
             metrics: ExecutionPlanMetricsSet::new(),
             metrics_store: None,
+            in_process_coordinator: Mutex::new(None),
         }
+    }
+
+    /// The store where worker task metrics land at runtime, if metrics collection is enabled.
+    /// Exposed for the in-crate shm/embedder consumer, which files decoded worker metric frames
+    /// here before the per-task EXPLAIN rewrite.
+    pub fn metrics_store(&self) -> Option<Arc<MetricsStore>> {
+        self.metrics_store.clone()
     }
 
     /// Enables task metrics collection from remote workers.
@@ -134,6 +154,53 @@ impl DistributedExec {
             .clone()
             .ok_or_else(|| internal_datafusion_err!("No head stage found. Was execute() called?"))
     }
+
+    /// Routes and dispatches every stage through the registered channel resolver, then returns the
+    /// head stage for the caller to drive synchronously, skipping the background task that
+    /// [`ExecutionPlan::execute`] would otherwise spawn to drive it.
+    ///
+    /// This is the extension point for an embedder that owns the runtime and drives the head stage
+    /// itself (for example a shared-memory mesh). Unlike `execute`, no record-batch pump is spawned:
+    /// the caller pulls partitions off the returned plan directly.
+    ///
+    /// Dispatch on this branch is not synchronous: [`prepare_static_plan`] sends each stage through
+    /// the [`QueryCoordinator`]'s background join-set. That coordinator is stashed on `self` so the
+    /// dispatch is not aborted, which means the caller must keep this `DistributedExec` alive for as
+    /// long as it drives the head stage.
+    ///
+    /// Only static task planning is supported here; dynamic task counts need the async coordinator
+    /// path that `execute` runs.
+    pub fn prepare_in_process_plan(
+        &self,
+        ctx: &Arc<TaskContext>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
+        if d_cfg.dynamic_task_count {
+            return exec_err!(
+                "prepare_in_process_plan only supports static task planning; \
+                 dynamic task counts require the async coordinator path"
+            );
+        }
+
+        let query_coordinator =
+            QueryCoordinator::new(Arc::clone(ctx), &self.metrics, self.metrics_store.clone());
+        let result = prepare_static_plan(&query_coordinator, &self.base_plan)?;
+
+        self.plan_for_viz
+            .lock()
+            .expect("poisoned lock")
+            .replace(result.plan_for_viz);
+        self.head_stage
+            .lock()
+            .expect("poisoned lock")
+            .replace(Arc::clone(&result.head_stage));
+        self.in_process_coordinator
+            .lock()
+            .expect("poisoned lock")
+            .replace(query_coordinator);
+
+        Ok(result.head_stage)
+    }
 }
 
 impl DisplayAs for DistributedExec {
@@ -165,6 +232,7 @@ impl ExecutionPlan for DistributedExec {
             head_stage: Arc::new(Mutex::new(None)),
             metrics: self.metrics.clone(),
             metrics_store: self.metrics_store.clone(),
+            in_process_coordinator: Mutex::new(None),
         }))
     }
 

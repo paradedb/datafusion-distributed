@@ -58,6 +58,27 @@ pub fn metrics_set_proto_to_df(
     Ok(metrics_set)
 }
 
+/// Decode a wire [`pb::TaskMetrics`] into the in-memory [`crate::TaskMetrics`]. The no-gRPC push
+/// embedder receives metric frames as proto and files them into the plain metrics store, so it
+/// needs the decode direction without the gRPC client.
+pub fn decode_task_metrics(
+    task_metrics: pb::TaskMetrics,
+) -> Result<crate::TaskMetrics, DataFusionError> {
+    Ok(crate::TaskMetrics {
+        pre_order_plan_metrics: task_metrics
+            .pre_order_plan_metrics
+            .iter()
+            .map(metrics_set_proto_to_df)
+            .collect::<Result<_, _>>()?,
+        task_metrics: metrics_set_proto_to_df(
+            task_metrics
+                .task_metrics
+                .as_ref()
+                .ok_or_else(|| DataFusionError::Internal("Missing field 'task_metrics'".into()))?,
+        )?,
+    })
+}
+
 /// Custom metrics are not supported in proto conversion.
 const CUSTOM_METRICS_NOT_SUPPORTED: &str =
     "custom metrics are not supported in metrics proto conversion";

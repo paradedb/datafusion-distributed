@@ -23,7 +23,7 @@ pub use arrow_ipc::CompressionType;
 pub use coordinator::{DistributedExec, MetricsStore};
 pub use distributed_ext::{DistributedExt, DistributedGetterExt};
 pub use distributed_planner::{
-    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
+    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, PartitionRoute, SessionStateBuilderExt,
 };
 pub use events::{
     DesiredTaskCountEvent, DesiredTaskCountEventResponse, DesiredTaskCountHandler, RouteTasksEvent,

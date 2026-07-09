@@ -21,7 +21,7 @@ pub use arrow_ipc::CompressionType;
 pub use coordinator::DistributedExec;
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
-    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
+    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, PartitionRoute, SessionStateBuilderExt,
     TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,
 };
 pub use execution_plans::{

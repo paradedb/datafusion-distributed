@@ -17,7 +17,9 @@ impl MetricsStore {
         Self { tx, rx }
     }
 
-    pub(crate) fn insert(&self, key: TaskKey, metrics: TaskMetrics) {
+    // Public for the in-crate shm/embedder consumer, which files decoded worker metric frames into
+    // the executed plan's store before the per-task EXPLAIN rewrite reads it.
+    pub fn insert(&self, key: TaskKey, metrics: TaskMetrics) {
         self.tx.send_modify(|map| {
             map.insert(key, metrics);
         });

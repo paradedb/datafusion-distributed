@@ -2,7 +2,7 @@ use crate::common::require_one_child;
 use crate::coordinator::prepare_dynamic_plan::prepare_dynamic_plan;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
 use crate::coordinator::query_coordinator::QueryCoordinator;
-use crate::coordinator::store::{Store, task_keys_for_plan};
+use crate::coordinator::store::{MetricsStore, Store, task_keys_for_plan};
 use crate::dynamic_filtering::sever_dynamic_filter_relationships_in_plan_for_display;
 use crate::{DistributedConfig, TaskCompletedDynamicFilters, TaskKey, TaskMetrics};
 use datafusion::common::internal_datafusion_err;
@@ -67,6 +67,13 @@ impl DistributedExec {
             metrics_store: None,
             completed_dynamic_filter_store: None,
         }
+    }
+
+    /// The store where worker task metrics land at runtime, if metrics collection is enabled.
+    /// Exposed for a driver whose transport returns metrics out-of-band; it files decoded frames
+    /// here before the per-task EXPLAIN rewrite.
+    pub fn metrics_store(&self) -> Option<Arc<MetricsStore>> {
+        self.metrics_store.clone()
     }
 
     /// Enables task metrics collection from remote workers.

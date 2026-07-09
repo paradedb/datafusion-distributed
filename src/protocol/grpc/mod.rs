@@ -1,6 +1,5 @@
 mod channel_resolver;
 mod errors;
-mod metrics_proto;
 mod observability;
 mod spawn_select_all;
 mod worker_client;

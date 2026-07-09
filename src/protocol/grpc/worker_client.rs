@@ -1,17 +1,17 @@
 use super::channel_resolver::BoxCloneSyncChannel;
 use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
-use super::metrics_proto::metrics_set_proto_to_df;
 use crate::common::{RetryOutcome, serialize_uuid};
 use crate::grpc::errors::tonic_status_to_datafusion_error;
 use crate::grpc::on_drop_stream::on_drop_stream;
 use crate::protocol::generated::worker as pb;
 use crate::protocol::generated::worker::FlightAppMetadata;
+use crate::protocol::metrics_proto::decode_task_metrics;
 use crate::{
     BytesMetricExt, CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL,
     DistributedConfig, ExecuteTaskRequest, FirstLatencyMetric, GetWorkerInfoRequest,
     GetWorkerInfoResponse, LatencyMetricExt, LoadInfo, MaxLatencyMetric, MaybeEncoded,
     MinLatencyMetric, P50LatencyMetric, P95LatencyMetric, ProducerHead, SetPlanRequest,
-    TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, WorkUnitBatch,
+    TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, WorkUnitBatch,
     WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
 };
 use arrow_flight::FlightData;
@@ -570,22 +570,6 @@ fn decode_task_completed_dynamic_filters(
             .collect(),
     })
 }
-
-fn decode_task_metrics(task_metrics: pb::TaskMetrics) -> Result<TaskMetrics> {
-    Ok(TaskMetrics {
-        pre_order_plan_metrics: task_metrics
-            .pre_order_plan_metrics
-            .into_iter()
-            .map(|metrics_set| metrics_set_proto_to_df(&metrics_set))
-            .collect::<Result<_>>()?,
-        task_metrics: metrics_set_proto_to_df(
-            &task_metrics
-                .task_metrics
-                .ok_or_else(|| missing("task_metrics"))?,
-        )?,
-    })
-}
-
 fn decode_load_info(load_info: pb::LoadInfo) -> LoadInfo {
     LoadInfo {
         partition: load_info.partition as usize,

@@ -1,5 +1,5 @@
-use crate::TaskKey;
 use crate::distributed_planner::NetworkBoundaryExt;
+use crate::{TaskKey, TaskMetrics};
 use datafusion::common::HashMap;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::ExecutionPlan;
@@ -10,21 +10,31 @@ type StoreMap<T> = HashMap<TaskKey, T>;
 
 /// Stores task-scoped values and notifies waiters when entries change.
 #[derive(Debug, Clone)]
-pub(crate) struct Store<T> {
+pub struct Store<T> {
     tx: watch::Sender<StoreMap<T>>,
     rx: watch::Receiver<StoreMap<T>>,
 }
 
+/// The store where worker task metrics land at runtime.
+pub type MetricsStore = Store<TaskMetrics>;
+
 impl<T> Store<T> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (tx, rx) = watch::channel(HashMap::new());
         Self { tx, rx }
     }
 
-    pub(crate) fn insert(&self, key: TaskKey, value: T) {
+    pub fn insert(&self, key: TaskKey, value: T) {
         self.tx.send_modify(|map| {
             map.insert(key, value);
         });
+    }
+
+    pub fn get(&self, key: &TaskKey) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.rx.borrow().get(key).cloned()
     }
 
     pub(crate) async fn wait_for(&self, expected_keys: &[TaskKey]) -> StoreMap<T>

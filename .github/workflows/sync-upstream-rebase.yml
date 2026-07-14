@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   call-rebase:
-    uses: paradedb/actions/.github/workflows/reusable-rebase.yml@v4
+    uses: paradedb/actions/.github/workflows/reusable-rebase.yml@v5
     with:
       github_app_client_id: ${{ vars.PARADEDB_GITHUB_APP_CLIENT_ID }}
     secrets:

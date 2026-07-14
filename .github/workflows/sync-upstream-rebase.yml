@@ -17,5 +17,5 @@ concurrency:
 
 jobs:
   call-rebase:
-    uses: paradedb/actions/.github/workflows/reusable-rebase.yml@v2
+    uses: paradedb/actions/.github/workflows/reusable-rebase.yml@v3
     secrets: inherit

@@ -1,0 +1,26 @@
+# workflows/sync-promote-branch.yml
+#
+# Promote Target Patch Branch to Main
+# Promote a resolved target-patch-* branch to main after manual approval and CI validation.
+
+name: Promote Target Patch Branch to Main
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: "Branch name to promote (must match target-patch-*)"
+        required: true
+        type: string
+
+concurrency:
+  group: promote-branch
+  cancel-in-progress: false
+
+jobs:
+  call-promote:
+    uses: paradedb/actions/.github/workflows/reusable-promote.yml@v2
+    with:
+      branch_name: ${{ inputs.branch_name }}
+      approvers: "philippemnoel,rebasedming,stuhood,mdashti"
+    secrets: inherit

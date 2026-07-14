@@ -19,8 +19,11 @@ concurrency:
 
 jobs:
   call-promote:
-    uses: paradedb/actions/.github/workflows/reusable-promote.yml@v3
+    uses: paradedb/actions/.github/workflows/reusable-promote.yml@v4
     with:
       branch_name: ${{ inputs.branch_name }}
       approvers: "philippemnoel,rebasedming,stuhood,mdashti"
-    secrets: inherit
+      github_app_client_id: ${{ vars.PARADEDB_GITHUB_APP_CLIENT_ID }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_GITHUB_CHANNEL_WEBHOOK_URL }}
+      PARADEDB_GITHUB_APP_PRIVATE_KEY: ${{ secrets.PARADEDB_GITHUB_APP_PRIVATE_KEY }}

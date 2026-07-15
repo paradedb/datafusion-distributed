@@ -1,5 +1,4 @@
-use crate::config_extension_ext::set_distributed_option_extension;
-use crate::{DistributedConfig, WorkUnit, WorkUnitFeed, WorkUnitFeedProvider};
+use crate::{WorkUnit, WorkUnitFeed, WorkUnitFeedProvider};
 use datafusion::common::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -113,21 +112,10 @@ where
     T::WorkUnit: 'static,
     F: Fn(&Arc<dyn ExecutionPlan>) -> Option<&WorkUnitFeed<T>> + Send + Sync + 'static,
 {
-    let opts = cfg.options_mut();
-    if let Some(distributed_cfg) = opts.extensions.get_mut::<DistributedConfig>() {
-        distributed_cfg
-            .__private_work_unit_feed_registry
-            .entries
-            .push(Arc::new(getter));
-    } else {
-        let mut registry = WorkUnitFeedRegistry::default();
-        registry.entries.push(Arc::new(getter));
-        set_distributed_option_extension(
-            cfg,
-            DistributedConfig {
-                __private_work_unit_feed_registry: registry,
-                ..Default::default()
-            },
-        )
-    }
+    let mut registry = cfg
+        .get_extension::<WorkUnitFeedRegistry>()
+        .map(|existing| existing.as_ref().clone())
+        .unwrap_or_default();
+    registry.entries.push(Arc::new(getter));
+    cfg.set_extension(Arc::new(registry));
 }

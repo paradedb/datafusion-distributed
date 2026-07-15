@@ -2,16 +2,18 @@ use crate::common::{TreeNodeExt, now_ns, task_ctx_with_extension};
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::MetricsStore;
 use crate::coordinator::latency_metric::LatencyMetric;
+use crate::distributed_planner::CombinedTaskEstimator;
 use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::stage::LocalStage;
+use crate::work_unit_feed::WorkUnitFeedRegistry;
 use crate::work_unit_feed::{build_work_unit_batch_msg, set_work_unit_send_time};
 use crate::{
     BytesCounterMetric, BytesMetricExt, CoordinatorToWorkerMsg,
-    DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedConfig,
-    DistributedTaskContext, DistributedWorkUnitFeedContext, LoadInfo, NetworkBoundaryExt,
-    SetPlanRequest, Stage, TaskEstimator, TaskKey, TaskRoutingContext, WorkUnitFeedDeclaration,
-    WorkerToCoordinatorMsg, get_distributed_channel_resolver, get_distributed_worker_resolver,
+    DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedTaskContext,
+    DistributedWorkUnitFeedContext, LoadInfo, NetworkBoundaryExt, SetPlanRequest, Stage,
+    TaskEstimator, TaskKey, TaskRoutingContext, WorkUnitFeedDeclaration, WorkerToCoordinatorMsg,
+    get_distributed_channel_resolver, get_distributed_worker_resolver,
 };
 use datafusion::common::DataFusionError;
 use datafusion::common::instant::Instant;
@@ -261,8 +263,9 @@ impl<'a> StageCoordinator<'a> {
         tx: UnboundedSender<CoordinatorToWorkerMsg>,
     ) -> Result<()> {
         let session_config = self.task_ctx.session_config();
-        let d_cfg = DistributedConfig::from_config_options(session_config.options())?;
-        let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
+        let wuf_registry = session_config
+            .get_extension::<WorkUnitFeedRegistry>()
+            .unwrap_or_default();
 
         let d_ctx = DistributedTaskContext {
             task_index: task_i,
@@ -333,8 +336,9 @@ impl<'a> StageCoordinator<'a> {
         task_i: usize,
     ) -> Result<(Arc<dyn ExecutionPlan>, Vec<WorkUnitFeedDeclaration>)> {
         let session_config = self.task_ctx.session_config();
-        let d_cfg = DistributedConfig::from_config_options(session_config.options())?;
-        let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
+        let wuf_registry = session_config
+            .get_extension::<WorkUnitFeedRegistry>()
+            .unwrap_or_default();
 
         let mut work_unit_feed_declarations = vec![];
         let d_ctx = DistributedTaskContext {
@@ -373,9 +377,8 @@ impl<'a> StageCoordinator<'a> {
     ///   [TaskEstimator::route_tasks] method.
     pub(super) fn routed_urls(&self) -> Result<Vec<Url>> {
         let session_config = self.task_ctx.session_config();
-        let d_cfg = DistributedConfig::from_config_options(session_config.options())?;
         let worker_resolver = get_distributed_worker_resolver(session_config)?;
-        let task_estimator = &d_cfg.__private_task_estimator;
+        let task_estimator = CombinedTaskEstimator::from_session_config(session_config);
 
         let routed_urls = match task_estimator.route_tasks(&TaskRoutingContext {
             task_ctx: Arc::clone(self.task_ctx),

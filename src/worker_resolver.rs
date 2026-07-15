@@ -1,5 +1,4 @@
 use crate::DistributedConfig;
-use crate::config_extension_ext::set_distributed_option_extension;
 use datafusion::common::{DataFusionError, exec_err, not_impl_err};
 use datafusion::prelude::SessionConfig;
 use std::any::Any;
@@ -25,29 +24,19 @@ pub(crate) fn set_distributed_worker_resolver(
     cfg: &mut SessionConfig,
     worker_resolver: impl WorkerResolver + 'static,
 ) {
-    let opts = cfg.options_mut();
-    let worker_resolver = WorkerResolverExtension(Arc::new(worker_resolver));
-    if let Some(distributed_cfg) = opts.extensions.get_mut::<DistributedConfig>() {
-        distributed_cfg.__private_worker_resolver = worker_resolver;
-    } else {
-        set_distributed_option_extension(
-            cfg,
-            DistributedConfig {
-                __private_worker_resolver: worker_resolver,
-                ..Default::default()
-            },
-        )
-    }
+    DistributedConfig::ensure_in_config(cfg);
+    cfg.set_extension(Arc::new(WorkerResolverExtension(Arc::new(worker_resolver))));
 }
 
+/// Gets the [WorkerResolver] from the [SessionConfig]'s extensions. Typically called inside
+/// [TaskEstimator::route_tasks] to resolve the worker URLs available for distributed tasks.
 pub fn get_distributed_worker_resolver(
     cfg: &SessionConfig,
 ) -> Result<Arc<dyn WorkerResolver>, DataFusionError> {
-    let opts = cfg.options();
-    let Some(distributed_cfg) = opts.extensions.get::<DistributedConfig>() else {
+    let Some(ext) = cfg.get_extension::<WorkerResolverExtension>() else {
         return exec_err!("WorkerResolver not present in the session config");
     };
-    Ok(Arc::clone(&distributed_cfg.__private_worker_resolver.0))
+    Ok(Arc::clone(&ext.0))
 }
 
 #[derive(Clone)]
@@ -62,6 +51,11 @@ impl WorkerResolverExtension {
             }
         }
         Self(Arc::new(NotImplementedWorkerResolver))
+    }
+
+    pub(crate) fn from_session_config(cfg: &SessionConfig) -> Arc<Self> {
+        cfg.get_extension::<WorkerResolverExtension>()
+            .unwrap_or_else(|| Arc::new(Self::not_implemented()))
     }
 }
 

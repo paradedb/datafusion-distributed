@@ -1,5 +1,4 @@
 use crate::DistributedConfig;
-use crate::config_extension_ext::set_distributed_option_extension;
 use crate::execution_plans::DistributedLeafExec;
 use TaskCountAnnotation::*;
 use datafusion::catalog::memory::DataSourceExec;
@@ -206,23 +205,12 @@ pub(crate) fn set_distributed_task_estimator(
     cfg: &mut SessionConfig,
     estimator: impl TaskEstimator + Send + Sync + 'static,
 ) {
-    let opts = cfg.options_mut();
-    if let Some(distributed_cfg) = opts.extensions.get_mut::<DistributedConfig>() {
-        distributed_cfg
-            .__private_task_estimator
-            .user_provided
-            .push(Arc::new(estimator));
-    } else {
-        let mut estimators = CombinedTaskEstimator::default();
-        estimators.user_provided.push(Arc::new(estimator));
-        set_distributed_option_extension(
-            cfg,
-            DistributedConfig {
-                __private_task_estimator: estimators,
-                ..Default::default()
-            },
-        )
-    }
+    let mut combined = cfg
+        .get_extension::<CombinedTaskEstimator>()
+        .map(|existing| existing.as_ref().clone())
+        .unwrap_or_default();
+    combined.user_provided.push(Arc::new(estimator));
+    cfg.set_extension(Arc::new(combined));
 }
 
 /// [TaskEstimator] implementation that acts on [DataSourceExec] nodes that contain
@@ -331,6 +319,13 @@ pub(crate) struct CombinedTaskEstimator {
     pub(crate) user_provided: Vec<Arc<dyn TaskEstimator + Send + Sync>>,
 }
 
+impl CombinedTaskEstimator {
+    pub(crate) fn from_session_config(cfg: &SessionConfig) -> Arc<Self> {
+        cfg.get_extension::<CombinedTaskEstimator>()
+            .unwrap_or_else(|| Arc::new(Self::default()))
+    }
+}
+
 impl TaskEstimator for CombinedTaskEstimator {
     fn task_estimation(
         &self,
@@ -388,9 +383,7 @@ impl TaskEstimator for CombinedTaskEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver;
     use crate::test_utils::parquet::register_parquet_tables;
-    use crate::worker_resolver::WorkerResolverExtension;
     use datafusion::error::DataFusionError;
     use datafusion::prelude::SessionContext;
 
@@ -479,9 +472,6 @@ mod tests {
             cfg.execution.target_partitions = 1;
             let d_cfg = DistributedConfig {
                 file_scan_config_bytes_per_partition: 1,
-                __private_worker_resolver: WorkerResolverExtension(Arc::new(
-                    InMemoryWorkerResolver::new(3),
-                )),
                 ..Default::default()
             };
             cfg.extensions.insert(f(d_cfg));

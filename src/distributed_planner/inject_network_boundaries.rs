@@ -1,9 +1,11 @@
 use crate::TaskCountAnnotation::{Desired, Maximum};
+use crate::distributed_planner::{CombinedTaskEstimator, TaskEstimator};
 use crate::execution_plans::{ChildWeight, ChildrenIsolatorUnionExec};
 use crate::stage::LocalStage;
+use crate::worker_resolver::WorkerResolverExtension;
 use crate::{
     BroadcastExec, DistributedConfig, NetworkBoundaryExt, NetworkBroadcastExec,
-    NetworkCoalesceExec, NetworkShuffleExec, Stage, TaskCountAnnotation, TaskEstimator,
+    NetworkCoalesceExec, NetworkShuffleExec, Stage, TaskCountAnnotation,
 };
 use async_trait::async_trait;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -17,6 +19,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, PlanProperties};
+use datafusion::prelude::SessionConfig;
 use std::any::TypeId;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -136,11 +139,14 @@ use uuid::Uuid;
 pub(crate) async fn inject_network_boundaries(
     plan: Arc<dyn ExecutionPlan>,
     nb_builder: impl NetworkBoundaryBuilder + Send + Sync,
-    cfg: &ConfigOptions,
+    session_cfg: &SessionConfig,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let cfg = session_cfg.options();
     let ctx = InjectNetworkBoundaryContext {
         cfg,
         d_cfg: DistributedConfig::from_config_options(cfg)?,
+        worker_resolver: WorkerResolverExtension::from_session_config(session_cfg),
+        task_estimator: CombinedTaskEstimator::from_session_config(session_cfg),
         nb_builder: &nb_builder,
         task_counts: &Mutex::new(HashMap::new()),
         query_id: Uuid::new_v4(),
@@ -155,6 +161,8 @@ pub(crate) struct InjectNetworkBoundaryContext<'a> {
     pub(crate) d_cfg: &'a DistributedConfig,
 
     cfg: &'a ConfigOptions,
+    worker_resolver: Arc<WorkerResolverExtension>,
+    task_estimator: Arc<CombinedTaskEstimator>,
     nb_builder: &'a (dyn NetworkBoundaryBuilder + Send + Sync),
     task_counts: &'a Mutex<HashMap<usize, TaskCountAnnotation>>,
     query_id: Uuid,
@@ -164,13 +172,7 @@ pub(crate) struct InjectNetworkBoundaryContext<'a> {
 impl<'a> InjectNetworkBoundaryContext<'a> {
     pub(crate) fn max_tasks(&self) -> Result<usize> {
         Ok(match self.d_cfg.max_tasks_per_stage {
-            0 => self
-                .d_cfg
-                .__private_worker_resolver
-                .0
-                .get_urls()?
-                .len()
-                .max(1),
+            0 => self.worker_resolver.0.get_urls()?.len().max(1),
             v => v,
         })
     }
@@ -228,7 +230,7 @@ async fn _inject_network_boundaries(
     nb_ctx: &InjectNetworkBoundaryContext<'_>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let broadcast_joins_enabled = nb_ctx.d_cfg.broadcast_joins;
-    let estimator = &nb_ctx.d_cfg.__private_task_estimator;
+    let estimator = nb_ctx.task_estimator.as_ref();
 
     if plan.children().is_empty() {
         // This is a leaf node, maybe a DataSourceExec, or maybe something else custom from the
@@ -416,7 +418,7 @@ impl InjectNetworkBoundaryContext<'_> {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Handle leaf nodes.
         if plan.children().is_empty() {
-            let scaled_up = self.d_cfg.__private_task_estimator.scale_up_leaf_node(
+            let scaled_up = self.task_estimator.as_ref().scale_up_leaf_node(
                 plan,
                 task_count.as_usize(),
                 self.cfg,
@@ -1267,6 +1269,8 @@ mod tests {
         let network_boundaries_ctx = InjectNetworkBoundaryContext {
             cfg: session_config.options(),
             d_cfg: DistributedConfig::from_config_options(session_config.options()).unwrap(),
+            worker_resolver: WorkerResolverExtension::from_session_config(&session_config),
+            task_estimator: CombinedTaskEstimator::from_session_config(&session_config),
             task_counts: &Mutex::new(HashMap::new()),
             query_id: Uuid::new_v4(),
             stage_id: &AtomicUsize::new(1),

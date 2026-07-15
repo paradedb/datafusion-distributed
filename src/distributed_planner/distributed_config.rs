@@ -1,13 +1,8 @@
-use crate::distributed_planner::task_estimator::CombinedTaskEstimator;
-use crate::protocol::ChannelResolverExtension;
-use crate::work_unit_feed::WorkUnitFeedRegistry;
-use crate::worker_resolver::WorkerResolverExtension;
-use crate::{TaskEstimator, WorkerResolver};
-use datafusion::common::{DataFusionError, extensions_options, not_impl_err, plan_err};
-use datafusion::config::{ConfigExtension, ConfigField, ConfigOptions, Visit};
+use crate::config_extension_ext::set_distributed_option_extension;
+use datafusion::common::{DataFusionError, extensions_options, plan_err};
+use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionConfig;
-use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 extensions_options! {
@@ -76,18 +71,6 @@ extensions_options! {
         /// If `dynamic_task_count` is enabled, this value is the amount of bytes/second each
         /// partition is expected to handle. Lower values will result in greater parallelism.
         pub bytes_per_partition_per_second: usize, default = 16 * 1024 * 1024
-        /// Collection of [TaskEstimator]s that will be applied to leaf nodes in order to
-        /// estimate how many tasks should be spawned for the [Stage] containing the leaf node.
-        pub(crate) __private_task_estimator: CombinedTaskEstimator, default = CombinedTaskEstimator::default()
-        /// [ChannelResolver] implementation that tells the distributed planner information about
-        /// the available workers ready to execute distributed tasks.
-        pub(crate) __private_channel_resolver: ChannelResolverExtension, default = ChannelResolverExtension::default()
-        /// [WorkerResolver] implementation that tells the distributed planner information about
-        /// the available workers ready to execute distributed tasks.
-        pub(crate) __private_worker_resolver: WorkerResolverExtension, default = WorkerResolverExtension::not_implemented()
-        /// [WorkUnitFeedRegistry] that contains a set of getters that, applied to each node in a
-        /// plan, will return the [crate::WorkUnitFeed]s present in all nodes.
-        pub(crate) __private_work_unit_feed_registry: WorkUnitFeedRegistry, default = WorkUnitFeedRegistry::default()
     }
 }
 
@@ -100,19 +83,6 @@ fn cardinality_task_count_factor_default() -> f64 {
 }
 
 impl DistributedConfig {
-    /// Appends a [TaskEstimator] to the list. [TaskEstimator] will be executed sequentially in
-    /// order on leaf nodes, and the first one to provide a value is the one that gets to decide
-    /// how many tasks are used for that [Stage].
-    pub fn with_task_estimator(
-        mut self,
-        task_estimator: impl TaskEstimator + Send + Sync + 'static,
-    ) -> Self {
-        self.__private_task_estimator
-            .user_provided
-            .push(Arc::new(task_estimator));
-        self
-    }
-
     /// Gets the [DistributedConfig] from the [ConfigOptions]'s extensions.
     pub fn from_config_options(cfg: &ConfigOptions) -> Result<&Self, DataFusionError> {
         let Some(distributed_cfg) = cfg.extensions.get::<DistributedConfig>() else {
@@ -120,7 +90,6 @@ impl DistributedConfig {
         };
         Ok(distributed_cfg)
     }
-
     /// Gets the [DistributedConfig] from the [ConfigOptions]'s extensions.
     pub fn from_config_options_mut(cfg: &mut ConfigOptions) -> Result<&mut Self, DataFusionError> {
         let Some(distributed_cfg) = cfg.extensions.get_mut::<DistributedConfig>() else {
@@ -139,84 +108,20 @@ impl DistributedConfig {
         Self::from_session_config(ctx.session_config())
     }
 
-    /// Returns the [WorkerResolver] currently in scope for this [DistributedConfig].
-    pub fn worker_resolver(&self) -> &Arc<dyn WorkerResolver> {
-        &self.__private_worker_resolver.0
+    /// Ensures that the [DistributedConfig] is present in the [SessionConfig]'s [ConfigOptions].
+    /// If not, it will insert a default [DistributedConfig] into the [SessionConfig]'s [ConfigOptions].
+    pub(crate) fn ensure_in_config(cfg: &mut SessionConfig) {
+        if cfg
+            .options()
+            .extensions
+            .get::<DistributedConfig>()
+            .is_none()
+        {
+            set_distributed_option_extension(cfg, DistributedConfig::default())
+        }
     }
 }
 
 impl ConfigExtension for DistributedConfig {
     const PREFIX: &'static str = "distributed";
-}
-
-// FIXME: Ideally, both ChannelResolverExtension and TaskEstimators would be passed as
-//  extensions in SessionConfig's AnyMap instead of the ConfigOptions. However, we need
-//  to pass this as ConfigOptions as we need these two fields to be present during
-//  planning in the DistributedQueryPlanner, and the signature of the create_physical_plan()
-//  method there accepts a SessionState which only provides ConfigOptions.
-//  The following PR addresses this: https://github.com/apache/datafusion/pull/18168
-//  but it still has not been accepted or merged.
-//  Because of this, all the boilerplate trait implementations below are needed.
-impl ConfigField for ChannelResolverExtension {
-    fn visit<V: Visit>(&self, _: &mut V, _: &str, _: &'static str) {
-        // nothing to do.
-    }
-
-    fn set(&mut self, _: &str, _: &str) -> datafusion::common::Result<()> {
-        not_impl_err!("Not implemented")
-    }
-}
-
-impl Debug for ChannelResolverExtension {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ChannelResolverExtension")
-    }
-}
-
-impl ConfigField for WorkerResolverExtension {
-    fn visit<V: Visit>(&self, _: &mut V, _: &str, _: &'static str) {
-        // nothing to do.
-    }
-
-    fn set(&mut self, _: &str, _: &str) -> datafusion::common::Result<()> {
-        not_impl_err!("Not implemented")
-    }
-}
-
-impl Debug for WorkerResolverExtension {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WorkerResolverExtension")
-    }
-}
-
-impl ConfigField for CombinedTaskEstimator {
-    fn visit<V: Visit>(&self, _: &mut V, _: &str, _: &'static str) {
-        //nothing to do.
-    }
-
-    fn set(&mut self, _: &str, _: &str) -> Result<(), DataFusionError> {
-        not_impl_err!("not implemented")
-    }
-}
-
-impl Debug for CombinedTaskEstimator {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TaskEstimators")
-    }
-}
-
-impl ConfigField for WorkUnitFeedRegistry {
-    fn visit<V: Visit>(&self, _: &mut V, _: &str, _: &'static str) {
-        //nothing to do.
-    }
-
-    fn set(&mut self, _: &str, _: &str) -> Result<(), DataFusionError> {
-        not_impl_err!("not implemented")
-    }
-}
-
-impl Debug for WorkUnitFeedRegistry {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WorkUnitFeedRegistry")
-    }
 }

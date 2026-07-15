@@ -24,10 +24,9 @@ use url::Url;
 
 use crate::execution_plans::DistributedLeafExec;
 use crate::worker::LocalWorkerContext;
-use crate::{
-    DistributedConfig, DistributedTaskContext, TaskEstimation, TaskEstimator, WorkerResolver,
-};
+use crate::{DistributedTaskContext, TaskEstimation, TaskEstimator, WorkerResolver};
 
+use crate::distributed_ext::DistributedGetterExt;
 // Table function that creates a `URLEmitterExec` for testing task routing.
 #[derive(Debug)]
 pub struct URLEmitterFunction;
@@ -291,8 +290,11 @@ impl TaskEstimator for URLEmitterTaskEstimator {
     }
 
     fn route_tasks(&self, routing_ctx: &crate::TaskRoutingContext<'_>) -> Result<Option<Vec<Url>>> {
-        let d_cfg = DistributedConfig::from_task_context(&routing_ctx.task_ctx)?;
-        let mut routed_urls = d_cfg.worker_resolver().get_urls()?;
+        let mut routed_urls = routing_ctx
+            .task_ctx
+            .session_config()
+            .get_distributed_worker_resolver()?
+            .get_urls()?;
 
         // Trivial routing policy: Assign tasks to URLs in reverse order.
         routed_urls.reverse();

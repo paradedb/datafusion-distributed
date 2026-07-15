@@ -18,5 +18,5 @@ pub(crate) use network_boundary::ProducerHead;
 pub use network_boundary::{NetworkBoundary, NetworkBoundaryExt};
 pub use session_state_builder_ext::SessionStateBuilderExt;
 pub(crate) use statistics::calculate_cost;
-pub(crate) use task_estimator::set_distributed_task_estimator;
+pub(crate) use task_estimator::{CombinedTaskEstimator, set_distributed_task_estimator};
 pub use task_estimator::{TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext};

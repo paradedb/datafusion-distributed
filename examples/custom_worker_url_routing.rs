@@ -41,8 +41,8 @@ use datafusion_distributed::test_utils::localhost::{
     LocalHostWorkerResolver, spawn_worker_service,
 };
 use datafusion_distributed::{
-    DistributedConfig, DistributedExt, DistributedLeafExec, SessionStateBuilderExt, TaskEstimation,
-    TaskEstimator, TaskRoutingContext, WorkerQueryContext, display_plan_ascii,
+    DistributedExt, DistributedGetterExt, DistributedLeafExec, SessionStateBuilderExt,
+    TaskEstimation, TaskEstimator, TaskRoutingContext, WorkerQueryContext, display_plan_ascii,
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf;
@@ -219,8 +219,11 @@ impl TaskEstimator for CachedFileScanConfigTaskEstimator {
     }
 
     fn route_tasks(&self, ctx: &TaskRoutingContext<'_>) -> Result<Option<Vec<Url>>> {
-        let d_cfg = DistributedConfig::from_task_context(&ctx.task_ctx)?;
-        let available_urls = d_cfg.worker_resolver().get_urls()?;
+        let available_urls = ctx
+            .task_ctx
+            .session_config()
+            .get_distributed_worker_resolver()?
+            .get_urls()?;
 
         let mut routed = None;
         ctx.plan.apply(|node| {

@@ -18,7 +18,7 @@ mod worker_resolver;
 #[cfg(feature = "grpc")]
 pub use arrow_ipc::CompressionType;
 pub use coordinator::DistributedExec;
-pub use distributed_ext::DistributedExt;
+pub use distributed_ext::{DistributedExt, DistributedGetterExt};
 pub use distributed_planner::{
     DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,
     TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext,

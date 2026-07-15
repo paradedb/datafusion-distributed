@@ -1,3 +1,4 @@
+use crate::distributed_planner::DistributedConfig;
 use crate::distributed_planner::distributed_query_planner::DistributedQueryPlanner;
 use datafusion::execution::SessionStateBuilder;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ pub trait SessionStateBuilderExt {
 
 impl SessionStateBuilderExt for SessionStateBuilder {
     fn with_distributed_planner(mut self) -> Self {
+        DistributedConfig::ensure_in_config(self.config().get_or_insert_default());
         self.config()
             .get_or_insert_default()
             .options_mut()

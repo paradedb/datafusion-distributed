@@ -663,6 +663,15 @@ impl DsmMpscSender {
         }
     }
 
+    /// Largest frame `try_send` can accept: every slot's payload capacity combined. Senders
+    /// consult this before encoding, so an oversized batch can be split to fit instead of
+    /// erroring with `MessageTooLarge`.
+    pub(super) fn max_frame_bytes(&self) -> usize {
+        let header = unsafe { self.ring.as_ref() };
+        (header.slot_capacity as usize).saturating_sub(SLOT_HEADER_BYTES)
+            * header.ring_size as usize
+    }
+
     /// Wake the registered consumer, if any. Reads the token the consumer stored via
     /// [`DsmMpscReceiver::set_receiver`] and hands it to the injected [`Wakeup`]; skips when no
     /// consumer is registered ([`NO_RECEIVER_TOKEN`]).

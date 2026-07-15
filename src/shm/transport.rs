@@ -33,7 +33,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use datafusion::common::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{
+    ArrayRef, BinaryViewArray, RecordBatch, StringViewArray, UInt64Array,
+};
+use datafusion::arrow::compute::take;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::DataFusionError;
@@ -373,6 +377,45 @@ fn encode_frame_into(
     Ok(())
 }
 
+/// Copy `len` rows starting at `offset` into fresh, tightly-packed arrays. A plain
+/// `RecordBatch::slice` keeps the original backing buffers, and arrow-ipc writes a sliced
+/// variable-length array's values buffer whole, which is exactly the ballooning the oversized
+/// send path exists to undo. `take` materializes only the selected rows; view arrays
+/// additionally need a `gc`, because `take` copies their views but keeps referencing the
+/// shared data blocks, so the encoded size wouldn't shrink no matter how few rows remain.
+fn compact_rows(
+    batch: &RecordBatch,
+    offset: usize,
+    len: usize,
+) -> Result<RecordBatch, DataFusionError> {
+    let indices = UInt64Array::from_iter_values(offset as u64..(offset + len) as u64);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            let taken = take(column.as_ref(), &indices, None)?;
+            Ok(match taken.data_type() {
+                DataType::Utf8View => Arc::new(
+                    taken
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .unwrap()
+                        .gc(),
+                ) as ArrayRef,
+                DataType::BinaryView => Arc::new(
+                    taken
+                        .as_any()
+                        .downcast_ref::<BinaryViewArray>()
+                        .unwrap()
+                        .gc(),
+                ) as ArrayRef,
+                _ => taken,
+            })
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
 /// Serialize a payload-less [`MppFrameKind::Eof`] frame for `(stage_id, partition)`
 /// into `buf`. The shm_mq peer reads this as a 16-byte message and routes it to
 /// the channel buffer's source-done counter without touching Arrow IPC.
@@ -634,6 +677,13 @@ pub(crate) trait BatchChannelSender: Send + Sync {
     /// sibling task land a different payload mid-message and corrupt the queue. In-proc
     /// channels return a per-instance mutex too, just to keep the call sites uniform.
     fn send_lock(&self) -> &tokio::sync::Mutex<()>;
+
+    /// Largest single frame the channel accepts, when bounded. The batch send path splits
+    /// oversized batches to fit under it. `None` (the default, for in-proc channels) disables
+    /// splitting.
+    fn max_frame_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Pluggable "drain everything inbound" hook for [`MppSender`]'s cooperative send spin. The
@@ -909,7 +959,33 @@ impl MppSender {
         let t_enc = Instant::now();
         encode_frame_into(self.header, batch, scratch)?;
         stats.encode += t_enc.elapsed();
-        self.spin_send_scratch(scratch, stats).await
+        let cap = self.channel.max_frame_bytes();
+        if cap.is_none_or(|cap| scratch.len() <= cap) {
+            return self.spin_send_scratch(scratch, stats).await;
+        }
+        let cap = cap.expect("bounded channel checked above");
+        // An over-cap frame usually means the batch carries offset slices of an upstream
+        // operator's accumulated state: arrow-ipc writes a sliced variable-length array's
+        // whole values buffer, so the frame balloons to the state's size no matter the row
+        // count. Compact the rows into fresh arrays and halve until every frame fits,
+        // depth-first left-to-right so row order survives for sorted streams. A single row
+        // that exceeds the ring still errors inside the channel with the raise-the-knob
+        // message.
+        let mut work = vec![(0usize, batch.num_rows())];
+        while let Some((offset, len)) = work.pop() {
+            let compacted = compact_rows(batch, offset, len)?;
+            let t_enc = Instant::now();
+            encode_frame_into(self.header, &compacted, scratch)?;
+            stats.encode += t_enc.elapsed();
+            if scratch.len() > cap && len > 1 {
+                let half = len / 2;
+                work.push((offset + half, len - half));
+                work.push((offset, half));
+                continue;
+            }
+            self.spin_send_scratch(scratch, stats).await?;
+        }
+        Ok(())
     }
 
     /// Push an already-encoded frame through the channel via the cooperative-drain spin (or the
@@ -1829,7 +1905,9 @@ pub(super) const SELF_LOOP_CAPACITY: usize = 1 << 20;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, Int64Array, StringArray, UInt64Array};
+    use datafusion::arrow::array::{
+        Int32Array, Int64Array, StringArray, StringViewArray, UInt64Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as StdArc;
     use std::thread;
@@ -2411,6 +2489,180 @@ mod tests {
             };
             assert_eq!(orig.num_rows(), decoded.num_rows());
         }
+    }
+
+    /// Bounded in-proc sink standing in for a DSM ring: rejects frames over `cap` the way
+    /// `try_send` does, records every accepted frame, and advertises the bound so the send
+    /// path's splitter engages.
+    struct BoundedSink {
+        cap: usize,
+        frames: Mutex<Vec<Vec<u8>>>,
+        send_lock: tokio::sync::Mutex<()>,
+    }
+
+    impl BoundedSink {
+        fn new(cap: usize) -> Arc<Self> {
+            Arc::new(Self {
+                cap,
+                frames: Mutex::new(Vec::new()),
+                send_lock: tokio::sync::Mutex::new(()),
+            })
+        }
+    }
+
+    impl BatchChannelSender for BoundedSink {
+        fn send_bytes(&self, bytes: &[u8]) -> Result<(), DataFusionError> {
+            if bytes.len() > self.cap {
+                return Err(DataFusionError::Execution(
+                    "mpp: DSM MPSC frame exceeds the entire ring capacity \
+                     (raise the embedder's queue-size knob)"
+                        .into(),
+                ));
+            }
+            self.frames.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn send_lock(&self) -> &tokio::sync::Mutex<()> {
+            &self.send_lock
+        }
+
+        fn max_frame_bytes(&self) -> Option<usize> {
+            Some(self.cap)
+        }
+    }
+
+    /// `rows` of ~1 KiB unique strings, so slices drag a large values buffer through
+    /// arrow-ipc.
+    fn wide_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let strings = StringArray::from_iter_values(
+            (0..rows).map(|i| format!("{i:06}-{}", "x".repeat(1024))),
+        );
+        let vals = Int64Array::from_iter_values(0..rows as i64);
+        RecordBatch::try_new(schema, vec![Arc::new(strings), Arc::new(vals)]).unwrap()
+    }
+
+    #[test]
+    fn oversized_sliced_batch_splits_to_fit() {
+        let cap = 64 * 1024;
+        let base = wide_batch(512);
+        // 128 rows, but the slice keeps the whole ~512 KiB values buffer alive.
+        let sliced = base.slice(64, 128);
+
+        // Premise: the sliced encode really does balloon past the cap. If arrow-ipc ever
+        // learns to truncate sliced buffers, this assert flags the test (and the split
+        // path's main motivation) for review.
+        let mut probe = Vec::new();
+        encode_frame_into(MppFrameHeader::batch(3, 7, 0), &sliced, &mut probe).expect("probe");
+        assert!(
+            probe.len() > cap,
+            "premise: sliced encode ({} bytes) must exceed cap ({cap})",
+            probe.len()
+        );
+
+        let sink = BoundedSink::new(cap);
+        let sender = MppSender::with_header(
+            Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
+            MppFrameHeader::batch(3, 7, 0),
+        );
+        sender.send_batch(&sliced).expect("split send");
+
+        let frames = sink.frames.lock().unwrap();
+        assert!(
+            frames.len() > 1,
+            "expected the oversized batch to split, got {} frame(s)",
+            frames.len()
+        );
+        let mut decoded = Vec::new();
+        for frame in frames.iter() {
+            assert!(
+                frame.len() <= cap,
+                "frame of {} bytes over cap",
+                frame.len()
+            );
+            let (header, body) = decode_frame(frame).expect("decode split frame");
+            assert_eq!((header.stage_id, header.partition), (3, 7));
+            let FrameBody::Batch(batch) = body else {
+                panic!("split frame must carry a batch");
+            };
+            decoded.push(batch);
+        }
+        let got = datafusion::arrow::compute::concat_batches(&sliced.schema(), &decoded)
+            .expect("concat decoded");
+        // Row order and content must survive the split; compare against a compacted copy
+        // (`take` of every row) since the decoded side never sees the original buffers.
+        let want = compact_rows(&sliced, 0, sliced.num_rows()).expect("compact reference");
+        assert_eq!(got, want);
+    }
+
+    /// Same as above but through `Utf8View`: `take` copies the views yet keeps the shared
+    /// data blocks, so without the compact-time `gc` no amount of row-splitting shrinks a
+    /// frame and the send would error at one row.
+    #[test]
+    fn oversized_view_array_batch_splits_after_gc() {
+        let cap = 64 * 1024;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let strings = StringViewArray::from_iter_values(
+            (0..512).map(|i| format!("{i:06}-{}", "x".repeat(1024))),
+        );
+        let base = RecordBatch::try_new(schema, vec![Arc::new(strings)]).unwrap();
+        let sliced = base.slice(64, 128);
+
+        let sink = BoundedSink::new(cap);
+        let sender = MppSender::with_header(
+            Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
+            MppFrameHeader::batch(1, 1, 0),
+        );
+        sender.send_batch(&sliced).expect("view-array split send");
+
+        let frames = sink.frames.lock().unwrap();
+        let mut rows = 0;
+        for frame in frames.iter() {
+            assert!(
+                frame.len() <= cap,
+                "frame of {} bytes over cap",
+                frame.len()
+            );
+            let (_, body) = decode_frame(frame).expect("decode view frame");
+            let FrameBody::Batch(batch) = body else {
+                panic!("expected batch frame");
+            };
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 128);
+    }
+
+    #[test]
+    fn single_oversized_row_still_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from_iter_values([
+                "y".repeat(128 * 1024)
+            ]))],
+        )
+        .unwrap();
+
+        let sink = BoundedSink::new(64 * 1024);
+        let sender = MppSender::with_header(
+            sink as Arc<dyn BatchChannelSender>,
+            MppFrameHeader::batch(0, 0, 0),
+        );
+        let err = sender
+            .send_batch(&batch)
+            .expect_err("one giant row can't split");
+        assert!(
+            format!("{err}").contains("exceeds the entire ring capacity"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

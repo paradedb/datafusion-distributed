@@ -1175,14 +1175,12 @@ mod tests {
     }
 
     async fn run(ctx: &SessionContext) -> Result<(String, Vec<String>)> {
-        // Shaped so every ring frame stays bounded by `shuffle_batch_size`. The strings cross
-        // the shuffle inside `max`'s partial state, which the repartition rebuilds with `take`
-        // into fresh per-batch arrays; the projection then reduces them to a length before the
-        // gather. Shipping `s` itself out of a sort or an aggregate would not work: those emit
-        // offset slices of their accumulated state, a sliced variable-length array ships its
-        // whole values buffer through arrow-ipc, and a single frame balloons to the size of the
-        // partition's state no matter the batch size.
-        let query = "SELECT val, length(max(s)) AS l FROM t GROUP BY val";
+        // Ships `s` itself out of the aggregate on purpose: the emit is an offset slice of the
+        // partition's accumulated state, and arrow-ipc writes a sliced variable-length array's
+        // whole values buffer, so the raw frame balloons to the state's size no matter the
+        // batch size. The send path's compact-and-split is what keeps every frame within these
+        // tiny rings; this query is its end-to-end exercise.
+        let query = "SELECT val, max(s) AS m FROM t GROUP BY val";
         let plan = ctx.sql(query).await?.create_physical_plan().await?;
         let display = display_plan_ascii(plan.as_ref(), false);
         let batches: Vec<_> = execute_stream(plan, ctx.task_ctx())?.try_collect().await?;

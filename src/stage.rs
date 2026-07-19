@@ -372,9 +372,18 @@ fn display_inner_ascii(
         true => metrics_suffix(plan.metrics().map(|m| format_metrics_by_task(&m))),
         false => String::new(),
     };
+    let mut stats_str = String::new();
+    if let Ok(stats) = plan.partition_statistics(None) {
+        let rows = match stats.num_rows {
+            datafusion::common::stats::Precision::Exact(n) => format!("Exact({})", n),
+            datafusion::common::stats::Precision::Inexact(n) => format!("Inexact({})", n),
+            datafusion::common::stats::Precision::Absent => "Absent".to_string(),
+        };
+        stats_str = format!(", rows={}", rows);
+    }
     writeln!(
         f,
-        "{} {}{metrics_str}",
+        "{} {}{stats_str}{metrics_str}",
         " ".repeat(indent),
         node_str.trim_end() // remove trailing newline
     )?;
@@ -412,12 +421,25 @@ fn display_inner_distributed_leaf(
     {
         writeln!(f, "{indent} DistributedLeafExec:")?;
         for (task_i, variant) in leaf.variants.iter().enumerate() {
-            let variant = displayable(variant.as_ref()).one_line().to_string();
+            let variant_str = displayable(variant.as_ref()).one_line().to_string();
             let metrics = match by_task.is_empty() {
                 true => String::new(),
                 false => metrics_suffix(by_task.get(&task_i).map(format_metrics_by_task)),
             };
-            writeln!(f, "{indent}   t{task_i}: {}{metrics}", variant.trim_end())?;
+            let mut stats_str = String::new();
+            if let Ok(stats) = variant.partition_statistics(None) {
+                let rows = match stats.num_rows {
+                    datafusion::common::stats::Precision::Exact(n) => format!("Exact({})", n),
+                    datafusion::common::stats::Precision::Inexact(n) => format!("Inexact({})", n),
+                    datafusion::common::stats::Precision::Absent => "Absent".to_string(),
+                };
+                stats_str = format!(", rows={}", rows);
+            }
+            writeln!(
+                f,
+                "{indent}   t{task_i}: {}{stats_str}{metrics}",
+                variant_str.trim_end()
+            )?;
         }
     } else {
         let header = match show_metrics {
@@ -426,8 +448,21 @@ fn display_inner_distributed_leaf(
         };
         writeln!(f, "{indent} DistributedLeafExec:{header}")?;
         for (task_i, variant) in leaf.variants.iter().enumerate() {
-            let variant = displayable(variant.as_ref()).one_line().to_string();
-            writeln!(f, "{indent}   t{task_i}: {}", variant.trim_end())?;
+            let variant_str = displayable(variant.as_ref()).one_line().to_string();
+            let mut stats_str = String::new();
+            if let Ok(stats) = variant.partition_statistics(None) {
+                let rows = match stats.num_rows {
+                    datafusion::common::stats::Precision::Exact(n) => format!("Exact({})", n),
+                    datafusion::common::stats::Precision::Inexact(n) => format!("Inexact({})", n),
+                    datafusion::common::stats::Precision::Absent => "Absent".to_string(),
+                };
+                stats_str = format!(", rows={}", rows);
+            }
+            writeln!(
+                f,
+                "{indent}   t{task_i}: {}{stats_str}",
+                variant_str.trim_end()
+            )?;
         }
     }
     Ok(())

@@ -1,4 +1,5 @@
 use crate::TaskCountAnnotation::{Desired, Maximum};
+use crate::distributed_planner::insert_broadcast::is_left_broadcast_safe;
 use crate::distributed_planner::{CombinedTaskEstimator, TaskEstimator};
 use crate::execution_plans::{ChildWeight, ChildrenIsolatorUnionExec};
 use crate::stage::LocalStage;
@@ -270,10 +271,12 @@ async fn _inject_network_boundaries(
         task_count = Desired(count);
     } else if let Some(node) = plan.downcast_ref::<HashJoinExec>()
         && node.mode == PartitionMode::CollectLeft
-        && !broadcast_joins_enabled
+        && (!broadcast_joins_enabled || !is_left_broadcast_safe(node.join_type()))
     {
-        // Only distribute CollectLeft HashJoins after we broadcast more intelligently or when it
-        // is explicitly enabled.
+        // A CollectLeft join collects its entire build side in every task, so it can only run in
+        // a multi-task stage when [insert_broadcast_execs] broadcast the build side, which is only
+        // legal for join types that don't emit build-side rows. Everything else must run in a
+        // single task.
         task_count = Maximum(1);
     } else {
         // The task count for this plan is decided by the biggest task count from the children; unless

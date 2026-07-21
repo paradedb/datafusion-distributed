@@ -157,14 +157,14 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_7() -> Result<()> {
         let display = test_clickbench_query("q7").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [count(*)@1 DESC]
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: expr=[count(*)@1 DESC], preserve_partitioning=[true]
-          │   ProjectionExec: expr=[AdvEngineID@0 as AdvEngineID, count(Int64(1))@1 as count(*)]
+          │ ProjectionExec: expr=[AdvEngineID@0 as AdvEngineID, count(Int64(1))@1 as count(*)]
+          │   SortExec: expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]
           │     AggregateExec: mode=FinalPartitioned, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))]
           │       [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=4
           └──────────────────────────────────────────────────
@@ -185,13 +185,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_8() -> Result<()> {
         let display = test_clickbench_query("q8").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [u@1 DESC], fetch=10
         │   [Stage 3] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 3 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[u@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[RegionID@0 as RegionID, count(alias1)@1 as u]
           │     SortExec: TopK(fetch=10), expr=[count(alias1)@1 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID], aggr=[count(alias1)]
@@ -219,13 +219,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_9() -> Result<()> {
         let display = test_clickbench_query("q9").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [c@2 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=9, input_tasks=3
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=3, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[RegionID@0 as RegionID, sum(hits.AdvEngineID)@1 as sum(hits.AdvEngineID), count(Int64(1))@2 as c, avg(hits.ResolutionWidth)@3 as avg(hits.ResolutionWidth), count(DISTINCT hits.UserID)@4 as count(DISTINCT hits.UserID)]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth), count(DISTINCT hits.UserID)]
@@ -309,13 +309,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_12() -> Result<()> {
         let display = test_clickbench_query("q12").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [c@1 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(Int64(1))@1 as c]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]
@@ -369,13 +369,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_14() -> Result<()> {
         let display = test_clickbench_query("q14").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [c@2 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase, count(Int64(1))@2 as c]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase], aggr=[count(Int64(1))]
@@ -398,13 +398,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_15() -> Result<()> {
         let display = test_clickbench_query("q15").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [count(*)@1 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=9, input_tasks=3
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=3, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[count(*)@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[UserID@0 as UserID, count(Int64(1))@1 as count(*)]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[UserID@0 as UserID], aggr=[count(Int64(1))]
@@ -426,13 +426,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_16() -> Result<()> {
         let display = test_clickbench_query("q16").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [count(*)@2 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=9, input_tasks=3
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=3, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[count(*)@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[UserID@0 as UserID, SearchPhrase@1 as SearchPhrase, count(Int64(1))@2 as count(*)]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[UserID@0 as UserID, SearchPhrase@1 as SearchPhrase], aggr=[count(Int64(1))]
@@ -487,7 +487,7 @@ mod tests {
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=9, input_tasks=3
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=3, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[count(*)@3 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[UserID@0 as UserID, date_part(Utf8("MINUTE"),to_timestamp_seconds(hits.EventTime))@1 as m, SearchPhrase@2 as SearchPhrase, count(Int64(1))@3 as count(*)]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@3 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[UserID@0 as UserID, date_part(Utf8("MINUTE"),to_timestamp_seconds(hits.EventTime))@1 as date_part(Utf8("MINUTE"),to_timestamp_seconds(hits.EventTime)), SearchPhrase@2 as SearchPhrase], aggr=[count(Int64(1))]
@@ -633,20 +633,22 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_26() -> Result<()> {
         let display = test_clickbench_query("q26").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]
         │   SortPreservingMergeExec: [EventTime@1 ASC NULLS LAST, SearchPhrase@0 ASC NULLS LAST], fetch=10
         │     [Stage 1] => NetworkCoalesceExec: output_partitions=12, input_tasks=4
         └──────────────────────────────────────────────────
           ┌───── Stage 1 ── tasks=4, partitions=12
-          │ SortExec: TopK(fetch=10), expr=[EventTime@1 ASC NULLS LAST, SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[true]
-          │   FilterExec: SearchPhrase@1 != , projection=[SearchPhrase@1, EventTime@0]
-          │     DistributedLeafExec:
-          │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
-          │       t1: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
-          │       t2: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
-          │       t3: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
+          │ LocalLimitExec: fetch=10
+          │   ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]
+          │     SortExec: TopK(fetch=10), expr=[EventTime@0 ASC NULLS LAST, SearchPhrase@1 ASC NULLS LAST], preserve_partitioning=[true]
+          │       FilterExec: SearchPhrase@1 !=
+          │         DistributedLeafExec:
+          │           t0: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
+          │           t1: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
+          │           t2: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
+          │           t3: DataSourceExec: file_groups={3 groups: [[/testdata/clickbench/plans_range0-3/hits/0.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/1.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>, /testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>], [/testdata/clickbench/plans_range0-3/hits/2.parquet:<int>..<int>]]}, projection=[EventTime, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
           └──────────────────────────────────────────────────
         ");
         Ok(())
@@ -655,13 +657,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_27() -> Result<()> {
         let display = test_clickbench_query("q27").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [l@1 DESC], fetch=25
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=25), expr=[l@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=25
           │   ProjectionExec: expr=[CounterID@0 as CounterID, avg(length(hits.URL))@1 as l, count(Int64(1))@2 as c]
           │     SortExec: TopK(fetch=25), expr=[avg(length(hits.URL))@1 DESC], preserve_partitioning=[true]
           │       FilterExec: count(Int64(1))@2 > 100000
@@ -691,7 +693,7 @@ mod tests {
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=25), expr=[l@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=25
           │   ProjectionExec: expr=[regexp_replace(hits.Referer,Utf8("^https?://(?:www\.)?([^/]+)/.*$"),Utf8("\1"))@0 as k, avg(length(hits.Referer))@1 as l, count(Int64(1))@2 as c, min(hits.Referer)@3 as min(hits.Referer)]
           │     SortExec: TopK(fetch=25), expr=[avg(length(hits.Referer))@1 DESC], preserve_partitioning=[true]
           │       FilterExec: count(Int64(1))@2 > 100000
@@ -737,13 +739,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_30() -> Result<()> {
         let display = test_clickbench_query("q30").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [c@2 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[SearchEngineID@0 as SearchEngineID, ClientIP@1 as ClientIP, count(Int64(1))@2 as c, sum(hits.IsRefresh)@3 as sum(hits.IsRefresh), avg(hits.ResolutionWidth)@4 as avg(hits.ResolutionWidth)]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[SearchEngineID@0 as SearchEngineID, ClientIP@1 as ClientIP], aggr=[count(Int64(1)), sum(hits.IsRefresh), avg(hits.ResolutionWidth)]
@@ -766,13 +768,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_31() -> Result<()> {
         let display = test_clickbench_query("q31").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [c@2 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[WatchID@0 as WatchID, ClientIP@1 as ClientIP, count(Int64(1))@2 as c, sum(hits.IsRefresh)@3 as sum(hits.IsRefresh), avg(hits.ResolutionWidth)@4 as avg(hits.ResolutionWidth)]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[WatchID@0 as WatchID, ClientIP@1 as ClientIP], aggr=[count(Int64(1)), sum(hits.IsRefresh), avg(hits.ResolutionWidth)]
@@ -795,13 +797,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_32() -> Result<()> {
         let display = test_clickbench_query("q32").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [c@2 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=9, input_tasks=3
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=3, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[WatchID@0 as WatchID, ClientIP@1 as ClientIP, count(Int64(1))@2 as c, sum(hits.IsRefresh)@3 as sum(hits.IsRefresh), avg(hits.ResolutionWidth)@4 as avg(hits.ResolutionWidth)]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[WatchID@0 as WatchID, ClientIP@1 as ClientIP], aggr=[count(Int64(1)), sum(hits.IsRefresh), avg(hits.ResolutionWidth)]
@@ -823,13 +825,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_33() -> Result<()> {
         let display = test_clickbench_query("q33").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [c@1 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=9, input_tasks=3
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=3, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[URL@0 as URL, count(Int64(1))@1 as c]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(Int64(1))]
@@ -906,13 +908,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_36() -> Result<()> {
         let display = test_clickbench_query("q36").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [pageviews@1 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[pageviews@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[URL@0 as URL, count(Int64(1))@1 as pageviews]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(Int64(1))]
@@ -935,13 +937,13 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_37() -> Result<()> {
         let display = test_clickbench_query("q37").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ SortPreservingMergeExec: [pageviews@1 DESC], fetch=10
         │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10), expr=[pageviews@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10
           │   ProjectionExec: expr=[Title@0 as Title, count(Int64(1))@1 as pageviews]
           │     SortExec: TopK(fetch=10), expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[Title@0 as Title], aggr=[count(Int64(1))]
@@ -964,14 +966,14 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_38() -> Result<()> {
         let display = test_clickbench_query("q38").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ GlobalLimitExec: skip=1000, fetch=10
         │   SortPreservingMergeExec: [pageviews@1 DESC], fetch=1010
         │     [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=1010), expr=[pageviews@1 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=1010
           │   ProjectionExec: expr=[URL@0 as URL, count(Int64(1))@1 as pageviews]
           │     SortExec: TopK(fetch=1010), expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(Int64(1))]
@@ -1001,7 +1003,7 @@ mod tests {
         │     [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=1010), expr=[pageviews@5 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=1010
           │   ProjectionExec: expr=[TraficSourceID@0 as TraficSourceID, SearchEngineID@1 as SearchEngineID, AdvEngineID@2 as AdvEngineID, CASE WHEN hits.SearchEngineID = Int64(0) AND hits.AdvEngineID = Int64(0) THEN hits.Referer ELSE Utf8("") END@3 as src, URL@4 as dst, count(Int64(1))@5 as pageviews]
           │     SortExec: TopK(fetch=1010), expr=[count(Int64(1))@5 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[TraficSourceID@0 as TraficSourceID, SearchEngineID@1 as SearchEngineID, AdvEngineID@2 as AdvEngineID, CASE WHEN hits.SearchEngineID = Int64(0) AND hits.AdvEngineID = Int64(0) THEN hits.Referer ELSE Utf8("") END@3 as CASE WHEN hits.SearchEngineID = Int64(0) AND hits.AdvEngineID = Int64(0) THEN hits.Referer ELSE Utf8("") END, URL@4 as URL], aggr=[count(Int64(1))]
@@ -1024,14 +1026,14 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_40() -> Result<()> {
         let display = test_clickbench_query("q40").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ GlobalLimitExec: skip=100, fetch=10
         │   SortPreservingMergeExec: [pageviews@2 DESC], fetch=110
         │     [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=110), expr=[pageviews@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=110
           │   ProjectionExec: expr=[URLHash@0 as URLHash, EventDate@1 as EventDate, count(Int64(1))@2 as pageviews]
           │     SortExec: TopK(fetch=110), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[URLHash@0 as URLHash, EventDate@1 as EventDate], aggr=[count(Int64(1))]
@@ -1054,14 +1056,14 @@ mod tests {
     #[tokio::test]
     async fn test_clickbench_41() -> Result<()> {
         let display = test_clickbench_query("q41").await?;
-        assert_snapshot!(display, @r"
+        assert_snapshot!(display, @"
         ┌───── DistributedExec
         │ GlobalLimitExec: skip=10000, fetch=10
         │   SortPreservingMergeExec: [pageviews@2 DESC], fetch=10010
         │     [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         └──────────────────────────────────────────────────
           ┌───── Stage 2 ── tasks=2, partitions=3
-          │ SortExec: TopK(fetch=10010), expr=[pageviews@2 DESC], preserve_partitioning=[true]
+          │ LocalLimitExec: fetch=10010
           │   ProjectionExec: expr=[WindowClientWidth@0 as WindowClientWidth, WindowClientHeight@1 as WindowClientHeight, count(Int64(1))@2 as pageviews]
           │     SortExec: TopK(fetch=10010), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
           │       AggregateExec: mode=FinalPartitioned, gby=[WindowClientWidth@0 as WindowClientWidth, WindowClientHeight@1 as WindowClientHeight], aggr=[count(Int64(1))]

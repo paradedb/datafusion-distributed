@@ -115,6 +115,10 @@ impl BatchChannelSender for DsmInboxSender {
     fn send_lock(&self) -> &tokio::sync::Mutex<()> {
         &self.send_lock
     }
+
+    fn max_frame_bytes(&self) -> Option<usize> {
+        Some(self.inner.max_frame_bytes())
+    }
 }
 
 /// DSM MPSC ring as a `BatchChannelReceiver`. The scratch `Vec<u8>` lives behind a `Mutex` so a

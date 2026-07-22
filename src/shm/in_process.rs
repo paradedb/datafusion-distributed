@@ -44,7 +44,7 @@ use std::alloc::Layout;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use datafusion::arrow::array::{Int32Array, RecordBatch};
+use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::runtime::JoinSet;
@@ -594,6 +594,42 @@ mod tests {
         ctx.register_table("t", Arc::new(table)).unwrap();
     }
 
+    fn wide_table_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, false),
+        ]))
+    }
+
+    /// High-cardinality groups over ~1 KiB strings: each worker's partial-aggregate state runs
+    /// to hundreds of KiB, so its emit slices balloon past a tiny ring through arrow-ipc.
+    fn wide_table_partitions() -> Vec<Vec<RecordBatch>> {
+        let schema = wide_table_schema();
+        const ROWS_PER_PART: i32 = 700;
+        (0..N_WORKERS as i32)
+            .map(|p| {
+                let vals =
+                    Int32Array::from_iter_values((0..ROWS_PER_PART).map(|i| p * ROWS_PER_PART + i));
+                let strings = StringArray::from_iter_values(
+                    (0..ROWS_PER_PART).map(|i| format!("{p:02}-{i:06}-{}", "x".repeat(1024))),
+                );
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(vals), Arc::new(strings)])
+                        .unwrap();
+                vec![batch]
+            })
+            .collect()
+    }
+
+    /// Swap the session's `t` for the wide-string variant. `build_session` registers the
+    /// standard table; the swap only matters on the leader (fragments travel as shared plan
+    /// Arcs, so worker sessions never re-resolve the table).
+    fn register_wide_table(ctx: &SessionContext) {
+        let _ = ctx.deregister_table("t").unwrap();
+        let table = MemTable::try_new(wide_table_schema(), wide_table_partitions()).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+    }
+
     /// A worker is a consumer too (it reads shuffle inputs), so when one of its input streams drops
     /// early it has to cancel that stream's producer, not just the leader. This checks the wiring
     /// end-to-end: a worker proc's `cancel_stream` reaches the producing proc's inbox through the
@@ -846,7 +882,11 @@ mod tests {
     }
 
     fn bootstrap_mesh(n_procs: u32) -> Bootstrap {
-        let region_total = dsm_region_bytes(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
+        bootstrap_mesh_with_queue(n_procs, IN_PROCESS_QUEUE_BYTES)
+    }
+
+    fn bootstrap_mesh_with_queue(n_procs: u32, queue_bytes: usize) -> Bootstrap {
+        let region_total = dsm_region_bytes(n_procs, queue_bytes, 0).unwrap();
         let region = HeapRegion::new(region_total);
         let base = SharedBase(region.base());
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
@@ -854,7 +894,7 @@ mod tests {
             leader_setup(
                 base.0,
                 n_procs,
-                IN_PROCESS_QUEUE_BYTES,
+                queue_bytes,
                 &[],
                 Arc::clone(&wakeup),
                 receiver_token(0),
@@ -949,6 +989,69 @@ mod tests {
             pretty_format_batches(&expected).unwrap().to_string(),
             pretty_format_batches(&got).unwrap().to_string(),
             "distributed shuffle != serial"
+        );
+    }
+
+    /// An aggregate emits offset slices of its accumulated state, and arrow-ipc writes a
+    /// sliced variable-length array's whole values buffer, so raw frames balloon to the
+    /// state's size regardless of batch size. With rings far smaller than that state, the
+    /// send path's compact-and-split has to carry the query; the result must still match the
+    /// serial reference exactly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_aggregate_frames_split_across_tiny_rings() {
+        let query = "SELECT val, max(s) AS m FROM t GROUP BY val ORDER BY val";
+
+        let serial_ctx = SessionContext::new();
+        register_wide_table(&serial_ctx);
+        let expected = serial_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // 64 KiB rings against ~700 KiB of per-worker aggregate state.
+        let boot = bootstrap_mesh_with_queue(N_WORKERS + 1, 64 * 1024);
+        let captured = new_captured_plans();
+        let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
+        register_wide_table(&leader_ctx);
+        let physical = leader_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+
+        let mut workers = JoinSet::new();
+        for (proc_idx, mesh, outbound) in boot.workers {
+            let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
+            let session = build_session(Arc::clone(&mesh), None);
+            workers.spawn(run_worker_proc(
+                fragments,
+                outbound,
+                mesh,
+                session,
+                N_WORKERS,
+                Arc::clone(&captured),
+            ));
+        }
+
+        let leader_task_ctx = leader_ctx.task_ctx();
+        let stream = physical.execute(0, leader_task_ctx).unwrap();
+        let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        while let Some(res) = workers.join_next().await {
+            res.expect("worker task panicked").expect("worker proc");
+        }
+
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        assert_eq!(
+            pretty_format_batches(&expected).unwrap().to_string(),
+            pretty_format_batches(&got).unwrap().to_string(),
+            "distributed wide aggregate != serial"
         );
     }
 

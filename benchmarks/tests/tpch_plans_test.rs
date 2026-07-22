@@ -831,21 +831,40 @@ mod tests {
     async fn test_tpch_13() -> Result<(), Box<dyn Error>> {
         let plan = test_tpch_query("q13").await?;
         assert_snapshot!(plan, @"
-        SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]
-          ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]
-            SortExec: expr=[count(Int64(1))@1 DESC, c_count@0 DESC], preserve_partitioning=[true]
-              AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]
-                RepartitionExec: partitioning=Hash([c_count@0], 3), input_partitions=3
-                  AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]
-                    ProjectionExec: expr=[count(orders.o_orderkey)@1 as c_count]
-                      AggregateExec: mode=FinalPartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]
-                        RepartitionExec: partitioning=Hash([c_custkey@0], 3), input_partitions=3
-                          AggregateExec: mode=Partial, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]
-                            HashJoinExec: mode=CollectLeft, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1]
-                              CoalescePartitionsExec
-                                DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/customer/1.parquet, /testdata/tpch/plan_sf0.02/customer/10.parquet, /testdata/tpch/plan_sf0.02/customer/11.parquet, /testdata/tpch/plan_sf0.02/customer/12.parquet, /testdata/tpch/plan_sf0.02/customer/13.parquet, /testdata/tpch/plan_sf0.02/customer/14.parquet], [/testdata/tpch/plan_sf0.02/customer/15.parquet, /testdata/tpch/plan_sf0.02/customer/16.parquet, /testdata/tpch/plan_sf0.02/customer/2.parquet, /testdata/tpch/plan_sf0.02/customer/3.parquet, /testdata/tpch/plan_sf0.02/customer/4.parquet, /testdata/tpch/plan_sf0.02/customer/5.parquet], [/testdata/tpch/plan_sf0.02/customer/6.parquet, /testdata/tpch/plan_sf0.02/customer/7.parquet, /testdata/tpch/plan_sf0.02/customer/8.parquet, /testdata/tpch/plan_sf0.02/customer/9.parquet]]}, projection=[c_custkey], file_type=parquet
-                              FilterExec: o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]
-                                DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/orders/1.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/10.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/11.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/12.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/13.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/14.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/14.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/15.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/16.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/2.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/3.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/4.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/4.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/5.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/6.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/7.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/8.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/9.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_comment], file_type=parquet, predicate=o_comment@8 NOT LIKE %special%requests% AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+        ┌───── DistributedExec
+        │ SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]
+        │   [Stage 3] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
+        └──────────────────────────────────────────────────
+          ┌───── Stage 3 ── tasks=2, partitions=3
+          │ ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]
+          │   SortExec: expr=[count(Int64(1))@1 DESC, c_count@0 DESC], preserve_partitioning=[true]
+          │     AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]
+          │       [Stage 2] => NetworkShuffleExec: output_partitions=3, input_tasks=3
+          └──────────────────────────────────────────────────
+            ┌───── Stage 2 ── tasks=3, partitions=6
+            │ RepartitionExec: partitioning=Hash([c_count@0], 6), input_partitions=3
+            │   AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]
+            │     ProjectionExec: expr=[count(orders.o_orderkey)@1 as c_count]
+            │       AggregateExec: mode=FinalPartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]
+            │         [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=4
+            └──────────────────────────────────────────────────
+              ┌───── Stage 1 ── tasks=4, partitions=9
+              │ RepartitionExec: partitioning=Hash([c_custkey@0], 9), input_partitions=3
+              │   AggregateExec: mode=Partial, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]
+              │     HashJoinExec: mode=CollectLeft, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1]
+              │       CoalescePartitionsExec
+              │         DistributedLeafExec:
+              │           t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/customer/1.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/10.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/14.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/15.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/4.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/5.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/6.parquet:<int>..<int>]]}, projection=[c_custkey], file_type=parquet
+              │           t1: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/customer/10.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/11.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/15.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/16.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/6.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/7.parquet:<int>..<int>]]}, projection=[c_custkey], file_type=parquet
+              │           t2: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/customer/11.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/12.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/13.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/16.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/2.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/3.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/7.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/8.parquet:<int>..<int>]]}, projection=[c_custkey], file_type=parquet
+              │           t3: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/customer/13.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/14.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/3.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/4.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/customer/8.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/customer/9.parquet:<int>..<int>]]}, projection=[c_custkey], file_type=parquet
+              │       FilterExec: o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]
+              │         DistributedLeafExec:
+              │           t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/orders/1.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/10.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/14.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/15.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/4.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/5.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_comment], file_type=parquet, predicate=o_comment@8 NOT LIKE %special%requests% AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+              │           t1: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/orders/10.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/11.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/15.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/16.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/2.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/5.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/6.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/7.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_comment], file_type=parquet, predicate=o_comment@8 NOT LIKE %special%requests% AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+              │           t2: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/orders/11.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/12.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/13.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/2.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/3.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/7.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/8.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_comment], file_type=parquet, predicate=o_comment@8 NOT LIKE %special%requests% AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+              │           t3: DataSourceExec: file_groups={3 groups: [[/testdata/tpch/plan_sf0.02/orders/13.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/14.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/14.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/3.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/4.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/4.parquet:<int>..<int>], [/testdata/tpch/plan_sf0.02/orders/8.parquet:<int>..<int>, /testdata/tpch/plan_sf0.02/orders/9.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_comment], file_type=parquet, predicate=o_comment@8 NOT LIKE %special%requests% AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+              └──────────────────────────────────────────────────
         ");
         Ok(())
     }

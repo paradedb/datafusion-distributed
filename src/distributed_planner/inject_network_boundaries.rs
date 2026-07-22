@@ -271,7 +271,7 @@ async fn _inject_network_boundaries(
         task_count = Desired(count);
     } else if let Some(node) = plan.downcast_ref::<HashJoinExec>()
         && node.mode == PartitionMode::CollectLeft
-        && (!broadcast_joins_enabled || !is_left_broadcast_safe(node.join_type()))
+        && (!broadcast_joins_enabled)
     {
         // A CollectLeft join collects its entire build side in every task, so it can only run in
         // a multi-task stage when [insert_broadcast_execs] broadcast the build side, which is only
@@ -279,7 +279,7 @@ async fn _inject_network_boundaries(
         // single task.
         task_count = Maximum(1);
     } else if let Some(node) = plan.downcast_ref::<NestedLoopJoinExec>()
-        && (!broadcast_joins_enabled || !is_left_broadcast_safe(node.join_type()))
+        && (!broadcast_joins_enabled)
     {
         // A NestedLoopJoin always collects its entire left side in every task, so the same
         // reasoning as CollectLeft HashJoins above applies (it has no other partition mode).
@@ -1162,6 +1162,79 @@ mod tests {
                 DistributedLeafExec: task_count=Desired(4)
           DistributedLeafExec: task_count=Desired(4)
         ");
+    }
+
+    #[tokio::test]
+    async fn test_left_hash_join_not_broadcastable_capped() {
+        // A Left join emits build-side rows, so `insert_broadcast_execs` refuses to
+        // broadcast its build side even with broadcast joins enabled (same class as
+        // LeftSemi/LeftAnti/LeftMark, which is what TPC-DS q14/q95 hit). A CollectLeft
+        // join whose build side was not broadcast collects only its task's slice of the
+        // build data, so it must be capped to a single task.
+        let query = r#"
+        SELECT a."MinTemp", b."MaxTemp" FROM weather a LEFT JOIN weather b ON a."RainToday" = b."RainToday"
+        "#;
+
+        // Pin the plan shape: this must be a CollectLeft hash join with a
+        // build-side-emitting join type.
+        let physical_plan_string = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            .build()
+            .await
+            .physical_plan_as_string(query)
+            .await;
+        assert!(physical_plan_string.contains("HashJoinExec: mode=CollectLeft, join_type=Left"));
+
+        let test_plan_builder = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            // annotate_test_plan wants this as false so its s a single node plan
+            .distributed_planner(false)
+            .broadcast_joins(true);
+        let annotated = annotate_test_plan(test_plan_builder, query).await;
+        assert_snapshot!(annotated, @r"
+        HashJoinExec: task_count=Maximum(1)
+          CoalescePartitionsExec: task_count=Maximum(1)
+            DistributedLeafExec: task_count=Maximum(1)
+          DistributedLeafExec: task_count=Maximum(1)
+        ")
+    }
+
+    #[tokio::test]
+    async fn test_cross_join_no_broadcast_capped() {
+        // A CrossJoin collects its entire left side in every task, just like a
+        // CollectLeft hash join. With broadcast joins disabled, `insert_broadcast_execs`
+        // inserts nothing, so the join must be capped to a single task or every task
+        // would pair only its slice of the left side with its slice of the right side.
+        let query = r#"
+        SELECT a."MinTemp", b."MaxTemp"
+        FROM weather a CROSS JOIN weather b
+        "#;
+
+        // Pin the plan shape: this must plan as a CrossJoin.
+        let physical_plan_string = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            .build()
+            .await
+            .physical_plan_as_string(query)
+            .await;
+        assert!(physical_plan_string.contains("CrossJoinExec"));
+
+        let test_plan_builder = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            // annotate_test_plan wants this as false so its s a single node plan
+            .distributed_planner(false)
+            .broadcast_joins(false);
+        let annotated = annotate_test_plan(test_plan_builder, query).await;
+        assert_snapshot!(annotated, @r"
+        CrossJoinExec: task_count=Maximum(1)
+          CoalescePartitionsExec: task_count=Maximum(1)
+            DistributedLeafExec: task_count=Maximum(1)
+          DistributedLeafExec: task_count=Maximum(1)
+        ")
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -277,6 +277,12 @@ async fn _inject_network_boundaries(
         // a multi-task stage when [insert_broadcast_execs] broadcast the build side, which is only
         // legal for join types that don't emit build-side rows. Everything else must run in a
         // single task.
+        task_count = Maximum(1);
+    } else if let Some(node) = plan.downcast_ref::<NestedLoopJoinExec>()
+        && (!broadcast_joins_enabled || !is_left_broadcast_safe(node.join_type()))
+    {
+        // A NestedLoopJoin always collects its entire left side in every task, so the same
+        // reasoning as CollectLeft HashJoins above applies (it has no other partition mode).
         task_count = Maximum(1);
     } else {
         // The task count for this plan is decided by the biggest task count from the children; unless
@@ -1091,6 +1097,70 @@ mod tests {
               BroadcastExec: task_count=Desired(3)
                 DistributedLeafExec: task_count=Desired(3)
           DistributedLeafExec: task_count=Maximum(1)
+        ");
+    }
+
+    #[tokio::test]
+    async fn test_nested_loop_left_join_capped() {
+        // A NestedLoopJoin always collects its entire left side in every task, and a Left
+        // join emits build-side rows, so it can never be broadcast: even with broadcast
+        // joins enabled, the join must be capped at a single task.
+        let query = r#"
+        SELECT a."MinTemp", b."MaxTemp"
+        FROM weather a LEFT JOIN weather b
+        ON a."MinTemp" < b."MaxTemp"
+        "#;
+
+        // Pin the plan shape: a non-equi join must plan as a NestedLoopJoin with a
+        // build-side-emitting join type.
+        let physical_plan_string = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            .build()
+            .await
+            .physical_plan_as_string(query)
+            .await;
+        assert!(physical_plan_string.contains("NestedLoopJoinExec"));
+
+        let test_plan_builder = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            // annotate_test_plan wants this as false so its s a single node plan
+            .distributed_planner(false)
+            .broadcast_joins(true);
+        let annotated = annotate_test_plan(test_plan_builder, query).await;
+        assert_snapshot!(annotated, @"
+        NestedLoopJoinExec: task_count=Maximum(1)
+          CoalescePartitionsExec: task_count=Maximum(1)
+            DistributedLeafExec: task_count=Maximum(1)
+          DistributedLeafExec: task_count=Maximum(1)
+        ");
+    }
+
+    #[tokio::test]
+    async fn test_nested_loop_inner_join_broadcast() {
+        // The Inner counterpart of `test_nested_loop_left_join_capped`: Inner joins emit
+        // only probe-driven rows, so the left side can be broadcast and the join can run
+        // in a multi-task stage.
+        let query = r#"
+        SELECT a."MinTemp", b."MaxTemp"
+        FROM weather a INNER JOIN weather b
+        ON a."MinTemp" < b."MaxTemp"
+        "#;
+        let test_plan_builder = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            // annotate_test_plan wants this as false so its s a single node plan
+            .distributed_planner(false)
+            .broadcast_joins(true);
+        let annotated = annotate_test_plan(test_plan_builder, query).await;
+        assert_snapshot!(annotated, @"
+        NestedLoopJoinExec: task_count=Desired(4)
+          CoalescePartitionsExec: task_count=Desired(4)
+            NetworkBroadcastExec: task_count=Desired(4)
+              BroadcastExec: task_count=Desired(4)
+                DistributedLeafExec: task_count=Desired(4)
+          DistributedLeafExec: task_count=Desired(4)
         ");
     }
 

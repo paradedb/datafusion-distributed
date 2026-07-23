@@ -138,10 +138,7 @@ mod tests {
     use crate::test_utils::plans::TestPlanBuilder;
     use datafusion::physical_plan::displayable;
 
-    async fn sql_to_normalized_plan(
-        query: &str,
-        broadcast_enabled: bool,
-    ) -> String {
+    async fn sql_to_normalized_plan(query: &str, broadcast_enabled: bool) -> String {
         let test_plan = TestPlanBuilder::new()
             .target_partitions(3)
             .broadcast_joins(broadcast_enabled)

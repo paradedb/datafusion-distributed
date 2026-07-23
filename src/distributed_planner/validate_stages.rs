@@ -34,14 +34,19 @@ use std::sync::Arc;
 
 use datafusion::common::{Result, plan_err};
 use datafusion::physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};
+use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::{Distribution, ExecutionPlan};
+use datafusion::physical_plan::{Distribution, ExecutionPlan, ExecutionPlanProperties};
 
-use crate::execution_plans::DistributedLeafExec;
+use datafusion::config::ConfigOptions;
+use datafusion::prelude::SessionConfig;
+
+use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
 use crate::stage::{Stage, find_all_stages};
 use crate::{NetworkBoundaryExt, NetworkBroadcastExec, NetworkShuffleExec};
 
 use super::insert_broadcast::is_left_broadcast_safe;
+use super::task_estimator::{CombinedTaskEstimator, TaskEstimator};
 
 /// How a subtree's data is laid out across the tasks of its stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,10 +60,19 @@ enum DataFlow {
 }
 
 /// Validates every stage embedded in a fully planned distributed plan.
-pub(crate) fn validate_distributed_stages(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
+pub(crate) fn validate_distributed_stages(
+    plan: &Arc<dyn ExecutionPlan>,
+    session_cfg: &SessionConfig,
+) -> Result<()> {
+    let estimator = CombinedTaskEstimator::from_session_config(session_cfg);
     for stage in find_all_stages(plan) {
         if let Stage::Local(stage) = stage {
-            validate_stage_plan(&stage.plan, stage.tasks)?;
+            validate_stage_plan(
+                &stage.plan,
+                stage.tasks,
+                estimator.as_ref(),
+                session_cfg.options(),
+            )?;
         }
     }
     Ok(())
@@ -66,11 +80,19 @@ pub(crate) fn validate_distributed_stages(plan: &Arc<dyn ExecutionPlan>) -> Resu
 
 /// Validates a single stage's plan against its task count. Single-task stages are trivially
 /// correct: one instance sees all the data, exactly as DataFusion's optimizer assumed.
-pub(crate) fn validate_stage_plan(plan: &Arc<dyn ExecutionPlan>, tasks: usize) -> Result<()> {
+///
+/// The `estimator` is the same [TaskEstimator] machinery the planner used to decide leaf task
+/// counts; the validator consults it to tell task-varying leaves from replicated ones.
+pub(crate) fn validate_stage_plan(
+    plan: &Arc<dyn ExecutionPlan>,
+    tasks: usize,
+    estimator: &dyn TaskEstimator,
+    cfg: &ConfigOptions,
+) -> Result<()> {
     if tasks <= 1 {
         return Ok(());
     }
-    match classify(plan, tasks)? {
+    match classify(plan, tasks, estimator, cfg)? {
         DataFlow::Partitioned { .. } => Ok(()),
         DataFlow::Replicated => plan_err!(
             "stage runs {tasks} tasks but its plan is fully replicated: every task would \
@@ -82,7 +104,12 @@ pub(crate) fn validate_stage_plan(plan: &Arc<dyn ExecutionPlan>, tasks: usize) -
 /// Classifies `node`'s output as [DataFlow::Replicated] or [DataFlow::Partitioned] and
 /// enforces obligations (A) and (B) for its inputs. Recursion stops at network boundaries:
 /// their subtrees belong to child stages, which are validated against their own task counts.
-fn classify(node: &Arc<dyn ExecutionPlan>, tasks: usize) -> Result<DataFlow> {
+fn classify(
+    node: &Arc<dyn ExecutionPlan>,
+    tasks: usize,
+    estimator: &dyn TaskEstimator,
+    cfg: &ConfigOptions,
+) -> Result<DataFlow> {
     // Exchange operators re-establish global properties.
     if node.is::<NetworkBroadcastExec>() {
         return Ok(DataFlow::Replicated);
@@ -101,22 +128,61 @@ fn classify(node: &Arc<dyn ExecutionPlan>, tasks: usize) -> Result<DataFlow> {
     }
     // A DistributedLeafExec resolves to a different slice of the underlying source in every
     // task. (Its per-task variants are children in the plan tree, so check before the leaf
-    // case below.)
+    // case below.) If the scan preserves a hash partitioning from the storage layout
+    // (hive-style pre-partitioned files with `preserve_file_partitions`), the per-task
+    // slicing follows those same partitions, so equal keys still co-locate cluster-wide.
     if node.is::<DistributedLeafExec>() {
+        let by_key = matches!(node.output_partitioning(), Partitioning::Hash(..));
+        return Ok(DataFlow::Partitioned { by_key });
+    }
+    // A ChildrenIsolatorUnionExec divides the stage's tasks among its children: child `i`
+    // executes only in the tasks its `task_idx_map` assigns to it. Each child subtree must
+    // therefore be validated against its own effective task count, not the stage's. A child
+    // allotted a single task behaves like a single-task stage — trivially correct, including
+    // any NetworkCoalesceExec it contains.
+    if let Some(union) = node.downcast_ref::<ChildrenIsolatorUnionExec>() {
+        for (child_idx, child) in union.children.iter().enumerate() {
+            let child_tasks = union
+                .task_idx_map
+                .iter()
+                .filter(|entries| entries.iter().any(|(child, _)| *child == child_idx))
+                .count();
+            if child_tasks > 1
+                && classify(child, child_tasks, estimator, cfg)? == DataFlow::Replicated
+            {
+                return plan_err!(
+                    "input {child_idx} of {} is replicated but allotted {child_tasks} tasks; \
+                     each task would emit an identical copy of its data",
+                    node.name()
+                );
+            }
+        }
+        // Children occupy disjoint task allotments, so across the stage's tasks the union
+        // emits each child's data exactly once.
         return Ok(DataFlow::Partitioned { by_key: false });
     }
     let children = node.children();
     if children.is_empty() {
-        // Any other leaf (in-memory table, literal values, an unsliced scan) is embedded
-        // verbatim in every task's serialized plan: identical, complete data everywhere.
+        // A leaf that some TaskEstimator knows how to scale is task-varying: each task
+        // executes it over its own slice or work assignment (this mirrors how
+        // `inject_network_boundaries` decides leaf task counts, and covers custom sources
+        // like work-unit-feed leaves). Any other leaf (in-memory table, literal values) is
+        // embedded verbatim in every task's serialized plan: identical, complete data.
         // NOTE: a volatile leaf (e.g. one backed by a random or time-dependent source)
-        // would break this assumption; nothing in the ExecutionPlan API exposes that.
-        return Ok(DataFlow::Replicated);
+        // would break the replication assumption; nothing in the ExecutionPlan API exposes
+        // that.
+        return Ok(if estimator.task_estimation(node, cfg).is_some() {
+            DataFlow::Partitioned {
+                by_key: matches!(node.output_partitioning(), Partitioning::Hash(..)),
+            }
+        } else {
+            DataFlow::Replicated
+        });
     }
 
     let child_flows = children
         .iter()
-        .map(|child| classify(child, tasks))
+        .map(|child| classify(child, tasks, estimator, cfg))
         .collect::<Result<Vec<_>>>()?;
 
     // Obligation (A): declared input-distribution requirements must hold cluster-globally.
@@ -220,33 +286,81 @@ mod tests {
     use super::*;
     use crate::test_utils::plans::TestPlanBuilder;
 
-    async fn plan_distributed(query: &str, broadcast_joins: bool) -> Arc<dyn ExecutionPlan> {
-        TestPlanBuilder::new()
+    /// Plans `query` through the full distributed planner. Since [validate_distributed_stages]
+    /// is wired into `create_physical_plan`, an invalid stage surfaces here as a planning
+    /// error rather than as a returned plan. Also returns the session config so tests can
+    /// re-run validation directly.
+    async fn try_plan_distributed(
+        query: &str,
+        broadcast_joins: bool,
+    ) -> (Result<Arc<dyn ExecutionPlan>>, SessionConfig) {
+        let test_plan = TestPlanBuilder::new()
             .target_partitions(3)
             .num_workers(4)
             .distributed_planner(true)
             .broadcast_joins(broadcast_joins)
             .build()
-            .await
-            .physical_plan(query)
-            .await
+            .await;
+        let ctx = test_plan.get_ctx();
+        let session_cfg = ctx.copied_config();
+        let plan = match ctx.sql(query).await {
+            Ok(df) => df.create_physical_plan().await,
+            Err(err) => Err(err),
+        };
+        (plan, session_cfg)
+    }
+
+    fn assert_rejected(result: Result<Arc<dyn ExecutionPlan>>) {
+        let err = result.expect_err("expected the planner to reject the query");
+        assert!(
+            err.to_string().contains("requires a single partition"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
     async fn rejects_unbroadcast_collect_left_join_in_multi_task_stage() {
         // LEFT is not broadcast-safe, so `insert_broadcast_execs` never broadcasts its build
         // side; with broadcast joins enabled nothing caps the stage to one task either, and
-        // each task collects only its slice of the build side.
-        let plan = plan_distributed(
-            r#"SELECT a."MinTemp", b."MaxTemp"
-               FROM weather a LEFT JOIN weather b ON a."RainToday" = b."RainToday""#,
-            true,
-        )
-        .await;
-        let err = validate_distributed_stages(&plan).expect_err("expected validation to fail");
-        assert!(
-            err.to_string().contains("requires a single partition"),
-            "unexpected error: {err}"
+        // each task would collect only its slice of the build side.
+        assert_rejected(
+            try_plan_distributed(
+                r#"SELECT a."MinTemp", b."MaxTemp"
+                   FROM weather a LEFT JOIN weather b ON a."RainToday" = b."RainToday""#,
+                true,
+            )
+            .await
+            .0,
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_unbroadcast_nested_loop_left_join() {
+        // A Left NLJ is not broadcast-safe either; its collected left side arrives through
+        // a plain CoalescePartitionsExec over a sliced leaf.
+        assert_rejected(
+            try_plan_distributed(
+                r#"SELECT a."MinTemp", b."MaxTemp"
+                   FROM weather a LEFT JOIN weather b ON a."MinTemp" < b."MaxTemp""#,
+                true,
+            )
+            .await
+            .0,
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_join_with_broadcast_disabled() {
+        // Cross joins are always broadcast-safe, but with broadcast joins disabled there is
+        // no broadcast at all, and no gating arm covers CrossJoinExec.
+        assert_rejected(
+            try_plan_distributed(
+                r#"SELECT sum(a."MinTemp" + b."MaxTemp")
+                   FROM weather a CROSS JOIN weather b"#,
+                false,
+            )
+            .await
+            .0,
         );
     }
 
@@ -255,59 +369,27 @@ mod tests {
         // Inner is broadcast-safe: the build side arrives through a NetworkBroadcastExec
         // (replicated), the probe side is a sliced leaf (partitioned), and an inner join
         // only emits probe-driven rows.
-        let plan = plan_distributed(
+        let (plan, session_cfg) = try_plan_distributed(
             r#"SELECT a."MinTemp", b."MaxTemp"
                FROM weather a INNER JOIN weather b ON a."RainToday" = b."RainToday""#,
             true,
         )
         .await;
-        validate_distributed_stages(&plan).expect("expected validation to pass");
-    }
-
-    #[tokio::test]
-    async fn rejects_unbroadcast_nested_loop_left_join() {
-        // A Left NLJ is not broadcast-safe either; its collected left side arrives through
-        // a plain CoalescePartitionsExec over a sliced leaf.
-        let plan = plan_distributed(
-            r#"SELECT a."MinTemp", b."MaxTemp"
-               FROM weather a LEFT JOIN weather b ON a."MinTemp" < b."MaxTemp""#,
-            true,
-        )
-        .await;
-        let err = validate_distributed_stages(&plan).expect_err("expected validation to fail");
-        assert!(
-            err.to_string().contains("requires a single partition"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_cross_join_with_broadcast_disabled() {
-        // Cross joins are always broadcast-safe, but with broadcast joins disabled there is
-        // no broadcast at all, and no gating arm covers CrossJoinExec.
-        let plan = plan_distributed(
-            r#"SELECT sum(a."MinTemp" + b."MaxTemp")
-               FROM weather a CROSS JOIN weather b"#,
-            false,
-        )
-        .await;
-        let err = validate_distributed_stages(&plan).expect_err("expected validation to fail");
-        assert!(
-            err.to_string().contains("requires a single partition"),
-            "unexpected error: {err}"
-        );
+        let plan = plan.expect("expected planning to succeed");
+        validate_distributed_stages(&plan, &session_cfg).expect("expected validation to pass");
     }
 
     #[tokio::test]
     async fn accepts_plan_with_broadcast_disabled() {
         // With broadcast joins disabled the planner caps CollectLeft joins to a single task,
         // so whatever stages remain must validate cleanly.
-        let plan = plan_distributed(
+        let (plan, session_cfg) = try_plan_distributed(
             r#"SELECT a."MinTemp", b."MaxTemp"
                FROM weather a LEFT JOIN weather b ON a."RainToday" = b."RainToday""#,
             false,
         )
         .await;
-        validate_distributed_stages(&plan).expect("expected validation to pass");
+        let plan = plan.expect("expected planning to succeed");
+        validate_distributed_stages(&plan, &session_cfg).expect("expected validation to pass");
     }
 }

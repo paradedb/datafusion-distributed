@@ -6,6 +6,7 @@ use crate::distributed_planner::inject_network_boundaries::{
 use crate::distributed_planner::insert_broadcast::insert_broadcast_execs;
 use crate::distributed_planner::partial_reduce_below_network_shuffles::partial_reduce_below_network_shuffles;
 use crate::distributed_planner::prepare_network_boundaries::prepare_network_boundaries;
+use crate::distributed_planner::validate_stages::validate_distributed_stages;
 use crate::distributed_planner::push_fetch_into_network_coalesce::push_fetch_into_network_coalesce;
 use crate::{DistributedConfig, DistributedExec, NetworkBoundaryExt, TaskEstimator};
 use async_trait::async_trait;
@@ -95,6 +96,7 @@ impl QueryPlanner for DistributedQueryPlanner {
                 return Ok(plan);
             }
             let plan = push_fetch_into_network_coalesce(plan)?;
+            validate_distributed_stages(&plan, session_cfg)?;
             return Ok(Arc::new(
                 DistributedExec::new(plan).with_metrics_collection(d_cfg.collect_metrics),
             ));
@@ -128,6 +130,7 @@ impl QueryPlanner for DistributedQueryPlanner {
 
         let plan = partial_reduce_below_network_shuffles(plan, cfg)?;
         let plan = push_fetch_into_network_coalesce(plan)?;
+        validate_distributed_stages(&plan, session_cfg)?;
 
         Ok(Arc::new(
             DistributedExec::new(plan).with_metrics_collection(d_cfg.collect_metrics),

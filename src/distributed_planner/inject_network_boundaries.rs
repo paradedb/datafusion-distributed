@@ -1,5 +1,4 @@
 use crate::TaskCountAnnotation::{Desired, Maximum};
-use crate::distributed_planner::insert_broadcast::is_left_broadcast_safe;
 use crate::distributed_planner::{CombinedTaskEstimator, TaskEstimator};
 use crate::execution_plans::{ChildWeight, ChildrenIsolatorUnionExec};
 use crate::stage::LocalStage;
@@ -10,12 +9,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{HashMap, Result, plan_err};
+use datafusion::common::{HashMap, JoinType, Result, plan_err};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
-use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -271,18 +272,28 @@ async fn _inject_network_boundaries(
         task_count = Desired(count);
     } else if let Some(node) = plan.downcast_ref::<HashJoinExec>()
         && node.mode == PartitionMode::CollectLeft
-        && (!broadcast_joins_enabled)
+        && (!broadcast_joins_enabled || node.null_aware)
     {
         // A CollectLeft join collects its entire build side in every task, so it can only run in
-        // a multi-task stage when [insert_broadcast_execs] broadcast the build side, which is only
-        // legal for join types that don't emit build-side rows. Everything else must run in a
-        // single task.
+        // a multi-task stage when [insert_broadcast_execs] broadcast the build side. That is not
+        // possible when broadcast joins are disabled, nor for null-aware anti joins, whose
+        // NULL-existence checks live in process-local shared state that cannot span tasks in any
+        // orientation. Other build-side-emitting join types were already rewritten to Partitioned
+        // by [normalize_collect_joins], so they never reach this arm.
         task_count = Maximum(1);
     } else if let Some(node) = plan.downcast_ref::<NestedLoopJoinExec>()
-        && (!broadcast_joins_enabled)
+        && (!broadcast_joins_enabled || node.join_type() == &JoinType::Full)
     {
-        // A NestedLoopJoin always collects its entire left side in every task, so the same
-        // reasoning as CollectLeft HashJoins above applies (it has no other partition mode).
+        // A NestedLoopJoin always collects its entire left side in every task, so it also needs
+        // its build side broadcast to run in a multi-task stage. Full joins emit unmatched rows
+        // from both sides, which needs global match knowledge that cannot span tasks, so they
+        // always run in a single task. Other build-side-emitting join types were already swapped
+        // to probe-side-emitting ones by [normalize_collect_joins].
+        task_count = Maximum(1);
+    } else if plan.is::<CrossJoinExec>() && !broadcast_joins_enabled {
+        // A CrossJoin also collects its entire left side in every task. It is always safe to
+        // broadcast (it emits only pair rows), so it is only restricted to a single task when
+        // broadcasts are unavailable.
         task_count = Maximum(1);
     } else {
         // The task count for this plan is decided by the biggest task count from the children; unless
@@ -638,6 +649,7 @@ impl NetworkBoundaryBuilder for CardinalityBasedNetworkBoundaryBuilder {
 mod tests {
     use super::*;
     use crate::distributed_planner::insert_broadcast::insert_broadcast_execs;
+    use crate::distributed_planner::normalize_collect_joins::normalize_collect_joins;
     use crate::test_utils::plans::{BuildSideOneTaskEstimator, TestPlanBuilder};
     use crate::{TaskEstimation, TaskEstimator, assert_snapshot};
     use datafusion::config::ConfigOptions;
@@ -720,11 +732,14 @@ mod tests {
             .distributed_planner(false)
             .broadcast_joins(false);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        HashJoinExec: task_count=Maximum(1)
-          CoalescePartitionsExec: task_count=Maximum(1)
-            DistributedLeafExec: task_count=Maximum(1)
-          DistributedLeafExec: task_count=Maximum(1)
+        assert_snapshot!(annotated, @"
+        HashJoinExec: task_count=Desired(4)
+          NetworkShuffleExec: task_count=Desired(4)
+            RepartitionExec: task_count=Desired(4)
+              DistributedLeafExec: task_count=Desired(4)
+          NetworkShuffleExec: task_count=Desired(4)
+            RepartitionExec: task_count=Desired(4)
+              DistributedLeafExec: task_count=Desired(4)
         ")
     }
 
@@ -760,10 +775,10 @@ mod tests {
             .distributed_planner(false)
             .broadcast_joins(false);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        HashJoinExec: task_count=Maximum(1)
-          CoalescePartitionsExec: task_count=Maximum(1)
-            NetworkCoalesceExec: task_count=Maximum(1)
+        assert_snapshot!(annotated, @"
+        HashJoinExec: task_count=Desired(2)
+          NetworkShuffleExec: task_count=Desired(2)
+            RepartitionExec: task_count=Desired(2)
               ProjectionExec: task_count=Desired(2)
                 AggregateExec: task_count=Desired(2)
                   NetworkShuffleExec: task_count=Desired(2)
@@ -772,14 +787,16 @@ mod tests {
                         FilterExec: task_count=Desired(4)
                           RepartitionExec: task_count=Desired(4)
                             DistributedLeafExec: task_count=Desired(4)
-          ProjectionExec: task_count=Maximum(1)
-            AggregateExec: task_count=Maximum(1)
-              NetworkShuffleExec: task_count=Maximum(1)
-                RepartitionExec: task_count=Desired(4)
-                  AggregateExec: task_count=Desired(4)
-                    FilterExec: task_count=Desired(4)
-                      RepartitionExec: task_count=Desired(4)
-                        DistributedLeafExec: task_count=Desired(4)
+          NetworkShuffleExec: task_count=Desired(2)
+            RepartitionExec: task_count=Desired(2)
+              ProjectionExec: task_count=Desired(2)
+                AggregateExec: task_count=Desired(2)
+                  NetworkShuffleExec: task_count=Desired(2)
+                    RepartitionExec: task_count=Desired(4)
+                      AggregateExec: task_count=Desired(4)
+                        FilterExec: task_count=Desired(4)
+                          RepartitionExec: task_count=Desired(4)
+                            DistributedLeafExec: task_count=Desired(4)
         ")
     }
 
@@ -1101,47 +1118,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nested_loop_left_join_capped() {
-        // A NestedLoopJoin always collects its entire left side in every task, and a Left
-        // join emits build-side rows, so it can never be broadcast: even with broadcast
-        // joins enabled, the join must be capped at a single task.
-        let query = r#"
-        SELECT a."MinTemp", b."MaxTemp"
-        FROM weather a LEFT JOIN weather b
-        ON a."MinTemp" < b."MaxTemp"
-        "#;
-
-        // Pin the plan shape: a non-equi join must plan as a NestedLoopJoin with a
-        // build-side-emitting join type.
-        let physical_plan_string = TestPlanBuilder::new()
-            .target_partitions(4)
-            .num_workers(4)
-            .build()
-            .await
-            .physical_plan_as_string(query)
-            .await;
-        assert!(physical_plan_string.contains("NestedLoopJoinExec"));
-
-        let test_plan_builder = TestPlanBuilder::new()
-            .target_partitions(4)
-            .num_workers(4)
-            // annotate_test_plan wants this as false so its s a single node plan
-            .distributed_planner(false)
-            .broadcast_joins(true);
-        let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @"
-        NestedLoopJoinExec: task_count=Maximum(1)
-          CoalescePartitionsExec: task_count=Maximum(1)
-            DistributedLeafExec: task_count=Maximum(1)
-          DistributedLeafExec: task_count=Maximum(1)
-        ");
-    }
-
-    #[tokio::test]
     async fn test_nested_loop_inner_join_broadcast() {
-        // The Inner counterpart of `test_nested_loop_left_join_capped`: Inner joins emit
-        // only probe-driven rows, so the left side can be broadcast and the join can run
-        // in a multi-task stage.
+        // Inner joins emit only probe-driven rows, so the left side can be broadcast and
+        // the join can run in a multi-task stage.
         let query = r#"
         SELECT a."MinTemp", b."MaxTemp"
         FROM weather a INNER JOIN weather b
@@ -1162,79 +1141,6 @@ mod tests {
                 DistributedLeafExec: task_count=Desired(4)
           DistributedLeafExec: task_count=Desired(4)
         ");
-    }
-
-    #[tokio::test]
-    async fn test_left_hash_join_not_broadcastable_capped() {
-        // A Left join emits build-side rows, so `insert_broadcast_execs` refuses to
-        // broadcast its build side even with broadcast joins enabled (same class as
-        // LeftSemi/LeftAnti/LeftMark, which is what TPC-DS q14/q95 hit). A CollectLeft
-        // join whose build side was not broadcast collects only its task's slice of the
-        // build data, so it must be capped to a single task.
-        let query = r#"
-        SELECT a."MinTemp", b."MaxTemp" FROM weather a LEFT JOIN weather b ON a."RainToday" = b."RainToday"
-        "#;
-
-        // Pin the plan shape: this must be a CollectLeft hash join with a
-        // build-side-emitting join type.
-        let physical_plan_string = TestPlanBuilder::new()
-            .target_partitions(4)
-            .num_workers(4)
-            .build()
-            .await
-            .physical_plan_as_string(query)
-            .await;
-        assert!(physical_plan_string.contains("HashJoinExec: mode=CollectLeft, join_type=Left"));
-
-        let test_plan_builder = TestPlanBuilder::new()
-            .target_partitions(4)
-            .num_workers(4)
-            // annotate_test_plan wants this as false so its s a single node plan
-            .distributed_planner(false)
-            .broadcast_joins(true);
-        let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        HashJoinExec: task_count=Maximum(1)
-          CoalescePartitionsExec: task_count=Maximum(1)
-            DistributedLeafExec: task_count=Maximum(1)
-          DistributedLeafExec: task_count=Maximum(1)
-        ")
-    }
-
-    #[tokio::test]
-    async fn test_cross_join_no_broadcast_capped() {
-        // A CrossJoin collects its entire left side in every task, just like a
-        // CollectLeft hash join. With broadcast joins disabled, `insert_broadcast_execs`
-        // inserts nothing, so the join must be capped to a single task or every task
-        // would pair only its slice of the left side with its slice of the right side.
-        let query = r#"
-        SELECT a."MinTemp", b."MaxTemp"
-        FROM weather a CROSS JOIN weather b
-        "#;
-
-        // Pin the plan shape: this must plan as a CrossJoin.
-        let physical_plan_string = TestPlanBuilder::new()
-            .target_partitions(4)
-            .num_workers(4)
-            .build()
-            .await
-            .physical_plan_as_string(query)
-            .await;
-        assert!(physical_plan_string.contains("CrossJoinExec"));
-
-        let test_plan_builder = TestPlanBuilder::new()
-            .target_partitions(4)
-            .num_workers(4)
-            // annotate_test_plan wants this as false so its s a single node plan
-            .distributed_planner(false)
-            .broadcast_joins(false);
-        let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        CrossJoinExec: task_count=Maximum(1)
-          CoalescePartitionsExec: task_count=Maximum(1)
-            DistributedLeafExec: task_count=Maximum(1)
-          DistributedLeafExec: task_count=Maximum(1)
-        ")
     }
 
     #[tokio::test]
@@ -1410,8 +1316,10 @@ mod tests {
         let plan = test_plan.physical_plan(query).await;
         let session_config = test_plan.get_ctx().copied_config();
 
-        let plan_w_broadcast = insert_broadcast_execs(plan, session_config.options())
-            .expect("failed to insert broadcasts");
+        let plan = normalize_collect_joins(plan, session_config.options())
+            .expect("failed to normalize collect joins");
+        let plan_w_broadcast =
+            insert_broadcast_execs(plan, session_config.options()).expect("failed to insert broadcasts");
         let network_boundaries_ctx = InjectNetworkBoundaryContext {
             cfg: session_config.options(),
             d_cfg: DistributedConfig::from_config_options(session_config.options()).unwrap(),

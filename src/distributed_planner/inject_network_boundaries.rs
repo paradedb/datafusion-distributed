@@ -9,12 +9,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{HashMap, Result, plan_err};
+use datafusion::common::{HashMap, JoinType, Result, plan_err};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -270,10 +272,28 @@ async fn _inject_network_boundaries(
         task_count = Desired(count);
     } else if let Some(node) = plan.downcast_ref::<HashJoinExec>()
         && node.mode == PartitionMode::CollectLeft
-        && !broadcast_joins_enabled
+        && (!broadcast_joins_enabled || node.null_aware)
     {
-        // Only distribute CollectLeft HashJoins after we broadcast more intelligently or when it
-        // is explicitly enabled.
+        // A CollectLeft join collects its entire build side in every task, so it can only run in
+        // a multi-task stage when [insert_broadcast_execs] broadcast the build side. That is not
+        // possible when broadcast joins are disabled, nor for null-aware anti joins, whose
+        // NULL-existence checks live in process-local shared state that cannot span tasks in any
+        // orientation. Other build-side-emitting join types were already rewritten to Partitioned
+        // by [normalize_collect_joins], so they never reach this arm.
+        task_count = Maximum(1);
+    } else if let Some(node) = plan.downcast_ref::<NestedLoopJoinExec>()
+        && (!broadcast_joins_enabled || node.join_type() == &JoinType::Full)
+    {
+        // A NestedLoopJoin always collects its entire left side in every task, so it also needs
+        // its build side broadcast to run in a multi-task stage. Full joins emit unmatched rows
+        // from both sides, which needs global match knowledge that cannot span tasks, so they
+        // always run in a single task. Other build-side-emitting join types were already swapped
+        // to probe-side-emitting ones by [normalize_collect_joins].
+        task_count = Maximum(1);
+    } else if plan.is::<CrossJoinExec>() && !broadcast_joins_enabled {
+        // A CrossJoin also collects its entire left side in every task. It is always safe to
+        // broadcast (it emits only pair rows), so it is only restricted to a single task when
+        // broadcasts are unavailable.
         task_count = Maximum(1);
     } else {
         // The task count for this plan is decided by the biggest task count from the children; unless
@@ -629,6 +649,7 @@ impl NetworkBoundaryBuilder for CardinalityBasedNetworkBoundaryBuilder {
 mod tests {
     use super::*;
     use crate::distributed_planner::insert_broadcast::insert_broadcast_execs;
+    use crate::distributed_planner::normalize_collect_joins::normalize_collect_joins;
     use crate::test_utils::plans::{BuildSideOneTaskEstimator, TestPlanBuilder};
     use crate::{TaskEstimation, TaskEstimator, assert_snapshot};
     use datafusion::config::ConfigOptions;
@@ -686,11 +707,11 @@ mod tests {
             .distributed_planner(false)
             .broadcast_joins(false);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
+        assert_snapshot!(annotated, @"
         SortPreservingMergeExec: task_count=Maximum(1)
           NetworkCoalesceExec: task_count=Maximum(1)
-            SortExec: task_count=Desired(3)
-              ProjectionExec: task_count=Desired(3)
+            ProjectionExec: task_count=Desired(3)
+              SortExec: task_count=Desired(3)
                 AggregateExec: task_count=Desired(3)
                   NetworkShuffleExec: task_count=Desired(3)
                     RepartitionExec: task_count=Desired(4)
@@ -711,11 +732,14 @@ mod tests {
             .distributed_planner(false)
             .broadcast_joins(false);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        HashJoinExec: task_count=Maximum(1)
-          CoalescePartitionsExec: task_count=Maximum(1)
-            DistributedLeafExec: task_count=Maximum(1)
-          DistributedLeafExec: task_count=Maximum(1)
+        assert_snapshot!(annotated, @"
+        HashJoinExec: task_count=Desired(4)
+          NetworkShuffleExec: task_count=Desired(4)
+            RepartitionExec: task_count=Desired(4)
+              DistributedLeafExec: task_count=Desired(4)
+          NetworkShuffleExec: task_count=Desired(4)
+            RepartitionExec: task_count=Desired(4)
+              DistributedLeafExec: task_count=Desired(4)
         ")
     }
 
@@ -751,10 +775,10 @@ mod tests {
             .distributed_planner(false)
             .broadcast_joins(false);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        HashJoinExec: task_count=Maximum(1)
-          CoalescePartitionsExec: task_count=Maximum(1)
-            NetworkCoalesceExec: task_count=Maximum(1)
+        assert_snapshot!(annotated, @"
+        HashJoinExec: task_count=Desired(2)
+          NetworkShuffleExec: task_count=Desired(2)
+            RepartitionExec: task_count=Desired(2)
               ProjectionExec: task_count=Desired(2)
                 AggregateExec: task_count=Desired(2)
                   NetworkShuffleExec: task_count=Desired(2)
@@ -763,14 +787,16 @@ mod tests {
                         FilterExec: task_count=Desired(4)
                           RepartitionExec: task_count=Desired(4)
                             DistributedLeafExec: task_count=Desired(4)
-          ProjectionExec: task_count=Maximum(1)
-            AggregateExec: task_count=Maximum(1)
-              NetworkShuffleExec: task_count=Maximum(1)
-                RepartitionExec: task_count=Desired(4)
-                  AggregateExec: task_count=Desired(4)
-                    FilterExec: task_count=Desired(4)
-                      RepartitionExec: task_count=Desired(4)
-                        DistributedLeafExec: task_count=Desired(4)
+          NetworkShuffleExec: task_count=Desired(2)
+            RepartitionExec: task_count=Desired(2)
+              ProjectionExec: task_count=Desired(2)
+                AggregateExec: task_count=Desired(2)
+                  NetworkShuffleExec: task_count=Desired(2)
+                    RepartitionExec: task_count=Desired(4)
+                      AggregateExec: task_count=Desired(4)
+                        FilterExec: task_count=Desired(4)
+                          RepartitionExec: task_count=Desired(4)
+                            DistributedLeafExec: task_count=Desired(4)
         ")
     }
 
@@ -1015,10 +1041,10 @@ mod tests {
             .await
             .physical_plan_as_string(query)
             .await;
-        assert_snapshot!(physical_plan_string, @r"
+        assert_snapshot!(physical_plan_string, @"
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(RainToday@1, RainToday@1)], projection=[MinTemp@0, MaxTemp@2]
           DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000000.parquet, /testdata/weather/result-000001.parquet, /testdata/weather/result-000002.parquet]]}, projection=[MinTemp, RainToday], file_type=parquet
-          DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000000.parquet, /testdata/weather/result-000001.parquet, /testdata/weather/result-000002.parquet]]}, projection=[MaxTemp, RainToday], file_type=parquet, predicate=DynamicFilter [ empty ]
+          DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000000.parquet, /testdata/weather/result-000001.parquet, /testdata/weather/result-000002.parquet]]}, projection=[MaxTemp, RainToday], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
         ");
 
         // With target_partitions=1, there is no CoalescePartitionsExec initially
@@ -1088,6 +1114,32 @@ mod tests {
               BroadcastExec: task_count=Desired(3)
                 DistributedLeafExec: task_count=Desired(3)
           DistributedLeafExec: task_count=Maximum(1)
+        ");
+    }
+
+    #[tokio::test]
+    async fn test_nested_loop_inner_join_broadcast() {
+        // Inner joins emit only probe-driven rows, so the left side can be broadcast and
+        // the join can run in a multi-task stage.
+        let query = r#"
+        SELECT a."MinTemp", b."MaxTemp"
+        FROM weather a INNER JOIN weather b
+        ON a."MinTemp" < b."MaxTemp"
+        "#;
+        let test_plan_builder = TestPlanBuilder::new()
+            .target_partitions(4)
+            .num_workers(4)
+            // annotate_test_plan wants this as false so its s a single node plan
+            .distributed_planner(false)
+            .broadcast_joins(true);
+        let annotated = annotate_test_plan(test_plan_builder, query).await;
+        assert_snapshot!(annotated, @"
+        NestedLoopJoinExec: task_count=Desired(4)
+          CoalescePartitionsExec: task_count=Desired(4)
+            NetworkBroadcastExec: task_count=Desired(4)
+              BroadcastExec: task_count=Desired(4)
+                DistributedLeafExec: task_count=Desired(4)
+          DistributedLeafExec: task_count=Desired(4)
         ");
     }
 
@@ -1264,6 +1316,8 @@ mod tests {
         let plan = test_plan.physical_plan(query).await;
         let session_config = test_plan.get_ctx().copied_config();
 
+        let plan = normalize_collect_joins(plan, session_config.options())
+            .expect("failed to normalize collect joins");
         let plan_w_broadcast = insert_broadcast_execs(plan, session_config.options())
             .expect("failed to insert broadcasts");
         let network_boundaries_ctx = InjectNetworkBoundaryContext {

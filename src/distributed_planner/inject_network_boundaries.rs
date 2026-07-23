@@ -160,9 +160,9 @@ pub(crate) async fn inject_network_boundaries(
 pub(crate) struct InjectNetworkBoundaryContext<'a> {
     pub(crate) d_cfg: &'a DistributedConfig,
 
-    cfg: &'a ConfigOptions,
+    pub(crate) cfg: &'a ConfigOptions,
     worker_resolver: Arc<WorkerResolverExtension>,
-    task_estimator: Arc<CombinedTaskEstimator>,
+    pub(crate) task_estimator: Arc<CombinedTaskEstimator>,
     nb_builder: &'a (dyn NetworkBoundaryBuilder + Send + Sync),
     task_counts: &'a Mutex<HashMap<usize, TaskCountAnnotation>>,
     query_id: Uuid,

@@ -23,7 +23,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning};
 use datafusion_proto::physical_plan::{
-    AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec, PhysicalPlanNodeExt,
+    DefaultPhysicalExtensionCodec, PhysicalExtensionCodec, PhysicalPlanNodeExt,
     PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf::proto_error;

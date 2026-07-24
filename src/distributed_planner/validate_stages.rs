@@ -20,7 +20,11 @@
 //!
 //! (A) every declared input-distribution requirement must hold *cluster-globally*:
 //!     `SinglePartition` may only be satisfied by a replicated subtree, and
-//!     `HashPartitioned` only by a global shuffle (or a replicated copy);
+//!     `HashPartitioned` only by a claim that (1) semantically satisfies the required
+//!     expressions — checked with [Partitioning::satisfaction] against the child's claimed
+//!     output partitioning and equivalence classes, exactly as DataFusion's own
+//!     EnforceDistribution/SanityCheckPlan do process-locally — and (2) is globally true,
+//!     i.e. established by a global exchange rather than a stage-local repartition;
 //! (B) replicated data may only feed operators that never *emit* rows driven by it —
 //!     N task instances would emit such rows N times, and the machinery that deduplicates
 //!     them in a single process (e.g. the hash join's shared visited bitmap) does not exist
@@ -54,9 +58,12 @@ enum DataFlow {
     /// Every task materializes the identical, complete dataset.
     Replicated,
     /// Every task materializes a task-specific subset; the union across tasks is the whole
-    /// dataset. `by_key` is true when rows were routed by a *global* hash exchange, so all
-    /// rows with equal keys live in the same task-local partition.
-    Partitioned { by_key: bool },
+    /// dataset. `claims_are_global` records provenance: whether the partitioning this
+    /// subtree *claims* in its `PlanProperties` (e.g. `Partitioning::Hash`) was established
+    /// by a global exchange (or exchange-aligned storage) and merely preserved since — as
+    /// opposed to being minted task-locally by a stage-local `RepartitionExec`, where the
+    /// same claim only holds within each task's slice of the data.
+    Partitioned { claims_are_global: bool },
 }
 
 /// Validates every stage embedded in a fully planned distributed plan.
@@ -115,7 +122,9 @@ fn classify(
         return Ok(DataFlow::Replicated);
     }
     if node.is::<NetworkShuffleExec>() {
-        return Ok(DataFlow::Partitioned { by_key: true });
+        return Ok(DataFlow::Partitioned {
+            claims_are_global: true,
+        });
     }
     if node.is_network_boundary() {
         // NetworkCoalesceExec (or a future boundary type): gathers all partitions into a
@@ -132,8 +141,8 @@ fn classify(
     // (hive-style pre-partitioned files with `preserve_file_partitions`), the per-task
     // slicing follows those same partitions, so equal keys still co-locate cluster-wide.
     if node.is::<DistributedLeafExec>() {
-        let by_key = matches!(node.output_partitioning(), Partitioning::Hash(..));
-        return Ok(DataFlow::Partitioned { by_key });
+        let claims_are_global = matches!(node.output_partitioning(), Partitioning::Hash(..));
+        return Ok(DataFlow::Partitioned { claims_are_global });
     }
     // A ChildrenIsolatorUnionExec divides the stage's tasks among its children: child `i`
     // executes only in the tasks its `task_idx_map` assigns to it. Each child subtree must
@@ -159,7 +168,9 @@ fn classify(
         }
         // Children occupy disjoint task allotments, so across the stage's tasks the union
         // emits each child's data exactly once.
-        return Ok(DataFlow::Partitioned { by_key: false });
+        return Ok(DataFlow::Partitioned {
+            claims_are_global: false,
+        });
     }
     let children = node.children();
     if children.is_empty() {
@@ -173,7 +184,7 @@ fn classify(
         // that.
         return Ok(if estimator.task_estimation(node, cfg).is_some() {
             DataFlow::Partitioned {
-                by_key: matches!(node.output_partitioning(), Partitioning::Hash(..)),
+                claims_are_global: matches!(node.output_partitioning(), Partitioning::Hash(..)),
             }
         } else {
             DataFlow::Replicated
@@ -206,20 +217,82 @@ fn classify(
                 }
             }
             Distribution::HashPartitioned(_) => {
-                if matches!(flow, DataFlow::Partitioned { by_key: false }) {
-                    return plan_err!(
-                        "{} requires its input {idx} ({}) to be hash-partitioned, but in a \
-                         {tasks}-task stage that partitioning was established task-locally: \
-                         equal keys living in different tasks would never meet. The input \
-                         must come through a NetworkShuffleExec",
-                        node.name(),
-                        child.name()
+                // `Replicated` inputs pass both checks below: every task computes over the
+                // complete data, and whether the resulting duplication is legal is decided
+                // where it mixes into partitioned flow, or at the stage root.
+                if let DataFlow::Partitioned { claims_are_global } = flow {
+                    // Semantic check, delegated to DataFusion: does the child's claimed
+                    // output partitioning satisfy the required expressions? Equivalence
+                    // classes make renamed keys pass; dropped or wrong keys fail. Subset
+                    // satisfaction — partitioned on a subset of the required keys — still
+                    // co-locates equal keys and is accepted, matching what
+                    // EnforceDistribution accepts process-locally (e.g. an aggregate
+                    // grouping on a superset of its input's join keys).
+                    // DataFusion 54 does not export the type `satisfaction` returns, so a
+                    // reference NotSatisfied value (an unknown partitioning can never
+                    // satisfy a hash requirement) stands in for naming the variant.
+                    let eq_properties = child.equivalence_properties();
+                    let not_satisfied = Partitioning::UnknownPartitioning(2).satisfaction(
+                        requirement,
+                        eq_properties,
+                        true,
                     );
-                    // `Partitioned { by_key: true }` is a global shuffle. `Replicated` also
-                    // passes: every task computes over the complete data, and whether the
-                    // resulting duplication is legal is decided where it mixes into
-                    // partitioned flow, or at the stage root.
+                    let satisfaction = child.output_partitioning().satisfaction(
+                        requirement,
+                        eq_properties,
+                        true,
+                    );
+                    if satisfaction == not_satisfied {
+                        return plan_err!(
+                            "{} requires its input {idx} ({}) to be hash-partitioned on \
+                             specific keys, but that input's claimed partitioning ({}) does \
+                             not satisfy the requirement",
+                            node.name(),
+                            child.name(),
+                            child.output_partitioning()
+                        );
+                    }
+                    // Provenance check: the claim must be globally true. A stage-local
+                    // RepartitionExec mints the same claim, but it runs once per task over
+                    // only that task's slice, so equal keys living in different tasks would
+                    // never meet.
+                    if !claims_are_global {
+                        return plan_err!(
+                            "{} requires its input {idx} ({}) to be hash-partitioned, but \
+                             in a {tasks}-task stage that partitioning was established \
+                             task-locally: equal keys living in different tasks would never \
+                             meet. The input must come through a NetworkShuffleExec",
+                            node.name(),
+                            child.name()
+                        );
+                    }
                 }
+            }
+        }
+    }
+
+    // Partitioned consumers zip partition `i` of every hash-required input within a task,
+    // so all such inputs must agree on partition count — otherwise equal keys land at
+    // different partition indices and never meet.
+    let mut hash_partitioned_counts = children
+        .iter()
+        .zip(&child_flows)
+        .zip(&requirements)
+        .enumerate()
+        .filter(|(_, ((_, flow), requirement))| {
+            matches!(requirement, Distribution::HashPartitioned(_))
+                && matches!(flow, DataFlow::Partitioned { .. })
+        })
+        .map(|(idx, ((child, _), _))| (idx, child.output_partitioning().partition_count()));
+    if let Some((first_idx, first_count)) = hash_partitioned_counts.next() {
+        for (idx, count) in hash_partitioned_counts {
+            if count != first_count {
+                return plan_err!(
+                    "{} requires co-partitioned inputs, but input {first_idx} claims \
+                     {first_count} partitions while input {idx} claims {count}: equal keys \
+                     would land at different partition indices and never meet",
+                    node.name()
+                );
             }
         }
     }
@@ -246,17 +319,20 @@ fn classify(
         }
     }
 
-    // Global key-partitioning survives only through operators that don't reshuffle rows
-    // between partitions. A stage-local RepartitionExec re-routes within the task, so its
-    // output partitions are no longer globally keyed.
-    // NOTE: this is an approximation; a production version should consult
-    // `node.properties().output_partitioning()` and equivalence classes instead.
-    let by_key = !node.is::<RepartitionExec>()
+    // Provenance propagation. DataFusion's PlanProperties already carry each node's claimed
+    // partitioning through the operators — remapped through equivalence classes on renames,
+    // degraded when keys are projected away — so the *content* of the claim needs no
+    // tracking here; consumers check it with [Partitioning::satisfy] above. The one thing
+    // PlanProperties cannot express is whether a claim is globally true. A stage-local
+    // RepartitionExec is the only stage-local operator that mints new claims, and it runs
+    // once per task over only that task's slice, so its claims hold task-locally only.
+    // Every other operator inherits its claim from its children, preserving provenance.
+    let claims_are_global = !node.is::<RepartitionExec>()
         && child_flows.iter().all(|flow| match flow {
-            DataFlow::Partitioned { by_key } => *by_key,
+            DataFlow::Partitioned { claims_are_global } => *claims_are_global,
             DataFlow::Replicated => true,
         });
-    Ok(DataFlow::Partitioned { by_key })
+    Ok(DataFlow::Partitioned { claims_are_global })
 }
 
 /// The one fact about an operator that no DataFusion API exposes: does it emit output rows
@@ -391,5 +467,140 @@ mod tests {
         .await;
         let plan = plan.expect("expected planning to succeed");
         validate_distributed_stages(&plan, &session_cfg).expect("expected validation to pass");
+    }
+
+    // ---- Hand-built plans below: shapes the real planner never produces, exercising the
+    // ---- claim-satisfaction, provenance, and co-partitioning checks directly. The stub
+    // ---- estimator (`&4usize`) claims every childless leaf, making it task-varying.
+
+    use crate::stage::LocalStage;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::{JoinType, NullEquality};
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+    use datafusion::physical_plan::PlanProperties;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use uuid::Uuid;
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]))
+    }
+
+    fn column(name: &str, schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Column::new_with_schema(name, schema).unwrap())
+    }
+
+    /// A stand-in for a real shuffle: a [NetworkShuffleExec] whose stage claims
+    /// `Hash([key], partitions)`. Classified as globally partitioned by construction.
+    fn fake_shuffle(key: &str, partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let schema = test_schema();
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::Hash(vec![column(key, &schema)], partitions),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Arc::new(NetworkShuffleExec::from_stage(
+            Stage::Local(LocalStage {
+                query_id: Uuid::default(),
+                num: 1,
+                plan: Arc::new(EmptyExec::new(schema)),
+                tasks: 4,
+                metrics_set: Default::default(),
+            }),
+            properties,
+        ))
+    }
+
+    /// A Partitioned hash join between `left` and `right` on `key` = `key`.
+    fn partitioned_join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        key: &str,
+    ) -> Arc<dyn ExecutionPlan> {
+        let on = vec![(column(key, &left.schema()), column(key, &right.schema()))];
+        Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn validate(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
+        validate_stage_plan(plan, 4, &4usize, &ConfigOptions::default())
+    }
+
+    #[test]
+    fn accepts_partitioned_join_over_matching_global_shuffles() {
+        let join = partitioned_join(fake_shuffle("a", 4), fake_shuffle("a", 4), "a");
+        validate(&join).expect("expected validation to pass");
+    }
+
+    #[test]
+    fn rejects_partitioned_join_on_wrong_key() {
+        // Both sides are globally partitioned — but the left one on `b`, while the join
+        // requires partitioning on `a`. The provenance bit alone cannot see this; the
+        // claim-satisfaction check must.
+        let join = partitioned_join(fake_shuffle("b", 4), fake_shuffle("a", 4), "a");
+        let err = validate(&join).expect_err("expected validation to fail");
+        assert!(
+            err.to_string().contains("does not satisfy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_partitioned_join_over_stage_local_repartition() {
+        // The repartition claims exactly the required Hash([a], 4) — the claim satisfies,
+        // but it was minted inside the stage over the task's own slice of the leaf.
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(test_schema()));
+        let hash = Partitioning::Hash(vec![column("a", &test_schema())], 4);
+        let repartition: Arc<dyn ExecutionPlan> =
+            Arc::new(RepartitionExec::try_new(leaf, hash).unwrap());
+        let join = partitioned_join(repartition, fake_shuffle("a", 4), "a");
+        let err = validate(&join).expect_err("expected validation to fail");
+        assert!(
+            err.to_string().contains("established task-locally"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_partitioned_join_with_mismatched_partition_counts() {
+        let join = partitioned_join(fake_shuffle("a", 4), fake_shuffle("a", 8), "a");
+        let err = validate(&join).expect_err("expected validation to fail");
+        assert!(
+            err.to_string().contains("co-partitioned"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_renamed_key_through_projection() {
+        // Each side renames `a` to `x` above a shuffle hashed on `a`; the join keys
+        // reference `x`. DataFusion remaps the claimed Hash([a]) through the projection's
+        // equivalence mapping, so the satisfaction check passes under the new name.
+        let renamed = || -> Arc<dyn ExecutionPlan> {
+            let shuffle = fake_shuffle("a", 4);
+            let exprs = vec![(column("a", &shuffle.schema()), "x".to_string())];
+            Arc::new(ProjectionExec::try_new(exprs, shuffle).unwrap())
+        };
+        let join = partitioned_join(renamed(), renamed(), "x");
+        validate(&join).expect("expected validation to pass");
     }
 }

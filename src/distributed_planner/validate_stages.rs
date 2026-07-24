@@ -37,8 +37,8 @@
 use std::sync::Arc;
 
 use datafusion::common::{Result, plan_err};
-use datafusion::physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};
 use datafusion::physical_expr::Partitioning;
+use datafusion::physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{Distribution, ExecutionPlan, ExecutionPlanProperties};
 
@@ -198,8 +198,11 @@ fn classify(
 
     // Obligation (A): declared input-distribution requirements must hold cluster-globally.
     let requirements = node.required_input_distribution();
-    for (idx, ((child, flow), requirement)) in
-        children.iter().zip(&child_flows).zip(&requirements).enumerate()
+    for (idx, ((child, flow), requirement)) in children
+        .iter()
+        .zip(&child_flows)
+        .zip(&requirements)
+        .enumerate()
     {
         match requirement {
             Distribution::UnspecifiedDistribution => {}
@@ -237,11 +240,10 @@ fn classify(
                         eq_properties,
                         true,
                     );
-                    let satisfaction = child.output_partitioning().satisfaction(
-                        requirement,
-                        eq_properties,
-                        true,
-                    );
+                    let satisfaction =
+                        child
+                            .output_partitioning()
+                            .satisfaction(requirement, eq_properties, true);
                     if satisfaction == not_satisfied {
                         return plan_err!(
                             "{} requires its input {idx} ({}) to be hash-partitioned on \

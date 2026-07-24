@@ -1318,8 +1318,8 @@ mod tests {
 
         let plan = normalize_collect_joins(plan, session_config.options())
             .expect("failed to normalize collect joins");
-        let plan_w_broadcast =
-            insert_broadcast_execs(plan, session_config.options()).expect("failed to insert broadcasts");
+        let plan_w_broadcast = insert_broadcast_execs(plan, session_config.options())
+            .expect("failed to insert broadcasts");
         let network_boundaries_ctx = InjectNetworkBoundaryContext {
             cfg: session_config.options(),
             d_cfg: DistributedConfig::from_config_options(session_config.options()).unwrap(),

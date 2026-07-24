@@ -1184,7 +1184,7 @@ mod tests {
         // partition's state no matter the batch size.
         let query = "SELECT val, length(max(s)) AS l FROM t GROUP BY val";
         let plan = ctx.sql(query).await?.create_physical_plan().await?;
-        let display = display_plan_ascii(plan.as_ref(), false);
+        let display = display_plan_ascii(plan.as_ref(), DisplayMetrics::None);
         let batches: Vec<_> = execute_stream(plan, ctx.task_ctx())?.try_collect().await?;
         let mut lines: Vec<String> = pretty_format_batches(&batches)?
             .to_string()

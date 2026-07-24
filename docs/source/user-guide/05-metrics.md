@@ -59,7 +59,7 @@ let plan =
     rewrite_distributed_plan_with_metrics(plan, DistributedMetricsFormat::Aggregated).await?;
 
 // 4. ...and render it.
-println!("{}", display_plan_ascii(plan.as_ref(), true));
+println!("{}", display_plan_ascii(plan.as_ref(), DisplayMetrics::All));
 ```
 
 This produces an EXPLAIN ANALYZE that spans the whole cluster — every stage and every node carries its

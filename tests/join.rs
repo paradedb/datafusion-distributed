@@ -11,7 +11,7 @@ mod tests {
         prelude::{ParquetReadOptions, SessionContext, col},
     };
     use datafusion_distributed::{
-        DefaultSessionBuilder, assert_snapshot, display_plan_ascii,
+        DefaultSessionBuilder, DisplayMetrics, assert_snapshot, display_plan_ascii,
         test_utils::localhost::start_localhost_context,
     };
 
@@ -71,7 +71,7 @@ mod tests {
         let df = ctx.sql(query).await?;
         let (state, logical_plan) = df.into_parts();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
-        let distributed_plan = display_plan_ascii(physical_plan.as_ref(), false);
+        let distributed_plan = display_plan_ascii(physical_plan.as_ref(), DisplayMetrics::None);
         println!("\n——————— DISTRIBUTED PLAN ———————\n\n{distributed_plan}");
 
         let distributed_results = collect(physical_plan, state.task_ctx()).await?;

@@ -4,8 +4,9 @@ use crate::coordinator::DistributedExec;
 use crate::stage::Stage;
 #[cfg(test)]
 use crate::{
-    DistributedConfig, DistributedExt, SessionStateBuilderExt, TaskEstimation, TaskEstimator,
-    display_plan_ascii, test_utils::in_memory_channel_resolver::InMemoryWorkerResolver,
+    DisplayMetrics, DistributedConfig, DistributedExt, SessionStateBuilderExt, TaskEstimation,
+    TaskEstimator, display_plan_ascii,
+    test_utils::in_memory_channel_resolver::InMemoryWorkerResolver,
 };
 use crate::{NetworkBoundaryExt, TaskKey};
 #[cfg(test)]
@@ -325,7 +326,13 @@ impl TestPlanBuilder {
 
     /// get the physical plan of a query as an ascii string
     pub async fn physical_plan_as_ascii(&self, query: &str, show_metrics: bool) -> String {
-        display_plan_ascii(self.physical_plan(query).await.as_ref(), show_metrics)
+        display_plan_ascii(
+            self.physical_plan(query).await.as_ref(),
+            match show_metrics {
+                true => DisplayMetrics::All,
+                false => DisplayMetrics::None,
+            },
+        )
     }
 }
 

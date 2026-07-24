@@ -227,6 +227,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
 use datafusion::common::stats::Precision;
 use datafusion::physical_expr::Partitioning;
+use datafusion::physical_plan::metrics::MetricValue;
+
 /// Be able to display a nice tree for stages.
 ///
 /// The challenge to doing this at the moment is that `TreeRenderVisitor`
@@ -252,9 +254,16 @@ pub async fn explain_analyze(
             .to_string()),
         Some(_) => {
             let executed = rewrite_distributed_plan_with_metrics(executed.clone(), format).await?;
-            Ok(display_plan_ascii(executed.as_ref(), true))
+            Ok(display_plan_ascii(executed.as_ref(), DisplayMetrics::All))
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMetrics {
+    None,
+    NoTiming, // Includes metrics, but strips `elapsed_compute` and `Time` values
+    All,
 }
 
 // Unicode box-drawing characters for creating borders and connections.
@@ -262,17 +271,19 @@ const LTCORNER: &str = "┌"; // Left top corner
 const LDCORNER: &str = "└"; // Left bottom corner
 const VERTICAL: &str = "│"; // Vertical line
 const HORIZONTAL: &str = "─"; // Horizontal line
-pub fn display_plan_ascii(plan: &dyn ExecutionPlan, show_metrics: bool) -> String {
+pub fn display_plan_ascii(plan: &dyn ExecutionPlan, show_metrics: DisplayMetrics) -> String {
     if let Some(plan) = plan.downcast_ref::<DistributedExec>() {
         let mut f = String::new();
         display_ascii(plan, Either::Left(plan), 0, show_metrics, &mut f).unwrap();
         f
     } else {
         match show_metrics {
-            true => DisplayableExecutionPlan::with_metrics(plan)
-                .indent(true)
-                .to_string(),
-            false => displayable(plan).indent(true).to_string(),
+            DisplayMetrics::All | DisplayMetrics::NoTiming => {
+                DisplayableExecutionPlan::with_metrics(plan)
+                    .indent(true)
+                    .to_string()
+            }
+            DisplayMetrics::None => displayable(plan).indent(true).to_string(),
         }
     }
 }
@@ -281,7 +292,7 @@ fn display_ascii(
     root: &DistributedExec,
     stage: Either<&DistributedExec, &Stage>,
     depth: usize,
-    show_metrics: bool,
+    show_metrics: DisplayMetrics,
     f: &mut String,
 ) -> std::fmt::Result {
     let plan = match stage {
@@ -304,12 +315,14 @@ fn display_ascii(
                 LTCORNER,
                 HORIZONTAL.repeat(5),
             )?;
-            if show_metrics && let Some(metrics) = dist_exec.metrics() {
+            if show_metrics != DisplayMetrics::None
+                && let Some(metrics) = dist_exec.metrics()
+            {
                 writeln!(
                     f,
                     " {} {}",
                     HORIZONTAL.repeat(2),
-                    format_metrics_by_task(&metrics)
+                    format_metrics_by_task(&metrics, show_metrics)
                 )?;
             } else {
                 writeln!(f)?;
@@ -326,10 +339,12 @@ fn display_ascii(
                 HORIZONTAL.repeat(2),
                 format_tasks_for_stage(stage.task_count(), plan)
             )?;
-            if show_metrics && let Some(metrics_store) = &root.metrics_store {
+            if show_metrics != DisplayMetrics::None
+                && let Some(metrics_store) = &root.metrics_store
+            {
                 let metrics = gather_stage_header_metrics(stage, metrics_store);
                 write!(f, " ")?;
-                writeln!(f, "{}", format_metrics_by_task(&metrics))?;
+                writeln!(f, "{}", format_metrics_by_task(&metrics, show_metrics))?;
             } else {
                 writeln!(f)?;
             }
@@ -360,7 +375,7 @@ fn display_ascii(
 fn display_inner_ascii(
     plan: &Arc<dyn ExecutionPlan>,
     indent: usize,
-    show_metrics: bool,
+    show_metrics: DisplayMetrics,
     f: &mut String,
 ) -> std::fmt::Result {
     if plan.is::<DistributedLeafExec>() {
@@ -369,8 +384,11 @@ fn display_inner_ascii(
 
     let node_str = displayable(plan.as_ref()).one_line().to_string();
     let metrics_str = match show_metrics {
-        true => metrics_suffix(plan.metrics().map(|m| format_metrics_by_task(&m))),
-        false => String::new(),
+        DisplayMetrics::All | DisplayMetrics::NoTiming => metrics_suffix(
+            plan.metrics()
+                .map(|m| format_metrics_by_task(&m, show_metrics)),
+        ),
+        DisplayMetrics::None => String::new(),
     };
     writeln!(
         f,
@@ -392,7 +410,7 @@ fn display_inner_ascii(
 fn display_inner_distributed_leaf(
     plan: &Arc<dyn ExecutionPlan>,
     indent: usize,
-    show_metrics: bool,
+    show_metrics: DisplayMetrics,
     f: &mut String,
 ) -> std::fmt::Result {
     let Some(leaf) = plan.downcast_ref::<DistributedLeafExec>() else {
@@ -404,7 +422,7 @@ fn display_inner_distributed_leaf(
     // per-task metrics live on `plan.metrics()` (the wrapper), not on `leaf.metrics()` (which
     // delegates to the un-rewritten original). Split them by task id to show each variant's
     // own metrics.
-    if let Some(by_task) = show_metrics
+    if let Some(by_task) = (show_metrics != DisplayMetrics::None)
         .then(|| plan.metrics())
         .flatten()
         .map(|m| metrics_by_task_id(&m))
@@ -415,13 +433,20 @@ fn display_inner_distributed_leaf(
             let variant = displayable(variant.as_ref()).one_line().to_string();
             let metrics = match by_task.is_empty() {
                 true => String::new(),
-                false => metrics_suffix(by_task.get(&task_i).map(format_metrics_by_task)),
+                false => metrics_suffix(
+                    by_task
+                        .get(&task_i)
+                        .map(|m| format_metrics_by_task(m, show_metrics)),
+                ),
             };
             writeln!(f, "{indent}   t{task_i}: {}{metrics}", variant.trim_end())?;
         }
     } else {
-        let header = match show_metrics {
-            true => metrics_suffix(plan.metrics().map(|m| format_metrics_by_task(&m))),
+        let header = match show_metrics != DisplayMetrics::None {
+            true => metrics_suffix(
+                plan.metrics()
+                    .map(|m| format_metrics_by_task(&m, show_metrics)),
+            ),
             false => String::new(),
         };
         writeln!(f, "{indent} DistributedLeafExec:{header}")?;
@@ -541,9 +566,27 @@ fn sorted_for_display_by_task_id(metrics: MetricsSet) -> MetricsSet {
 ///
 /// See
 /// https://github.com/apache/datafusion/blob/b463a9f9e3c9603eb2db7113125fea3a1b7f5455/datafusion/physical-plan/src/display.rs#L421.
-fn format_metrics_by_task(metrics: &MetricsSet) -> String {
+fn format_metrics_by_task(metrics: &MetricsSet, show_metrics: DisplayMetrics) -> String {
     let aggregated = aggregate_by_task_id(metrics);
-    let sorted = sorted_for_display_by_task_id(aggregated).timestamps_removed();
+    let mut sorted = sorted_for_display_by_task_id(aggregated).timestamps_removed();
+
+    if show_metrics == DisplayMetrics::NoTiming {
+        let filtered: Vec<_> = sorted
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    m.value(),
+                    MetricValue::ElapsedCompute(_) | MetricValue::Time { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let mut new_set = MetricsSet::new();
+        for m in filtered {
+            new_set.push(m);
+        }
+        sorted = new_set;
+    }
 
     // Metrics are sorted by (name, task_id), so entries sharing a name are contiguous. Fold each
     // name into a single group, then render task-labeled values as a `{task_id:value, ...}` map and
@@ -1089,7 +1132,7 @@ mod tests {
             output_rows(200, Some(2)),
         ]);
         assert_eq!(
-            format_metrics_by_task(&set),
+            format_metrics_by_task(&set, DisplayMetrics::All),
             "output_rows={0:100, 1:150, 2:200}"
         );
     }
@@ -1100,13 +1143,19 @@ mod tests {
         // reports a non-contiguous set of ids. The map keeps them explicit; a positional list
         // would misread task 2's value as task 1's.
         let set = metrics_set([output_rows(100, Some(0)), output_rows(200, Some(2))]);
-        assert_eq!(format_metrics_by_task(&set), "output_rows={0:100, 2:200}");
+        assert_eq!(
+            format_metrics_by_task(&set, DisplayMetrics::All),
+            "output_rows={0:100, 2:200}"
+        );
     }
 
     #[test]
     fn format_metrics_by_task_without_task_ids_stays_scalar() {
         let set = metrics_set([output_rows(100, None)]);
-        assert_eq!(format_metrics_by_task(&set), "output_rows=100");
+        assert_eq!(
+            format_metrics_by_task(&set, DisplayMetrics::All),
+            "output_rows=100"
+        );
     }
 
     fn single_column_schema() -> Arc<Schema> {

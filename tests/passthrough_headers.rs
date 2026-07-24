@@ -6,7 +6,9 @@ mod tests {
     use datafusion::physical_plan::execute_stream;
     use datafusion_distributed::test_utils::localhost::start_localhost_context;
     use datafusion_distributed::test_utils::parquet::register_parquet_tables;
-    use datafusion_distributed::{DistributedExt, WorkerQueryContext, display_plan_ascii};
+    use datafusion_distributed::{
+        DisplayMetrics, DistributedExt, WorkerQueryContext, display_plan_ascii,
+    };
     use futures::TryStreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue};
 
@@ -39,7 +41,7 @@ mod tests {
         register_parquet_tables(&ctx).await?;
         let df = ctx.sql(query).await?;
         let plan = df.create_physical_plan().await?;
-        let display = display_plan_ascii(plan.as_ref(), false);
+        let display = display_plan_ascii(plan.as_ref(), DisplayMetrics::None);
         println!("{display}");
 
         let stream = execute_stream(plan, ctx.task_ctx())?;

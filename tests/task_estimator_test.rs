@@ -5,7 +5,7 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::{error::DataFusionError, execution::SessionState, physical_plan::collect};
     use datafusion_distributed::{
-        DistributedExt, WorkerQueryContext, assert_snapshot, display_plan_ascii,
+        DisplayMetrics, DistributedExt, WorkerQueryContext, assert_snapshot, display_plan_ascii,
         test_utils::{
             in_memory_channel_resolver::start_in_memory_context,
             routing::{URLEmitterExtensionCodec, URLEmitterFunction, URLEmitterTaskEstimator},
@@ -394,7 +394,7 @@ mod tests {
 
         let df = ctx.sql(sql).await?;
         let plan = df.create_physical_plan().await?;
-        let plan_display = display_plan_ascii(plan.as_ref(), false);
+        let plan_display = display_plan_ascii(plan.as_ref(), DisplayMetrics::None);
 
         let batches = collect(plan, ctx.task_ctx()).await?;
         let formatted = pretty_format_batches(&batches)?;

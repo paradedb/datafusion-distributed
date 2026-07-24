@@ -56,8 +56,8 @@ use datafusion_distributed::test_utils::in_memory_channel_resolver::{
     InMemoryChannelResolver, InMemoryWorkerResolver,
 };
 use datafusion_distributed::{
-    DistributedExt, NetworkCoalesceExec, SessionStateBuilderExt, WorkerQueryContext,
-    display_plan_ascii,
+    DisplayMetrics, DistributedExt, NetworkCoalesceExec, SessionStateBuilderExt,
+    WorkerQueryContext, display_plan_ascii,
 };
 use futures::TryStreamExt;
 use std::sync::Arc;
@@ -273,7 +273,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = ctx.sql(&args.query).await?;
     if args.show_distributed_plan {
         let plan = df.create_physical_plan().await?;
-        println!("{}", display_plan_ascii(plan.as_ref(), false));
+        println!(
+            "{}",
+            display_plan_ascii(plan.as_ref(), DisplayMetrics::None)
+        );
     } else {
         let batches = df.execute_stream().await?.try_collect::<Vec<_>>().await?;
         println!("{}", pretty_format_batches(&batches)?);

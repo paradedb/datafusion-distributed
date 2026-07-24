@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_ec2::Client as Ec2Client;
@@ -15,7 +16,7 @@ use datafusion_distributed::test_utils::work_unit_file_scan::{
     WorkUnitFileScanCodec, WorkUnitFileScanConfig, WorkUnitFileScanTaskEstimator,
 };
 use datafusion_distributed::{
-    ChannelResolver, DistributedExt, DistributedMetricsFormat, NetworkBoundaryExt,
+    ChannelResolver, DisplayMetrics, DistributedExt, DistributedMetricsFormat, NetworkBoundaryExt,
     SessionStateBuilderExt, Worker, WorkerQueryContext, WorkerResolver, display_plan_ascii,
     get_distributed_channel_resolver, get_distributed_worker_resolver,
     rewrite_distributed_plan_with_metrics,
@@ -212,7 +213,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .await
                         .map_err(err)?;
                         let stats_q_error = stats_estimation_q_error(&physical);
-                        let plan = display_plan_ascii(physical.as_ref(), true);
+                        let plan = display_plan_ascii(physical.as_ref(), DisplayMetrics::All);
                         drop(task);
 
                         let mut task_count = 0;

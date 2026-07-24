@@ -4,7 +4,7 @@ use datafusion::common::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_distributed::{
-    DistributedExt, GetWorkerInfoRequest, SessionStateBuilderExt, WorkerResolver,
+    DisplayMetrics, DistributedExt, GetWorkerInfoRequest, SessionStateBuilderExt, WorkerResolver,
     display_plan_ascii, grpc,
 };
 use futures::TryStreamExt;
@@ -105,7 +105,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let df = ctx.sql(&args.query).await?;
     if args.show_distributed_plan {
         let plan = df.create_physical_plan().await?;
-        println!("{}", display_plan_ascii(plan.as_ref(), false));
+        println!(
+            "{}",
+            display_plan_ascii(plan.as_ref(), DisplayMetrics::None)
+        );
     } else {
         let stream = df.execute_stream().await?;
         let batches = stream.try_collect::<Vec<_>>().await?;

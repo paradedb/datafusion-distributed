@@ -41,8 +41,9 @@ use datafusion_distributed::test_utils::localhost::{
     LocalHostWorkerResolver, spawn_worker_service,
 };
 use datafusion_distributed::{
-    DistributedExt, DistributedGetterExt, DistributedLeafExec, SessionStateBuilderExt,
-    TaskEstimation, TaskEstimator, TaskRoutingContext, WorkerQueryContext, display_plan_ascii,
+    DisplayMetrics, DistributedExt, DistributedGetterExt, DistributedLeafExec,
+    SessionStateBuilderExt, TaskEstimation, TaskEstimator, TaskRoutingContext, WorkerQueryContext,
+    display_plan_ascii,
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf;
@@ -366,7 +367,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     if args.show_distributed_plan {
         let plan = ctx.sql(&args.query).await?.create_physical_plan().await?;
-        println!("{}", display_plan_ascii(plan.as_ref(), false));
+        println!(
+            "{}",
+            display_plan_ascii(plan.as_ref(), DisplayMetrics::None)
+        );
         return Ok(());
     }
 

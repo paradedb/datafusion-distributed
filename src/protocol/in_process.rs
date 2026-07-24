@@ -139,7 +139,7 @@ impl WorkerChannel for InProcessWorkerChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionStateBuilderExt, WorkerResolver, display_plan_ascii};
+    use crate::{DisplayMetrics, SessionStateBuilderExt, WorkerResolver, display_plan_ascii};
     use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_plan::collect;
@@ -210,7 +210,7 @@ mod tests {
             .await?
             .create_physical_plan()
             .await?;
-        let rendered = display_plan_ascii(physical.as_ref(), false);
+        let rendered = display_plan_ascii(physical.as_ref(), DisplayMetrics::None);
         assert!(
             rendered.contains("DistributedExec"),
             "plan was not distributed:\n{rendered}"

@@ -3,7 +3,8 @@ mod tests {
     use datafusion::error::Result;
     use datafusion_distributed::test_utils::in_memory_channel_resolver::start_in_memory_context;
     use datafusion_distributed::{
-        DefaultSessionBuilder, DistributedExec, DistributedExt, assert_snapshot, display_plan_ascii,
+        DefaultSessionBuilder, DisplayMetrics, DistributedExec, DistributedExt, assert_snapshot,
+        display_plan_ascii,
     };
     use datafusion_distributed_benchmarks::datasets::{clickbench, register_tables};
     use std::ops::Range;
@@ -1131,7 +1132,7 @@ mod tests {
         if !plan.is::<DistributedExec>() {
             Ok("".to_string())
         } else {
-            Ok(display_plan_ascii(plan.as_ref(), false))
+            Ok(display_plan_ascii(plan.as_ref(), DisplayMetrics::None))
         }
     }
 }

@@ -2,7 +2,7 @@
 mod tests {
     use datafusion_distributed::test_utils::in_memory_channel_resolver::start_in_memory_context;
     use datafusion_distributed::{
-        DefaultSessionBuilder, DistributedExt, assert_snapshot, display_plan_ascii,
+        DefaultSessionBuilder, DisplayMetrics, DistributedExt, assert_snapshot, display_plan_ascii,
     };
     use datafusion_distributed_benchmarks::datasets::{register_tables, tpch};
     use std::error::Error;
@@ -1406,7 +1406,7 @@ mod tests {
             df.create_physical_plan().await?
         };
 
-        Ok(display_plan_ascii(plan.as_ref(), false))
+        Ok(display_plan_ascii(plan.as_ref(), DisplayMetrics::None))
     }
 
     // OnceCell to ensure TPCH tables are generated only once for tests

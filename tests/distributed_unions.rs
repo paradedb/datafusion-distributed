@@ -6,7 +6,9 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_distributed::test_utils::localhost::start_localhost_context;
     use datafusion_distributed::test_utils::parquet::register_parquet_tables;
-    use datafusion_distributed::{DefaultSessionBuilder, assert_snapshot, display_plan_ascii};
+    use datafusion_distributed::{
+        DefaultSessionBuilder, DisplayMetrics, assert_snapshot, display_plan_ascii,
+    };
     use futures::TryStreamExt;
     use std::error::Error;
     use std::sync::Arc;
@@ -34,7 +36,8 @@ mod tests {
             .await?;
         let df_distributed = ctx_distributed.sql(query).await?;
         let physical_distributed = df_distributed.create_physical_plan().await?;
-        let physical_distributed_str = display_plan_ascii(physical_distributed.as_ref(), false);
+        let physical_distributed_str =
+            display_plan_ascii(physical_distributed.as_ref(), DisplayMetrics::None);
 
         assert_snapshot!(physical_distributed_str,
             @r"
@@ -86,7 +89,8 @@ mod tests {
             .await?;
         let df_distributed = ctx_distributed.sql(query).await?;
         let physical_distributed = df_distributed.create_physical_plan().await?;
-        let physical_distributed_str = display_plan_ascii(physical_distributed.as_ref(), false);
+        let physical_distributed_str =
+            display_plan_ascii(physical_distributed.as_ref(), DisplayMetrics::None);
 
         assert_snapshot!(physical_distributed_str,
             @r"
@@ -146,7 +150,8 @@ mod tests {
             .await?;
         let df_distributed = ctx_distributed.sql(query).await?;
         let physical_distributed = df_distributed.create_physical_plan().await?;
-        let physical_distributed_str = display_plan_ascii(physical_distributed.as_ref(), false);
+        let physical_distributed_str =
+            display_plan_ascii(physical_distributed.as_ref(), DisplayMetrics::None);
 
         assert_snapshot!(physical_distributed_str,
             @"
@@ -223,7 +228,8 @@ mod tests {
             .await?;
         let df_distributed = ctx_distributed.sql(query).await?;
         let physical_distributed = df_distributed.create_physical_plan().await?;
-        let physical_distributed_str = display_plan_ascii(physical_distributed.as_ref(), false);
+        let physical_distributed_str =
+            display_plan_ascii(physical_distributed.as_ref(), DisplayMetrics::None);
 
         assert_snapshot!(physical_distributed_str,
             @r"

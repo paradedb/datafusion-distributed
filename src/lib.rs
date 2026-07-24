@@ -65,7 +65,8 @@ pub use protocol::{
     WorkerToCoordinatorMsg, decode_task_metrics, get_distributed_channel_resolver,
 };
 pub use stage::{
-    DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
+    DisplayMetrics, DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz,
+    explain_analyze,
 };
 pub use work_unit_feed::{
     DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto,

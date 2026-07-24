@@ -3,7 +3,8 @@ mod tests {
     use datafusion::error::Result;
     use datafusion_distributed::test_utils::in_memory_channel_resolver::start_in_memory_context;
     use datafusion_distributed::{
-        DefaultSessionBuilder, DistributedExec, DistributedExt, assert_snapshot, display_plan_ascii,
+        DefaultSessionBuilder, DisplayMetrics, DistributedExec, DistributedExt, assert_snapshot,
+        display_plan_ascii,
     };
     use datafusion_distributed_benchmarks::datasets::{register_tables, tpcds};
     use std::env;
@@ -12907,7 +12908,7 @@ mod tests {
         let df = d_ctx.sql(&query_sql).await?;
         let plan = df.create_physical_plan().await?;
         if plan.is::<DistributedExec>() {
-            Ok(display_plan_ascii(plan.as_ref(), false))
+            Ok(display_plan_ascii(plan.as_ref(), DisplayMetrics::None))
         } else {
             Ok("".to_string())
         }

@@ -39,8 +39,8 @@ use datafusion_distributed::test_utils::in_memory_channel_resolver::{
     InMemoryChannelResolver, InMemoryWorkerResolver,
 };
 use datafusion_distributed::{
-    DistributedExt, DistributedTaskContext, SessionStateBuilderExt, TaskEstimation, TaskEstimator,
-    WorkerQueryContext, display_plan_ascii,
+    DisplayMetrics, DistributedExt, DistributedTaskContext, SessionStateBuilderExt, TaskEstimation,
+    TaskEstimator, WorkerQueryContext, display_plan_ascii,
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf;
@@ -394,7 +394,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = df.unwrap();
     if args.show_distributed_plan {
         let plan = df.create_physical_plan().await?;
-        println!("{}", display_plan_ascii(plan.as_ref(), false));
+        println!(
+            "{}",
+            display_plan_ascii(plan.as_ref(), DisplayMetrics::None)
+        );
     } else {
         let stream = df.execute_stream().await?;
         let batches = stream.try_collect::<Vec<_>>().await?;

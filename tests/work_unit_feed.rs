@@ -10,7 +10,7 @@ mod tests {
         TestWorkUnitFeedTaskEstimator,
     };
     use datafusion_distributed::{
-        DistributedExt, WorkerQueryContext, assert_snapshot, display_plan_ascii,
+        DisplayMetrics, DistributedExt, WorkerQueryContext, assert_snapshot, display_plan_ascii,
     };
     use futures::TryStreamExt;
     use std::sync::Arc;
@@ -878,7 +878,7 @@ mod tests {
             return Err(DataFusionError::Plan("Empty 'sql' parameter".to_string()));
         };
         let plan = df.create_physical_plan().await?;
-        let plan_display = display_plan_ascii(plan.as_ref(), false);
+        let plan_display = display_plan_ascii(plan.as_ref(), DisplayMetrics::None);
 
         let batches = execute_stream(plan, ctx.task_ctx())?
             .try_collect::<Vec<_>>()

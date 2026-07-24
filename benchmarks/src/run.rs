@@ -33,8 +33,8 @@ use datafusion_distributed::test_utils::work_unit_file_scan::{
     WorkUnitFileScanTaskEstimator,
 };
 use datafusion_distributed::{
-    DistributedExt, DistributedMetricsFormat, NetworkBoundaryExt, SessionStateBuilderExt, Worker,
-    display_plan_ascii, rewrite_distributed_plan_with_metrics,
+    DisplayMetrics, DistributedExt, DistributedMetricsFormat, NetworkBoundaryExt,
+    SessionStateBuilderExt, Worker, display_plan_ascii, rewrite_distributed_plan_with_metrics,
 };
 use datafusion_distributed_benchmarks::datasets::{clickbench, register_tables, tpcds, tpch};
 use datafusion_distributed_benchmarks::stats::stats_estimation_q_error;
@@ -315,7 +315,7 @@ impl RunOpt {
                         if self.debug {
                             println!(
                                 "=== Physical plan with metrics ===\n{}\n",
-                                display_plan_ascii(physical_plan.as_ref(), true)
+                                display_plan_ascii(physical_plan.as_ref(), DisplayMetrics::All)
                             );
                         }
 

@@ -30,8 +30,9 @@ use datafusion_distributed::test_utils::in_memory_channel_resolver::{
     InMemoryChannelResolver, InMemoryWorkerResolver,
 };
 use datafusion_distributed::{
-    DistributedExt, DistributedTaskContext, SessionStateBuilderExt, TaskEstimation, TaskEstimator,
-    WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider, WorkerQueryContext, display_plan_ascii,
+    DisplayMetrics, DistributedExt, DistributedTaskContext, SessionStateBuilderExt, TaskEstimation,
+    TaskEstimator, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider, WorkerQueryContext,
+    display_plan_ascii,
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf::proto_error;
@@ -403,7 +404,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = ctx.sql(&args.query).await?;
     if args.show_distributed_plan {
         let plan = df.create_physical_plan().await?;
-        println!("{}", display_plan_ascii(plan.as_ref(), false));
+        println!(
+            "{}",
+            display_plan_ascii(plan.as_ref(), DisplayMetrics::None)
+        );
     } else {
         let batches = df.execute_stream().await?.try_collect::<Vec<_>>().await?;
         println!("{}", pretty_format_batches(&batches)?);

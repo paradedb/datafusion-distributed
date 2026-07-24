@@ -10,7 +10,7 @@ mod tests {
         compare_ordering, compare_result_set,
     };
     use datafusion_distributed::{
-        DefaultSessionBuilder, DistributedExec, DistributedExt, display_plan_ascii,
+        DefaultSessionBuilder, DisplayMetrics, DistributedExec, DistributedExt, display_plan_ascii,
     };
     use datafusion_distributed_benchmarks::datasets::{clickbench, register_tables};
     use std::ops::Range;
@@ -308,7 +308,7 @@ mod tests {
         if !d_plan.is::<DistributedExec>() {
             return plan_err!("Query {query_id} did not get distributed");
         }
-        let display = display_plan_ascii(d_plan.as_ref(), false);
+        let display = display_plan_ascii(d_plan.as_ref(), DisplayMetrics::None);
         println!("Query {query_id}:\n{display}");
 
         let compare_result_set = {

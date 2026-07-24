@@ -16,9 +16,9 @@ mod tests {
         TestWorkUnitFeedTaskEstimator,
     };
     use datafusion_distributed::{
-        DefaultSessionBuilder, DistributedExt, DistributedLeafExec, DistributedMetricsFormat,
-        NetworkCoalesceExec, NetworkShuffleExec, WorkerQueryContext, display_plan_ascii,
-        rewrite_distributed_plan_with_metrics,
+        DefaultSessionBuilder, DisplayMetrics, DistributedExt, DistributedLeafExec,
+        DistributedMetricsFormat, NetworkCoalesceExec, NetworkShuffleExec, WorkerQueryContext,
+        display_plan_ascii, rewrite_distributed_plan_with_metrics,
     };
     use futures::TryStreamExt;
     use std::sync::Arc;
@@ -38,8 +38,14 @@ mod tests {
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
         d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
-        println!("{}", display_plan_ascii(s_physical.as_ref(), true));
-        println!("{}", display_plan_ascii(d_physical.as_ref(), true));
+        println!(
+            "{}",
+            display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
+        );
+        println!(
+            "{}",
+            display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All)
+        );
 
         assert_metrics_equal::<DataSourceExec, DistributedLeafExec>(
             ["output_rows", "output_bytes"],
@@ -86,8 +92,14 @@ mod tests {
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
         d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
-        println!("{}", display_plan_ascii(s_physical.as_ref(), true));
-        println!("{}", display_plan_ascii(d_physical.as_ref(), true));
+        println!(
+            "{}",
+            display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
+        );
+        println!(
+            "{}",
+            display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All)
+        );
 
         for data_source_index in 0..2 {
             assert_metrics_equal::<DataSourceExec, DistributedLeafExec>(
@@ -125,8 +137,14 @@ mod tests {
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
 
         d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
-        println!("{}", display_plan_ascii(s_physical.as_ref(), true));
-        println!("{}", display_plan_ascii(d_physical.as_ref(), true));
+        println!(
+            "{}",
+            display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
+        );
+        println!(
+            "{}",
+            display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All)
+        );
 
         for data_source_index in 0..5 {
             assert_metrics_equal::<DataSourceExec, DistributedLeafExec>(
@@ -153,8 +171,14 @@ mod tests {
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
         d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
-        println!("{}", display_plan_ascii(s_physical.as_ref(), true));
-        println!("{}", display_plan_ascii(d_physical.as_ref(), true));
+        println!(
+            "{}",
+            display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
+        );
+        println!(
+            "{}",
+            display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All)
+        );
 
         let value = node_metrics::<NetworkCoalesceExec>(&d_physical, "bytes_transferred", 1);
         assert!(value > 100);
@@ -209,7 +233,7 @@ mod tests {
         let (_, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
         d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
 
-        let display = display_plan_ascii(d_physical.as_ref(), true);
+        let display = display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All);
         assert_not_contains!(&display, "metrics=[]");
         assert_contains!(&display, "plan_added_at");
         assert_contains!(&display, "plan_executed_at");
@@ -237,7 +261,7 @@ mod tests {
                 .to_string();
         assert_not_contains!(display, "metrics=[]");
 
-        let display = display_plan_ascii(d_physical.as_ref(), true);
+        let display = display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All);
         assert_not_contains!(display, "metrics=[]");
 
         Ok(())
@@ -265,7 +289,7 @@ mod tests {
         let (_, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
         d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
 
-        let display = display_plan_ascii(d_physical.as_ref(), true);
+        let display = display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All);
         println!("{display}");
 
         let header = display
@@ -353,8 +377,14 @@ mod tests {
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
         d_physical = rewrite_with_metrics(d_physical, DistributedMetricsFormat::Aggregated).await;
-        println!("{}", display_plan_ascii(s_physical.as_ref(), true));
-        println!("{}", display_plan_ascii(d_physical.as_ref(), true));
+        println!(
+            "{}",
+            display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
+        );
+        println!(
+            "{}",
+            display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All)
+        );
 
         assert_metrics_equal::<DataSourceExec, DistributedLeafExec>(
             ["output_rows", "output_bytes"],

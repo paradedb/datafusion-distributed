@@ -14,7 +14,7 @@ mod tests {
     use datafusion_distributed::test_utils::localhost::start_localhost_context;
     use datafusion_distributed::test_utils::parquet::register_parquet_tables;
     use datafusion_distributed::{
-        DistributedExt, WorkerQueryContext, assert_snapshot, display_plan_ascii,
+        DisplayMetrics, DistributedExt, WorkerQueryContext, assert_snapshot, display_plan_ascii,
     };
     use datafusion_proto::physical_plan::PhysicalExtensionCodec;
     use datafusion_proto::protobuf::proto_error;
@@ -60,7 +60,7 @@ mod tests {
         })?;
         let plan = transformed.data;
 
-        let plan_str = display_plan_ascii(plan.as_ref(), false);
+        let plan_str = display_plan_ascii(plan.as_ref(), DisplayMetrics::None);
 
         assert_snapshot!(plan_str,
             @"

@@ -4,7 +4,7 @@ mod tests {
     use datafusion::physical_plan::execute_stream;
     use datafusion_distributed::test_utils::localhost::start_localhost_context;
     use datafusion_distributed::test_utils::parquet::register_parquet_tables;
-    use datafusion_distributed::{DefaultSessionBuilder, display_plan_ascii};
+    use datafusion_distributed::{DefaultSessionBuilder, DisplayMetrics, display_plan_ascii};
     use futures::TryStreamExt;
     use std::error::Error;
 
@@ -24,7 +24,7 @@ mod tests {
 
         let df = ctx.sql(query).await?;
         let physical = df.create_physical_plan().await?;
-        let physical_str = display_plan_ascii(physical.as_ref(), false);
+        let physical_str = display_plan_ascii(physical.as_ref(), DisplayMetrics::None);
 
         // The plan should be distributed
         assert_contains!(physical_str, "DistributedExec");

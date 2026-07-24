@@ -64,7 +64,7 @@ mod tests {
                 for file_idx in 0..FILES_PER_TABLE {
                     let chunk = (file_idx + rotation) % FILES_PER_TABLE;
                     let ids = (chunk * IDS_PER_FILE..(chunk + 1) * IDS_PER_FILE)
-                        .flat_map(|id| std::iter::repeat(id).take(duplicates))
+                        .flat_map(|id| std::iter::repeat_n(id, duplicates))
                         .collect::<Vec<_>>();
                     write_ids(&table_dir.join(format!("part-{file_idx}.parquet")), &ids);
                 }

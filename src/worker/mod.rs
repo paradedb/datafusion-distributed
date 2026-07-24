@@ -12,11 +12,12 @@ mod worker_service;
 
 pub use impl_coordinator_channel::collect_plan_metrics_protos;
 pub(crate) use single_write_multi_read::SingleWriteMultiRead;
-pub(crate) use worker_connection_pool::{LocalWorkerContext, WorkerConnectionPool};
+pub(crate) use worker_connection_pool::WorkerConnectionPool;
 
 pub use session_builder::{
     DefaultSessionBuilder, MappedWorkerSessionBuilder, MappedWorkerSessionBuilderExt,
     WorkerQueryContext, WorkerSessionBuilder,
 };
 pub use task_data::TaskData;
+pub use worker_connection_pool::LocalWorkerContext;
 pub use worker_service::Worker;

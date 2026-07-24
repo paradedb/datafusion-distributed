@@ -500,9 +500,9 @@ mod tests {
     use crate::stage::LocalStage;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::{JoinType, NullEquality, ScalarValue, SplitPoint};
-    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, RangePartitioning};
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, RangePartitioning};
     use datafusion::physical_plan::PlanProperties;
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -574,7 +574,12 @@ mod tests {
 
     #[test]
     fn accepts_partitioned_join_over_matching_global_shuffles() {
-        let join = partitioned_join(fake_shuffle("a", 4), fake_shuffle("a", 4), "a", JoinType::Inner);
+        let join = partitioned_join(
+            fake_shuffle("a", 4),
+            fake_shuffle("a", 4),
+            "a",
+            JoinType::Inner,
+        );
         validate(&join).expect("expected validation to pass");
     }
 
@@ -583,7 +588,12 @@ mod tests {
         // Both sides are globally partitioned — but the left one on `b`, while the join
         // requires partitioning on `a`. The provenance bit alone cannot see this; the
         // claim-satisfaction check must.
-        let join = partitioned_join(fake_shuffle("b", 4), fake_shuffle("a", 4), "a", JoinType::Inner);
+        let join = partitioned_join(
+            fake_shuffle("b", 4),
+            fake_shuffle("a", 4),
+            "a",
+            JoinType::Inner,
+        );
         let err = validate(&join).expect_err("expected validation to fail");
         assert!(
             err.to_string().contains("does not satisfy"),
@@ -609,7 +619,12 @@ mod tests {
 
     #[test]
     fn rejects_partitioned_join_with_mismatched_partition_counts() {
-        let join = partitioned_join(fake_shuffle("a", 4), fake_shuffle("a", 8), "a", JoinType::Inner);
+        let join = partitioned_join(
+            fake_shuffle("a", 4),
+            fake_shuffle("a", 8),
+            "a",
+            JoinType::Inner,
+        );
         let err = validate(&join).expect_err("expected validation to fail");
         assert!(
             err.to_string().contains("co-partitioned"),

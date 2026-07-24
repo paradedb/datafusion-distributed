@@ -12,8 +12,8 @@ use crate::protocol::set_distributed_channel_resolver;
 use crate::work_unit_feed::set_distributed_work_unit_feed;
 use crate::worker_resolver::set_distributed_worker_resolver;
 use crate::{
-    ChannelResolver, DispatchPlanSource, DistributedConfig, LocalWorkerContext,
-    WorkUnitFeed, WorkUnitFeedProvider, WorkerResolver, get_distributed_worker_resolver,
+    ChannelResolver, DispatchPlanSource, DistributedConfig, LocalWorkerContext, WorkUnitFeed,
+    WorkUnitFeedProvider, WorkerResolver, get_distributed_worker_resolver,
 };
 use datafusion::common::DataFusionError;
 use datafusion::config::ConfigExtension;

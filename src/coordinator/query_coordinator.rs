@@ -14,8 +14,7 @@ use crate::{
     DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedTaskContext,
     DistributedWorkUnitFeedContext, LoadInfo, NetworkBoundaryExt, SetPlanRequest, Stage, TaskKey,
     WorkUnitFeedDeclaration, WorkerToCoordinatorMsg, get_distributed_channel_resolver,
-    get_distributed_dispatch_plan_source,
-    get_distributed_worker_resolver,
+    get_distributed_dispatch_plan_source, get_distributed_worker_resolver,
 };
 use datafusion::common::DataFusionError;
 use datafusion::common::instant::Instant;

@@ -23,7 +23,8 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning};
 use datafusion_proto::physical_plan::{
-    AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
+    AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec, PhysicalPlanNodeExt,
+    PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf::proto_error;
 use datafusion_proto::{TryFromProto, protobuf as df_proto};
@@ -239,8 +240,7 @@ impl PhysicalExtensionCodec for WorkUnitFileScanCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
-
-        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !inputs.is_empty() {
             return internal_err!(
@@ -253,8 +253,11 @@ impl PhysicalExtensionCodec for WorkUnitFileScanCodec {
 
         let plan_node = df_proto::PhysicalPlanNode::decode(&proto.inner[..])
             .map_err(|e| proto_error(format!("Failed to decode template plan: {e}")))?;
-        let template_plan =
-            plan_node.try_into_physical_plan(ctx, &DefaultPhysicalExtensionCodec {})?;
+        let template_plan = plan_node.try_into_physical_plan_with_converter(
+            ctx,
+            &DefaultPhysicalExtensionCodec {},
+            proto_converter,
+        )?;
         let Some(dse) = template_plan.downcast_ref::<DataSourceExec>() else {
             return Err(proto_error(
                 "Expected the WorkUnitFileScan template plan to be a DataSourceExec",
@@ -279,7 +282,7 @@ impl PhysicalExtensionCodec for WorkUnitFileScanCodec {
         &self,
         node: Arc<dyn ExecutionPlan>,
         buf: &mut Vec<u8>,
-        _ext: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
         let Some(dse) = node.downcast_ref::<DataSourceExec>() else {
             return internal_err!(
@@ -293,9 +296,10 @@ impl PhysicalExtensionCodec for WorkUnitFileScanCodec {
 
         // Encode the template DataSourceExec(FileScanConfig) as a regular
         // PhysicalPlanNode using DataFusion's default codec.
-        let plan_node = df_proto::PhysicalPlanNode::try_from_physical_plan(
+        let plan_node = df_proto::PhysicalPlanNode::try_from_physical_plan_with_converter(
             DataSourceExec::from_data_source(wfs.fsc.clone()),
             &DefaultPhysicalExtensionCodec {},
+            proto_converter,
         )?;
         let mut inner_bytes = Vec::new();
         plan_node.encode(&mut inner_bytes).map_err(|e| {

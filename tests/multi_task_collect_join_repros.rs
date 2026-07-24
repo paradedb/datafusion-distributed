@@ -13,12 +13,14 @@
 //! rotated one file forward. A task therefore sees *different* ids from each table, and any
 //! cross-task match is silently lost.
 //!
-//! Stage validation (`validate_distributed_stages`) now enforces the invariant at planning
-//! time: the distributed planner REJECTS these shapes instead of silently computing on
-//! partial data. Each test asserts that rejection (and that single-node execution still
-//! works). If a plan-shaping fix later makes one of these shapes legal — converting the join
-//! to a partitioned mode, or capping its stage to one task — the corresponding test should
-//! become a correctness test comparing distributed vs single-node results.
+//! These shapes are now handled by plan shaping (ported from the rj.use-datafusion-55
+//! branch): `normalize_collect_joins` rewrites build-side-emitting CollectLeft HashJoins to
+//! PartitionMode::Partitioned and swaps build-side-emitting NestedLoopJoins so the emitting
+//! side becomes the probe side, while the task-count gate in `inject_network_boundaries`
+//! caps whatever has no distributed rewrite (Full joins, null-aware anti joins, and any of
+//! these joins when broadcasts are disabled) to a single task. Stage validation
+//! (`validate_distributed_stages`) remains the backstop that rejects anything unsafe at
+//! planning time. Every test here asserts distributed results match single-node execution.
 
 #[cfg(all(feature = "integration", test))]
 mod tests {
@@ -28,6 +30,7 @@ mod tests {
     use datafusion::physical_plan::{ExecutionPlan, collect};
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
     use datafusion_distributed::test_utils::in_memory_channel_resolver::start_in_memory_context;
+    use datafusion_distributed::test_utils::property_based::compare_result_set;
     use datafusion_distributed::{DefaultSessionBuilder, DistributedExt, display_plan_ascii};
     use parquet::arrow::ArrowWriter;
     use std::fs;
@@ -120,33 +123,43 @@ mod tests {
         Ok((plan, batches))
     }
 
-    /// Runs `query` on both contexts. Stage validation must make the distributed planner
-    /// reject the query outright — the shapes under test would compute on partial data when
-    /// run on more than one task — while single-node execution keeps working.
-    async fn assert_plan_rejected(query: &str, broadcast_joins: bool) -> Result<()> {
+    /// Runs `query` on both contexts and asserts the distributed context produces the same
+    /// results as single-node execution. The task-count gate caps these join shapes to a
+    /// single task (and stage validation guarantees nothing unsafe slips through), so the
+    /// query must both plan and return correct results.
+    async fn assert_distributed_matches_single_node(
+        query: &str,
+        broadcast_joins: bool,
+    ) -> Result<()> {
         ensure_data().await;
 
         let s_ctx = SessionContext::new();
+        // Pin the baseline to the same partitioning as the distributed context: DataFusion
+        // 54's NestedLoopJoin emits spurious unmatched rows in Full/Left joins, and how many
+        // depends on the probe-side partition count (fixed upstream during the DataFusion 55
+        // cycle, apache/datafusion#22791). With different target_partitions the two contexts
+        // disagree for reasons that have nothing to do with distribution.
+        s_ctx
+            .state_ref()
+            .write()
+            .config_mut()
+            .options_mut()
+            .execution
+            .target_partitions = PARTITIONS;
         register_tables(&s_ctx).await?;
         let d_ctx = make_distributed_ctx(broadcast_joins).await?;
 
         let (_, s_batches) = run(&s_ctx, query).await?;
-        let s_rows: usize = s_batches.iter().map(|b| b.num_rows()).sum();
-        println!("single-node rows: {s_rows}");
-
-        let err = match run(&d_ctx, query).await {
-            Err(err) => err.to_string(),
-            Ok((d_plan, _)) => panic!(
-                "expected the distributed planner to reject the query, but it produced:\n{}",
-                display_plan_ascii(d_plan.as_ref(), false)
-            ),
-        };
-        assert!(
-            err.contains("requires a single partition"),
-            "expected a stage-validation error, got: {err}"
+        let (d_plan, d_batches) = run(&d_ctx, query).await?;
+        println!(
+            "distributed plan:\n{}",
+            display_plan_ascii(d_plan.as_ref(), false)
         );
-        println!("distributed planner rejected the query: {err}");
-        Ok(())
+
+        let s_rows: usize = s_batches.iter().map(|b| b.num_rows()).sum();
+        let d_rows: usize = d_batches.iter().map(|b| b.num_rows()).sum();
+        println!("single-node rows: {s_rows}, distributed rows: {d_rows}");
+        compare_result_set(&Ok(d_batches), &Ok(s_batches))
     }
 
     /// Case 1: CollectLeft HashJoin with a build-side-emitting join type (LeftSemi).
@@ -154,8 +167,8 @@ mod tests {
     /// the stage to one task. Every id matches on a single node; distributed, a build id only
     /// survives if its probe rows landed in the same task.
     #[tokio::test]
-    async fn rejects_collect_left_semi_hash_join() -> Result<()> {
-        assert_plan_rejected(
+    async fn capped_collect_left_semi_hash_join_is_correct() -> Result<()> {
+        assert_distributed_matches_single_node(
             "SELECT id FROM build_side WHERE id IN (SELECT id FROM probe_side)",
             true,
         )
@@ -166,8 +179,8 @@ mod tests {
     /// so zero rows. Distributed, each task only sees a slice of probe_side, so most build ids
     /// look unmatched and phantom rows are emitted.
     #[tokio::test]
-    async fn rejects_not_in_anti_hash_join() -> Result<()> {
-        assert_plan_rejected(
+    async fn capped_not_in_anti_hash_join_is_correct() -> Result<()> {
+        assert_distributed_matches_single_node(
             "SELECT id FROM build_side WHERE id NOT IN (SELECT id FROM probe_side)",
             true,
         )
@@ -178,8 +191,8 @@ mod tests {
     /// by a correlated EXISTS with a non-equi predicate (`p.id > b.id - 1 AND p.id < b.id + 1`
     /// is `p.id = b.id` for integers, but expressed as inequalities so no hash join is possible).
     #[tokio::test]
-    async fn rejects_nested_loop_left_semi_join() -> Result<()> {
-        assert_plan_rejected(
+    async fn capped_nested_loop_left_semi_join_is_correct() -> Result<()> {
+        assert_distributed_matches_single_node(
             "SELECT b.id FROM build_side b WHERE EXISTS ( \
                 SELECT 1 FROM probe_side p WHERE p.id > b.id - 1 AND p.id < b.id + 1)",
             true,
@@ -191,8 +204,8 @@ mod tests {
     /// broadcast orientation can ever be correct. Single-node: every row matches, no NULL
     /// padding. Distributed: cross-task matches are lost and spurious NULL-padded rows appear.
     #[tokio::test]
-    async fn rejects_nested_loop_full_join() -> Result<()> {
-        assert_plan_rejected(
+    async fn capped_nested_loop_full_join_is_correct() -> Result<()> {
+        assert_distributed_matches_single_node(
             "SELECT b.id, p.id FROM build_side b FULL JOIN probe_side p \
                 ON p.id > b.id - 1 AND p.id < b.id + 1",
             true,
@@ -206,8 +219,8 @@ mod tests {
     /// (A bare `count(*)` is folded to a constant from parquet statistics, so sum an
     /// expression the optimizer cannot answer from metadata.)
     #[tokio::test]
-    async fn rejects_cross_join_broadcast_disabled() -> Result<()> {
-        assert_plan_rejected(
+    async fn capped_cross_join_broadcast_disabled_is_correct() -> Result<()> {
+        assert_distributed_matches_single_node(
             "SELECT sum(b.id + p.id) AS pair_sum FROM build_side b CROSS JOIN probe_side p",
             false,
         )

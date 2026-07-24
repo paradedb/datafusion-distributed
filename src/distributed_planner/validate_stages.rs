@@ -386,8 +386,60 @@ mod tests {
         (plan, session_cfg)
     }
 
-    fn assert_rejected(result: Result<Arc<dyn ExecutionPlan>>) {
-        let err = result.expect_err("expected the planner to reject the query");
+    #[tokio::test]
+    async fn planner_rewrites_collect_left_join_to_partitioned() {
+        // LEFT is not broadcast-safe, so `insert_broadcast_execs` never broadcasts its build
+        // side — instead `normalize_collect_joins` rewrites the join to
+        // PartitionMode::Partitioned, which distributes correctly through shuffles.
+        let (plan, session_cfg) = try_plan_distributed(
+            r#"SELECT a."MinTemp", b."MaxTemp"
+               FROM weather a LEFT JOIN weather b ON a."RainToday" = b."RainToday""#,
+            true,
+        )
+        .await;
+        let plan = plan.expect("expected planning to succeed");
+        validate_distributed_stages(&plan, &session_cfg).expect("expected validation to pass");
+    }
+
+    #[tokio::test]
+    async fn planner_swaps_unbroadcast_nested_loop_left_join() {
+        // A Left NLJ is not broadcast-safe either; `normalize_collect_joins` swaps its
+        // inputs (Left becomes Right) so the emitting side becomes the partitioned probe
+        // side and the build side can be broadcast as usual.
+        let (plan, session_cfg) = try_plan_distributed(
+            r#"SELECT a."MinTemp", b."MaxTemp"
+               FROM weather a LEFT JOIN weather b ON a."MinTemp" < b."MaxTemp""#,
+            true,
+        )
+        .await;
+        let plan = plan.expect("expected planning to succeed");
+        validate_distributed_stages(&plan, &session_cfg).expect("expected validation to pass");
+    }
+
+    #[test]
+    fn rejects_collect_left_join_with_sliced_build_side() {
+        // The planner's task-count gate prevents this shape from ever being produced, so
+        // build it by hand to keep direct validator coverage: a CollectLeft join whose
+        // collected build side is a task-varying leaf behind a plain CoalescePartitionsExec.
+        // Each task would collect only its own slice of the build data.
+        let leaf = || -> Arc<dyn ExecutionPlan> { Arc::new(EmptyExec::new(test_schema())) };
+        let build: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(leaf()));
+        let on = vec![(column("a", &build.schema()), column("a", &test_schema()))];
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                build,
+                leaf(),
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+        let err = validate(&join).expect_err("expected validation to fail");
         assert!(
             err.to_string().contains("requires a single partition"),
             "unexpected error: {err}"
@@ -395,49 +447,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unbroadcast_collect_left_join_in_multi_task_stage() {
-        // LEFT is not broadcast-safe, so `insert_broadcast_execs` never broadcasts its build
-        // side; with broadcast joins enabled nothing caps the stage to one task either, and
-        // each task would collect only its slice of the build side.
-        assert_rejected(
-            try_plan_distributed(
-                r#"SELECT a."MinTemp", b."MaxTemp"
-                   FROM weather a LEFT JOIN weather b ON a."RainToday" = b."RainToday""#,
-                true,
-            )
-            .await
-            .0,
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_unbroadcast_nested_loop_left_join() {
-        // A Left NLJ is not broadcast-safe either; its collected left side arrives through
-        // a plain CoalescePartitionsExec over a sliced leaf.
-        assert_rejected(
-            try_plan_distributed(
-                r#"SELECT a."MinTemp", b."MaxTemp"
-                   FROM weather a LEFT JOIN weather b ON a."MinTemp" < b."MaxTemp""#,
-                true,
-            )
-            .await
-            .0,
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_cross_join_with_broadcast_disabled() {
+    async fn planner_caps_cross_join_with_broadcast_disabled() {
         // Cross joins are always broadcast-safe, but with broadcast joins disabled there is
-        // no broadcast at all, and no gating arm covers CrossJoinExec.
-        assert_rejected(
-            try_plan_distributed(
-                r#"SELECT sum(a."MinTemp" + b."MaxTemp")
-                   FROM weather a CROSS JOIN weather b"#,
-                false,
-            )
-            .await
-            .0,
-        );
+        // no broadcast at all; the task-count gate caps the join's stage to a single task,
+        // producing a plan that validates cleanly.
+        let (plan, session_cfg) = try_plan_distributed(
+            r#"SELECT sum(a."MinTemp" + b."MaxTemp")
+               FROM weather a CROSS JOIN weather b"#,
+            false,
+        )
+        .await;
+        let plan = plan.expect("expected planning to succeed");
+        validate_distributed_stages(&plan, &session_cfg).expect("expected validation to pass");
     }
 
     #[tokio::test]
@@ -479,6 +500,7 @@ mod tests {
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
     use datafusion::physical_plan::PlanProperties;
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::joins::PartitionMode;

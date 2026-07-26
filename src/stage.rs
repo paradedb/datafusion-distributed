@@ -219,10 +219,8 @@ impl DistributedTaskContext {
     }
 }
 
-use crate::{
-    DistributedMetricsFormat, NetworkShuffleExec, TaskKey, rewrite_distributed_plan_with_metrics,
-};
 use crate::{NetworkBoundary, NetworkBoundaryExt};
+use crate::{NetworkShuffleExec, TaskKey, rewrite_distributed_plan_with_metrics};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
 use datafusion::common::stats::Precision;
@@ -244,26 +242,42 @@ use datafusion::physical_plan::metrics::MetricValue;
 use std::fmt::Write;
 
 /// explain_analyze renders an [ExecutionPlan] with metrics.
-pub async fn explain_analyze(
-    executed: Arc<dyn ExecutionPlan>,
-    format: DistributedMetricsFormat,
-) -> Result<String, DataFusionError> {
+pub async fn explain_analyze(executed: Arc<dyn ExecutionPlan>) -> Result<String, DataFusionError> {
     match executed.downcast_ref::<DistributedExec>() {
         None => Ok(DisplayableExecutionPlan::with_metrics(executed.as_ref())
             .indent(true)
             .to_string()),
         Some(_) => {
-            let executed = rewrite_distributed_plan_with_metrics(executed.clone(), format).await?;
+            let executed = rewrite_distributed_plan_with_metrics(executed.clone()).await?;
             Ok(display_plan_ascii(executed.as_ref(), DisplayMetrics::All))
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisplayMetrics {
-    None,
-    NoTiming, // Includes metrics, but strips `elapsed_compute` and `Time` values
-    All,
+pub struct DisplayMetrics {
+    pub show_metrics: bool,
+    pub show_timing: bool,
+    pub aggregate_tasks: bool,
+}
+
+#[allow(non_upper_case_globals)]
+impl DisplayMetrics {
+    pub const None: DisplayMetrics = DisplayMetrics {
+        show_metrics: false,
+        show_timing: false,
+        aggregate_tasks: false,
+    };
+    pub const NoTiming: DisplayMetrics = DisplayMetrics {
+        show_metrics: true,
+        show_timing: false,
+        aggregate_tasks: false,
+    };
+    pub const All: DisplayMetrics = DisplayMetrics {
+        show_metrics: true,
+        show_timing: true,
+        aggregate_tasks: false,
+    };
 }
 
 // Unicode box-drawing characters for creating borders and connections.
@@ -276,15 +290,12 @@ pub fn display_plan_ascii(plan: &dyn ExecutionPlan, show_metrics: DisplayMetrics
         let mut f = String::new();
         display_ascii(plan, Either::Left(plan), 0, show_metrics, &mut f).unwrap();
         f
+    } else if show_metrics.show_metrics {
+        DisplayableExecutionPlan::with_metrics(plan)
+            .indent(true)
+            .to_string()
     } else {
-        match show_metrics {
-            DisplayMetrics::All | DisplayMetrics::NoTiming => {
-                DisplayableExecutionPlan::with_metrics(plan)
-                    .indent(true)
-                    .to_string()
-            }
-            DisplayMetrics::None => displayable(plan).indent(true).to_string(),
-        }
+        displayable(plan).indent(true).to_string()
     }
 }
 
@@ -315,7 +326,7 @@ fn display_ascii(
                 LTCORNER,
                 HORIZONTAL.repeat(5),
             )?;
-            if show_metrics != DisplayMetrics::None
+            if show_metrics.show_metrics
                 && let Some(metrics) = dist_exec.metrics()
             {
                 writeln!(
@@ -339,7 +350,7 @@ fn display_ascii(
                 HORIZONTAL.repeat(2),
                 format_tasks_for_stage(stage.task_count(), plan)
             )?;
-            if show_metrics != DisplayMetrics::None
+            if show_metrics.show_metrics
                 && let Some(metrics_store) = &root.metrics_store
             {
                 let metrics = gather_stage_header_metrics(stage, metrics_store);
@@ -383,12 +394,13 @@ fn display_inner_ascii(
     }
 
     let node_str = displayable(plan.as_ref()).one_line().to_string();
-    let metrics_str = match show_metrics {
-        DisplayMetrics::All | DisplayMetrics::NoTiming => metrics_suffix(
+    let metrics_str = if show_metrics.show_metrics {
+        metrics_suffix(
             plan.metrics()
                 .map(|m| format_metrics_by_task(&m, show_metrics)),
-        ),
-        DisplayMetrics::None => String::new(),
+        )
+    } else {
+        String::new()
     };
     writeln!(
         f,
@@ -422,7 +434,8 @@ fn display_inner_distributed_leaf(
     // per-task metrics live on `plan.metrics()` (the wrapper), not on `leaf.metrics()` (which
     // delegates to the un-rewritten original). Split them by task id to show each variant's
     // own metrics.
-    if let Some(by_task) = (show_metrics != DisplayMetrics::None)
+    if let Some(by_task) = show_metrics
+        .show_metrics
         .then(|| plan.metrics())
         .flatten()
         .map(|m| metrics_by_task_id(&m))
@@ -442,7 +455,7 @@ fn display_inner_distributed_leaf(
             writeln!(f, "{indent}   t{task_i}: {}{metrics}", variant.trim_end())?;
         }
     } else {
-        let header = match show_metrics != DisplayMetrics::None {
+        let header = match show_metrics.show_metrics {
             true => metrics_suffix(
                 plan.metrics()
                     .map(|m| format_metrics_by_task(&m, show_metrics)),
@@ -567,10 +580,30 @@ fn sorted_for_display_by_task_id(metrics: MetricsSet) -> MetricsSet {
 /// See
 /// https://github.com/apache/datafusion/blob/b463a9f9e3c9603eb2db7113125fea3a1b7f5455/datafusion/physical-plan/src/display.rs#L421.
 fn format_metrics_by_task(metrics: &MetricsSet, show_metrics: DisplayMetrics) -> String {
-    let aggregated = aggregate_by_task_id(metrics);
+    let mut metrics_to_process = metrics.clone();
+
+    if show_metrics.aggregate_tasks {
+        let mut new_set = MetricsSet::new();
+        for metric in metrics.iter() {
+            let labels = metric
+                .labels()
+                .iter()
+                .filter(|l| l.name() != DISTRIBUTED_DATAFUSION_TASK_ID_LABEL)
+                .cloned()
+                .collect();
+            new_set.push(Arc::new(Metric::new_with_labels(
+                metric.value().clone(),
+                metric.partition(),
+                labels,
+            )));
+        }
+        metrics_to_process = new_set;
+    }
+
+    let aggregated = aggregate_by_task_id(&metrics_to_process);
     let mut sorted = sorted_for_display_by_task_id(aggregated).timestamps_removed();
 
-    if show_metrics == DisplayMetrics::NoTiming {
+    if !show_metrics.show_timing {
         let filtered: Vec<_> = sorted
             .iter()
             .filter(|m| {

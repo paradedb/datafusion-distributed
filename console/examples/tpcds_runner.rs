@@ -4,8 +4,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::SessionContext;
 use datafusion_distributed::{
-    DisplayMetrics, DistributedExt, DistributedMetricsFormat, SessionStateBuilderExt,
-    WorkerResolver, display_plan_ascii,
+    DisplayMetrics, DistributedExt, SessionStateBuilderExt, WorkerResolver, display_plan_ascii,
 };
 use datafusion_distributed_benchmarks::datasets::{register_tables, tpcds};
 use futures::TryStreamExt;
@@ -190,9 +189,7 @@ async fn run_single_query(
     let stream = execute_stream(plan.clone(), ctx.task_ctx())?;
     let batches = stream.try_collect::<Vec<_>>().await?;
     if explain_analyze {
-        let output =
-            datafusion_distributed::explain_analyze(plan, DistributedMetricsFormat::Aggregated)
-                .await?;
+        let output = datafusion_distributed::explain_analyze(plan).await?;
         println!("{output}");
     }
     Ok(batches)

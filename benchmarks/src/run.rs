@@ -33,8 +33,8 @@ use datafusion_distributed::test_utils::work_unit_file_scan::{
     WorkUnitFileScanTaskEstimator,
 };
 use datafusion_distributed::{
-    DisplayMetrics, DistributedExt, DistributedMetricsFormat, NetworkBoundaryExt,
-    SessionStateBuilderExt, Worker, display_plan_ascii, rewrite_distributed_plan_with_metrics,
+    DisplayMetrics, DistributedExt, NetworkBoundaryExt, SessionStateBuilderExt, Worker,
+    display_plan_ascii, rewrite_distributed_plan_with_metrics,
 };
 use datafusion_distributed_benchmarks::datasets::{clickbench, register_tables, tpcds, tpch};
 use datafusion_distributed_benchmarks::stats::stats_estimation_q_error;
@@ -290,11 +290,7 @@ impl RunOpt {
                         let ms = elapsed.as_secs_f64() * 1000.0;
                         let row_count = result.iter().map(|b| b.num_rows()).sum();
                         let physical_plan = if self.dynamic || self.debug {
-                            rewrite_distributed_plan_with_metrics(
-                                physical_plan,
-                                DistributedMetricsFormat::PerTask,
-                            )
-                            .await?
+                            rewrite_distributed_plan_with_metrics(physical_plan).await?
                         } else {
                             physical_plan
                         };

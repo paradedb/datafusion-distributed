@@ -17,33 +17,12 @@ use datafusion::physical_plan::internal_err;
 use datafusion::physical_plan::metrics::{Label, Metric, MetricsSet};
 use std::sync::Arc;
 
-/// Format to use when displaying metrics for a distributed plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DistributedMetricsFormat {
-    /// Metrics are aggregated across all tasks. ex. a `output_rows=X` represents the output rows for all tasks.
-    Aggregated,
-
-    /// Metrics are labeled with their task id and displayed per task. ex. `output_rows` is shown as
-    /// `output_rows={0:.., 1:..}`, one entry per task.
-    PerTask,
-}
-
-impl DistributedMetricsFormat {
-    pub(crate) fn to_rewrite_ctx(self, task_id: u64) -> RewriteCtx {
-        match self {
-            DistributedMetricsFormat::Aggregated => RewriteCtx::default(),
-            DistributedMetricsFormat::PerTask => RewriteCtx::from_task_id(task_id),
-        }
-    }
-}
-
 /// Rewrites a distributed plan with metrics. Does nothing if the root node is not a [DistributedExec].
 /// Returns an error if the distributed plan was not executed.
 ///
 /// Waits for all worker task metrics to arrive before rewriting, so the result is always complete.
 pub async fn rewrite_distributed_plan_with_metrics(
     plan: Arc<dyn ExecutionPlan>,
-    format: DistributedMetricsFormat,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some(distributed_exec) = plan.downcast_ref::<DistributedExec>() else {
         return Ok(plan);
@@ -60,7 +39,7 @@ pub async fn rewrite_distributed_plan_with_metrics(
 
     // Rewrite the DistributedExec's child plan with metrics.
     let dist_exec_plan_with_metrics = rewrite_local_plan_with_metrics(
-        format.to_rewrite_ctx(0), // Task id is 0 for the DistributedExec plan
+        RewriteCtx::from_task_id(0), // Task id is 0 for the DistributedExec plan
         distributed_exec.plan_for_viz()?,
         task_metrics,
     )?;
@@ -73,8 +52,7 @@ pub async fn rewrite_distributed_plan_with_metrics(
             };
             // This transform is a bit inefficient because we traverse the plan nodes twice
             // For now, we are okay with trading off performance for simplicity.
-            let plan_with_metrics =
-                stage_metrics_rewriter(stage, Arc::clone(&metrics_collection), format)?;
+            let plan_with_metrics = stage_metrics_rewriter(stage, Arc::clone(&metrics_collection))?;
             let network_boundary = network_boundary.with_input_stage(Stage::Local(LocalStage {
                 query_id: stage.query_id,
                 num: stage.num,
@@ -208,9 +186,7 @@ pub fn rewrite_local_plan_with_metrics(
 pub fn stage_metrics_rewriter(
     stage: &LocalStage,
     metrics_collection: Arc<MetricsStore>,
-    format: DistributedMetricsFormat,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // Phase 1 — accumulate per-task metrics into a map keyed by node identity.
     //
     // For each task, the plan is traversed with `apply_with_dt_ctx`, which visits nodes in pre-order
     // traversal, ignoring branches that do not belong to the recursed DistributedTaskContext
@@ -248,7 +224,7 @@ pub fn stage_metrics_rewriter(
             }
 
             let mut node_metrics = task_metrics.pre_order_plan_metrics[per_task_counter].clone();
-            let rewrite_ctx = format.to_rewrite_ctx(task_id as u64);
+            let rewrite_ctx = RewriteCtx::from_task_id(task_id as u64);
             node_metrics = rewrite_ctx.maybe_rewrite_node_metics(node_metrics);
 
             let id = Arc::as_ptr(node) as *const () as usize;
@@ -286,11 +262,11 @@ mod tests {
     use crate::DistributedExt;
     use crate::coordinator::MetricsStore;
     use crate::metrics::DISTRIBUTED_DATAFUSION_TASK_ID_LABEL;
+    use crate::metrics::rewrite_distributed_plan_with_metrics;
     use crate::metrics::task_metrics_rewriter::MetricsWrapperExec;
     use crate::metrics::task_metrics_rewriter::{
         annotate_metrics_set_with_task_id, stage_metrics_rewriter,
     };
-    use crate::metrics::{DistributedMetricsFormat, rewrite_distributed_plan_with_metrics};
     use crate::stage::LocalStage;
     use crate::test_utils::in_memory_channel_resolver::{
         InMemoryChannelResolver, InMemoryWorkerResolver,
@@ -310,7 +286,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use itertools::Itertools;
     use std::sync::Arc;
-    use test_case::test_case;
+
     use uuid::Uuid;
 
     async fn make_test_ctx() -> SessionContext {
@@ -434,7 +410,7 @@ mod tests {
     /// they are re-written (ie. ensures we don't assign metrics to the wrong nodes)
     ///
     /// Only tests single node plans since the [TaskMetricsRewriter] stops on [NetworkBoundary].
-    async fn run_stage_metrics_rewriter_test(sql: &str, format: DistributedMetricsFormat) {
+    async fn run_stage_metrics_rewriter_test(sql: &str) {
         // Generate the plan
         let ctx = make_test_ctx().await;
         let plan = ctx
@@ -473,8 +449,7 @@ mod tests {
         let metrics_collection = Arc::new(metrics_collection);
 
         // Rewrite the plan.
-        let rewritten_plan =
-            stage_metrics_rewriter(&stage, metrics_collection.clone(), format).unwrap();
+        let rewritten_plan = stage_metrics_rewriter(&stage, metrics_collection.clone()).unwrap();
 
         // Collect metrics from the plan.
         let mut actual_metrics = vec![];
@@ -510,39 +485,30 @@ mod tests {
 
                 let mut expected_metrics_set = expected_task_node_metrics;
 
-                if format == DistributedMetricsFormat::PerTask {
-                    // Add task ids labels. We expect the actual metrics to be annotated by the
-                    // rewriter when using DistributedMetricsFormat::PerTask
-                    expected_metrics_set =
-                        annotate_metrics_set_with_task_id(expected_metrics_set, task_id as u64);
-                }
+                // Add task ids labels. We expect the actual metrics to be annotated by the
+                // rewriter
+                expected_metrics_set =
+                    annotate_metrics_set_with_task_id(expected_metrics_set, task_id as u64);
                 assert!(metrics_set_eq(&actual_metrics_set, &expected_metrics_set));
             }
         }
     }
 
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_stage_metrics_rewriter_1(format: DistributedMetricsFormat) {
+    async fn test_stage_metrics_rewriter_1() {
         run_stage_metrics_rewriter_test(
             "SELECT sum(balance) / 7.0 as avg_yearly from table2 group by name",
-            format,
         )
         .await;
     }
 
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_stage_metrics_rewriter_2(format: DistributedMetricsFormat) {
-        run_stage_metrics_rewriter_test("SELECT id, COUNT(*) as count FROM table1 WHERE id > 1 GROUP BY id ORDER BY id LIMIT 10", format).await;
+    async fn test_stage_metrics_rewriter_2() {
+        run_stage_metrics_rewriter_test("SELECT id, COUNT(*) as count FROM table1 WHERE id > 1 GROUP BY id ORDER BY id LIMIT 10").await;
     }
 
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_stage_metrics_rewriter_3(format: DistributedMetricsFormat) {
+    async fn test_stage_metrics_rewriter_3() {
         run_stage_metrics_rewriter_test(
             "SELECT sum(balance) / 7.0 as avg_yearly
             FROM table2
@@ -552,7 +518,6 @@ mod tests {
                 FROM table2 t2_inner
                 WHERE t2_inner.id = table2.id
               )",
-            format,
         )
         .await;
     }
@@ -568,11 +533,7 @@ mod tests {
             .await
             .unwrap();
         assert!(plan.is::<DistributedExec>());
-        assert!(
-            rewrite_distributed_plan_with_metrics(plan, DistributedMetricsFormat::Aggregated)
-                .await
-                .is_err()
-        );
+        assert!(rewrite_distributed_plan_with_metrics(plan).await.is_err());
     }
 
     // Assert every plan node has at least one metric except partition isolators, network boundary nodes, and the root DistributedExec node.
@@ -599,10 +560,7 @@ mod tests {
             .unwrap();
         collect(plan.clone(), ctx.task_ctx()).await.unwrap();
         assert!(plan.is::<DistributedExec>());
-        let rewritten_plan =
-            rewrite_distributed_plan_with_metrics(plan, DistributedMetricsFormat::Aggregated)
-                .await
-                .unwrap();
+        let rewritten_plan = rewrite_distributed_plan_with_metrics(plan).await.unwrap();
         assert_metrics_present_in_plan(&rewritten_plan);
     }
 

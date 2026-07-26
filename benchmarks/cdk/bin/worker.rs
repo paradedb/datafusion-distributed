@@ -16,8 +16,8 @@ use datafusion_distributed::test_utils::work_unit_file_scan::{
     WorkUnitFileScanCodec, WorkUnitFileScanConfig, WorkUnitFileScanTaskEstimator,
 };
 use datafusion_distributed::{
-    ChannelResolver, DisplayMetrics, DistributedExt, DistributedMetricsFormat, NetworkBoundaryExt,
-    SessionStateBuilderExt, Worker, WorkerQueryContext, WorkerResolver, display_plan_ascii,
+    ChannelResolver, DisplayMetrics, DistributedExt, NetworkBoundaryExt, SessionStateBuilderExt,
+    Worker, WorkerQueryContext, WorkerResolver, display_plan_ascii,
     get_distributed_channel_resolver, get_distributed_worker_resolver,
     rewrite_distributed_plan_with_metrics,
 };
@@ -206,12 +206,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             count += batch.map_err(err)?.num_rows();
                             info!("Gathered {count} rows, query still in progress..")
                         }
-                        let physical = rewrite_distributed_plan_with_metrics(
-                            physical,
-                            DistributedMetricsFormat::PerTask,
-                        )
-                        .await
-                        .map_err(err)?;
+                        let physical = rewrite_distributed_plan_with_metrics(physical)
+                            .await
+                            .map_err(err)?;
                         let stats_q_error = stats_estimation_q_error(&physical);
                         let plan = display_plan_ascii(physical.as_ref(), DisplayMetrics::All);
                         drop(task);

@@ -17,19 +17,14 @@ mod tests {
     };
     use datafusion_distributed::{
         DefaultSessionBuilder, DisplayMetrics, DistributedExt, DistributedLeafExec,
-        DistributedMetricsFormat, NetworkCoalesceExec, NetworkShuffleExec, WorkerQueryContext,
-        display_plan_ascii, rewrite_distributed_plan_with_metrics,
+        NetworkCoalesceExec, NetworkShuffleExec, WorkerQueryContext, display_plan_ascii,
+        rewrite_distributed_plan_with_metrics,
     };
     use futures::TryStreamExt;
     use std::sync::Arc;
-    use test_case::test_case;
 
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_metrics_collection_in_aggregation(
-        format: DistributedMetricsFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_metrics_collection_in_aggregation() -> Result<(), Box<dyn std::error::Error>> {
         let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
 
         let query =
@@ -37,7 +32,7 @@ mod tests {
 
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
-        d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
+        d_physical = rewrite_with_metrics(d_physical.clone()).await;
         println!(
             "{}",
             display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
@@ -57,12 +52,8 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_metrics_collection_in_join(
-        format: DistributedMetricsFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_metrics_collection_in_join() -> Result<(), Box<dyn std::error::Error>> {
         let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
 
         let query = r#"
@@ -91,7 +82,7 @@ mod tests {
 
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
-        d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
+        d_physical = rewrite_with_metrics(d_physical.clone()).await;
         println!(
             "{}",
             display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
@@ -113,12 +104,8 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_metrics_collection_in_union(
-        format: DistributedMetricsFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_metrics_collection_in_union() -> Result<(), Box<dyn std::error::Error>> {
         let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
 
         let query = r#"
@@ -136,7 +123,7 @@ mod tests {
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
 
-        d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
+        d_physical = rewrite_with_metrics(d_physical.clone()).await;
         println!(
             "{}",
             display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
@@ -157,12 +144,8 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_metric_collection_network_boundaries(
-        format: DistributedMetricsFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_metric_collection_network_boundaries() -> Result<(), Box<dyn std::error::Error>> {
         let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
 
         let query =
@@ -170,7 +153,7 @@ mod tests {
 
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
-        d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
+        d_physical = rewrite_with_metrics(d_physical.clone()).await;
         println!(
             "{}",
             display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
@@ -223,7 +206,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_stage_level_metric_collection() -> Result<(), Box<dyn std::error::Error>> {
-        let format = DistributedMetricsFormat::PerTask;
         let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
 
         let query =
@@ -231,7 +213,7 @@ mod tests {
 
         let s_ctx = SessionContext::default();
         let (_, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
-        d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
+        d_physical = rewrite_with_metrics(d_physical.clone()).await;
 
         let display = display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All);
         assert_not_contains!(&display, "metrics=[]");
@@ -245,7 +227,6 @@ mod tests {
     #[tokio::test]
     async fn test_metric_collection_display_all_have_metrics()
     -> Result<(), Box<dyn std::error::Error>> {
-        let format = DistributedMetricsFormat::PerTask;
         let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
 
         let query =
@@ -253,7 +234,7 @@ mod tests {
 
         let s_ctx = SessionContext::default();
         let (_, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
-        d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
+        d_physical = rewrite_with_metrics(d_physical.clone()).await;
 
         let display =
             DisplayableExecutionPlan::with_metrics(d_physical.children().swap_remove(0).as_ref())
@@ -274,12 +255,8 @@ mod tests {
     /// This guards against the regression where the per-task metrics were sourced from the
     /// un-rewritten `leaf.metrics()` (always empty) instead of the wrapping `MetricsWrapperExec`,
     /// which collapsed all metrics onto the header line regardless of format.
-    #[test_case(DistributedMetricsFormat::Aggregated ; "aggregated_metrics")]
-    #[test_case(DistributedMetricsFormat::PerTask ; "per_task_metrics")]
     #[tokio::test]
-    async fn test_distributed_leaf_metrics_display(
-        format: DistributedMetricsFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_distributed_leaf_metrics_display() -> Result<(), Box<dyn std::error::Error>> {
         let (d_ctx, _guard, _) = start_localhost_context(3, DefaultSessionBuilder).await;
 
         let query =
@@ -287,9 +264,11 @@ mod tests {
 
         let s_ctx = SessionContext::default();
         let (_, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
-        d_physical = rewrite_with_metrics(d_physical.clone(), format).await;
+        d_physical = rewrite_with_metrics(d_physical.clone()).await;
 
-        let display = display_plan_ascii(d_physical.as_ref(), DisplayMetrics::All);
+        let mut all = DisplayMetrics::All;
+        all.aggregate_tasks = false;
+        let display = display_plan_ascii(d_physical.as_ref(), all);
         println!("{display}");
 
         let header = display
@@ -311,22 +290,21 @@ mod tests {
             variants.len()
         );
 
-        match format {
-            DistributedMetricsFormat::PerTask => {
-                // Metrics belong next to each variant, not aggregated on the header line.
-                assert_not_contains!(header, "metrics=");
-                for (task, line) in variants.iter().enumerate() {
-                    assert_contains!(*line, format!("metrics=[output_rows={{{task}:"));
-                }
-            }
-            DistributedMetricsFormat::Aggregated => {
-                // A single aggregated metrics block lives on the header; variants stay bare.
-                assert_contains!(header, "metrics=[output_rows=");
-                for line in &variants {
-                    assert_not_contains!(*line, "metrics=");
-                }
-            }
+        // Metrics belong next to each variant, not aggregated on the header line.
+        assert_not_contains!(header, "metrics=");
+        for (task, line) in variants.iter().enumerate() {
+            assert_contains!(*line, format!("metrics=[output_rows={{{task}:"));
         }
+
+        // Also test aggregated tasks
+        let mut agg = DisplayMetrics::All;
+        agg.aggregate_tasks = true;
+        let display_agg = display_plan_ascii(d_physical.as_ref(), agg);
+        let header_agg = display_agg
+            .lines()
+            .find(|l| l.contains("DistributedLeafExec:"))
+            .expect("expected a DistributedLeafExec in the distributed plan");
+        assert_contains!(header_agg, "metrics=[output_rows=");
 
         Ok(())
     }
@@ -357,8 +335,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let plan =
-            rewrite_distributed_plan_with_metrics(plan, DistributedMetricsFormat::PerTask).await?;
+        let plan = rewrite_distributed_plan_with_metrics(plan).await?;
 
         let work_units_sent = node_metrics::<RowGeneratorExec>(&plan, "work_units_sent", 0);
         assert_eq!(work_units_sent, 6);
@@ -376,7 +353,7 @@ mod tests {
 
         let s_ctx = SessionContext::default();
         let (s_physical, mut d_physical) = execute(&s_ctx, &d_ctx, query).await?;
-        d_physical = rewrite_with_metrics(d_physical, DistributedMetricsFormat::Aggregated).await;
+        d_physical = rewrite_with_metrics(d_physical).await;
         println!(
             "{}",
             display_plan_ascii(s_physical.as_ref(), DisplayMetrics::All)
@@ -421,14 +398,8 @@ mod tests {
         }
     }
 
-    /// Waits for all worker metrics to arrive then rewrites the plan with them.
-    async fn rewrite_with_metrics(
-        plan: Arc<dyn ExecutionPlan>,
-        format: DistributedMetricsFormat,
-    ) -> Arc<dyn ExecutionPlan> {
-        rewrite_distributed_plan_with_metrics(plan, format)
-            .await
-            .unwrap()
+    async fn rewrite_with_metrics(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        rewrite_distributed_plan_with_metrics(plan).await.unwrap()
     }
 
     async fn execute(

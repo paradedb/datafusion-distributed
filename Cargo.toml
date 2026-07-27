@@ -74,7 +74,6 @@ grpc = [
     "tonic",
     "tonic-prost",
     "tower",
-    "tower",
 ]
 
 integration = ["insta", "parquet", "arrow", "hyper-util", "grpc"]

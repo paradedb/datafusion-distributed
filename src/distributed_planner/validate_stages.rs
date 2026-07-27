@@ -2,7 +2,7 @@
 //! executing its plan once per task over the per-task input assignment and unioning the
 //! outputs must be equivalent to executing it once over all the data.
 //!
-//! DataFusion's optimizer discharges each operator's `required_input_distribution()`
+//! DataFusion's optimizer discharges each operator's `input_distribution_requirements()`
 //! obligations *process-locally* (a `SinglePartition` requirement is satisfied by a
 //! `CoalescePartitionsExec`, a `HashPartitioned` one by a `RepartitionExec`). Replicating the
 //! plan across tasks silently reinterprets "all the data" as "this task's slice", invalidating

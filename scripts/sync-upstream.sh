@@ -23,6 +23,14 @@ curl -fsSL "$CORE_SCRIPT_URL" -o "$TMP_SCRIPT"
 source "$TMP_SCRIPT"
 rm -f "$TMP_SCRIPT"
 
+# The shared rebase workflow falls back to <!here> when a GitHub user cannot be
+# mapped to Slack. Route this repo's upstream rebase alerts to the owning group.
+if [[ "${1:-}" == "rebase" || "${GITHUB_WORKFLOW:-}" == "Upstream Rebase" || "${WORKFLOW:-}" == "Upstream Rebase" ]]; then
+    slack_mention_for_user() {
+        echo "<!subteam^S0BLH15TWRK|@datafusion-maintainers>"
+    }
+fi
+
 # 4. Only execute the command router if run directly (not sourced)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     sync_core_main "$@"

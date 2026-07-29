@@ -1013,6 +1013,14 @@ mod tests {
 
         // 64 KiB rings against ~700 KiB of per-worker aggregate state.
         let boot = bootstrap_mesh_with_queue(N_WORKERS + 1, 64 * 1024);
+        // Meter every proc's reassembly through one pool; the end-state assert proves the
+        // reservations drain with the query.
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let transport_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        boot.leader_mesh.set_transport_memory_pool(&transport_pool);
+        for (_, mesh, _) in &boot.workers {
+            mesh.set_transport_memory_pool(&transport_pool);
+        }
         let captured = new_captured_plans();
         let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
         register_wide_table(&leader_ctx);
@@ -1052,6 +1060,11 @@ mod tests {
             pretty_format_batches(&expected).unwrap().to_string(),
             pretty_format_batches(&got).unwrap().to_string(),
             "distributed wide aggregate != serial"
+        );
+        assert_eq!(
+            transport_pool.reserved(),
+            0,
+            "reassembly must release the pool"
         );
     }
 

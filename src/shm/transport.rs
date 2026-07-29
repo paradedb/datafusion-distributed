@@ -41,6 +41,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::DataFusionError;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use prost::Message;
 
 use crate::common::deserialize_uuid;
@@ -1293,6 +1294,11 @@ pub(super) struct MppReceiver {
     /// stream's cancel) sits here until the stream's `Eof` clears it or a fresh frame for
     /// the stream restarts at offset 0.
     assemblies: Mutex<HashMap<(u32, u32, u32), FrameAssembly>>,
+    /// Accounts the bytes held in `assemblies` against an embedder-provided memory pool.
+    /// `None` (the default) leaves reassembly unmetered. Each assembly reserves its
+    /// `total_len` at insert and releases it at remove; dropping the receiver returns
+    /// whatever is still reserved (the reservation frees itself on drop).
+    reservation: Mutex<Option<MemoryReservation>>,
 }
 
 /// One stream's partially reassembled oversized frame.
@@ -1306,6 +1312,29 @@ impl MppReceiver {
         Self {
             channel,
             assemblies: Mutex::new(HashMap::default()),
+            reservation: Mutex::new(None),
+        }
+    }
+
+    /// Meter this receiver's reassembly buffers against `pool`. A frame whose reservation
+    /// fails surfaces the pool's error as a transport error, the same way an operator
+    /// overflowing the pool fails the query. Install before frames flow: a replacement
+    /// reservation would return any in-flight bytes to the old pool.
+    pub(super) fn set_memory_pool(&self, pool: &Arc<dyn MemoryPool>) {
+        let reservation = MemoryConsumer::new("MppFrameReassembly").register(pool);
+        *self.reservation.lock().unwrap() = Some(reservation);
+    }
+
+    fn reserve(&self, bytes: usize) -> Result<(), DataFusionError> {
+        match self.reservation.lock().unwrap().as_mut() {
+            Some(reservation) => reservation.try_grow(bytes),
+            None => Ok(()),
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if let Some(reservation) = self.reservation.lock().unwrap().as_mut() {
+            reservation.shrink(bytes);
         }
     }
 
@@ -1353,11 +1382,14 @@ impl MppReceiver {
         if kind != MppFrameKind::Chunk {
             if kind == MppFrameKind::Eof {
                 // The stream is over; drop any prefix its producer abandoned mid-frame.
-                self.assemblies.lock().unwrap().remove(&(
+                let abandoned = self.assemblies.lock().unwrap().remove(&(
                     header.sender_proc(),
                     header.stage_id,
                     header.partition,
                 ));
+                if let Some(abandoned) = abandoned {
+                    self.release(abandoned.total_len);
+                }
             }
             return Ok(Some(bytes));
         }
@@ -1376,17 +1408,24 @@ impl MppReceiver {
         let mut assemblies = self.assemblies.lock().unwrap();
         if offset == 0 {
             // Start of a new frame; replaces any abandoned predecessor for the same stream.
+            if let Some(abandoned) = assemblies.remove(&key) {
+                self.release(abandoned.total_len);
+            }
+            if data.len() == total_len {
+                return Ok(Some(data.to_vec()));
+            }
+            // Reserve before allocating so an over-budget frame fails without the bytes
+            // ever existing.
+            self.reserve(total_len)?;
             let mut buf = Vec::new();
             // `try_reserve` so a corrupt total_len surfaces as a query error, not an abort.
-            buf.try_reserve_exact(total_len).map_err(|e| {
-                DataFusionError::ResourcesExhausted(format!(
+            if let Err(e) = buf.try_reserve_exact(total_len) {
+                self.release(total_len);
+                return Err(DataFusionError::ResourcesExhausted(format!(
                     "mpp: cannot buffer a {total_len}-byte reassembled frame: {e}"
-                ))
-            })?;
-            buf.extend_from_slice(data);
-            if buf.len() == total_len {
-                return Ok(Some(buf));
+                )));
             }
+            buf.extend_from_slice(data);
             assemblies.insert(key, FrameAssembly { total_len, buf });
             return Ok(None);
         }
@@ -1407,6 +1446,7 @@ impl MppReceiver {
         assembly.buf.extend_from_slice(data);
         if assembly.buf.len() == total_len {
             let assembly = assemblies.remove(&key).expect("assembly present");
+            self.release(assembly.total_len);
             return Ok(Some(assembly.buf));
         }
         Ok(None)
@@ -1618,6 +1658,16 @@ impl DrainHandle {
             task_metrics_rx: Mutex::new(Some(task_metrics_rx)),
             set_plan_registry: Mutex::new(SetPlanRegistry::default()),
             cancelled_streams: Mutex::new(HashSet::default()),
+        }
+    }
+
+    /// Meter every receiver's reassembly buffers against `pool`. See
+    /// [`MppReceiver::set_memory_pool`].
+    pub(super) fn set_memory_pool(&self, pool: &Arc<dyn MemoryPool>) {
+        for slot in self.coop_receivers.lock().unwrap().iter() {
+            if let Some((_, receiver)) = slot.as_ref() {
+                receiver.set_memory_pool(pool);
+            }
         }
     }
 
@@ -2734,14 +2784,25 @@ mod tests {
     /// Replays recorded frames as a `BatchChannelReceiver`, standing in for the ring's recv
     /// side so reassembly can be exercised without a DSM region.
     struct ReplayChannel {
-        frames: Mutex<VecDeque<Vec<u8>>>,
+        frames: StdArc<Mutex<VecDeque<Vec<u8>>>>,
     }
 
     impl ReplayChannel {
         fn over(frames: Vec<Vec<u8>>) -> Box<Self> {
-            Box::new(Self {
-                frames: Mutex::new(frames.into_iter().collect()),
-            })
+            Self::shared(frames).0
+        }
+
+        /// Variant that keeps a handle to the queue so a test can feed more frames after
+        /// the receiver is constructed.
+        #[allow(clippy::type_complexity)]
+        fn shared(frames: Vec<Vec<u8>>) -> (Box<Self>, StdArc<Mutex<VecDeque<Vec<u8>>>>) {
+            let queue = StdArc::new(Mutex::new(frames.into_iter().collect::<VecDeque<_>>()));
+            (
+                Box::new(Self {
+                    frames: StdArc::clone(&queue),
+                }),
+                queue,
+            )
         }
     }
 
@@ -2969,7 +3030,11 @@ mod tests {
         let mut whole = Vec::new();
         encode_chunk_frame_into(chunk_header, inner.len() as u64, 0, &inner, &mut whole);
 
+        let pool: Arc<dyn MemoryPool> = Arc::new(
+            datafusion::execution::memory_pool::GreedyMemoryPool::new(1 << 20),
+        );
         let receiver = MppReceiver::new(ReplayChannel::over(vec![partial, eof, whole]));
+        receiver.set_memory_pool(&pool);
         let RecvBatchOutcome::Eof { header } = receiver.try_recv_batch() else {
             panic!("expected the Eof to pass through");
         };
@@ -2978,6 +3043,7 @@ mod tests {
             receiver.assemblies.lock().unwrap().is_empty(),
             "the Eof must clear the abandoned prefix"
         );
+        assert_eq!(pool.reserved(), 0, "the Eof must release the reservation");
         assert!(matches!(
             receiver.try_recv_batch(),
             RecvBatchOutcome::Batch { .. }
@@ -3007,6 +3073,82 @@ mod tests {
             receiver.try_recv_batch(),
             RecvBatchOutcome::Error(_)
         ));
+    }
+
+    /// With a pool installed, an in-flight assembly reserves its full frame size and the
+    /// completion releases it, so reassembly memory shows up in (and returns to) the same
+    /// budget the embedder gives its operators.
+    #[test]
+    fn reassembly_reserves_and_releases_pool_memory() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+
+        let sender_proc = 6;
+        let mut inner = Vec::new();
+        encode_frame_into(
+            MppFrameHeader::batch(2, 0, sender_proc),
+            &sample_batch(4),
+            &mut inner,
+        )
+        .expect("encode inner");
+        let chunk_header = MppFrameHeader::chunk(2, 0, sender_proc);
+        let split_at = inner.len() / 2;
+        let mut c0 = Vec::new();
+        encode_chunk_frame_into(
+            chunk_header,
+            inner.len() as u64,
+            0,
+            &inner[..split_at],
+            &mut c0,
+        );
+        let mut c1 = Vec::new();
+        encode_chunk_frame_into(
+            chunk_header,
+            inner.len() as u64,
+            split_at as u64,
+            &inner[split_at..],
+            &mut c1,
+        );
+
+        let (channel, queue) = ReplayChannel::shared(vec![c0]);
+        let receiver = MppReceiver::new(channel);
+        receiver.set_memory_pool(&pool);
+        assert!(matches!(receiver.try_recv_batch(), RecvBatchOutcome::Empty));
+        assert_eq!(pool.reserved(), inner.len());
+        queue.lock().unwrap().push_back(c1);
+        assert!(matches!(
+            receiver.try_recv_batch(),
+            RecvBatchOutcome::Batch { .. }
+        ));
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A frame whose reservation exceeds the pool fails as a transport error naming the
+    /// consumer, with nothing left reserved and nothing allocated.
+    #[test]
+    fn reassembly_over_budget_fails_with_pool_error() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(256));
+
+        let mut chunk = Vec::new();
+        encode_chunk_frame_into(
+            MppFrameHeader::chunk(1, 0, 2),
+            100_000,
+            0,
+            &[0u8; 64],
+            &mut chunk,
+        );
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![chunk]));
+        receiver.set_memory_pool(&pool);
+        let RecvBatchOutcome::Error(e) = receiver.try_recv_batch() else {
+            panic!("expected the reservation to fail");
+        };
+        assert!(
+            format!("{e}").contains("MppFrameReassembly"),
+            "unexpected error: {e}"
+        );
+        assert_eq!(pool.reserved(), 0);
+        assert!(receiver.assemblies.lock().unwrap().is_empty());
     }
 
     #[test]

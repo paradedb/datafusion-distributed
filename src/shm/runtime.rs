@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use futures::stream::{self, BoxStream, StreamExt};
 use http::HeaderMap;
@@ -125,6 +126,15 @@ impl MppMesh {
             cancel_senders: Mutex::new(None),
             alive,
         }
+    }
+
+    /// Meter the transport's frame-reassembly buffers against `pool`, so an oversized
+    /// inbound frame draws from the same budget the embedder gives its operators. A frame
+    /// that cannot reserve fails the query with the pool's error instead of growing
+    /// unaccounted heap. Optional: without it, reassembly is unmetered. Install right
+    /// after setup, before frames flow.
+    pub fn set_transport_memory_pool(&self, pool: &Arc<dyn MemoryPool>) {
+        self.inbound_receiver.set_memory_pool(pool);
     }
 
     /// Mark this proc's DSM mesh detached so every ring handle's operations become no-ops.

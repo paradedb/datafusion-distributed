@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   call-promote:
-    uses: paradedb/actions/.github/workflows/reusable-promote.yml@v8
+    uses: paradedb/actions/.github/workflows/upstream-sync-promote.yml@v10
     with:
       branch_name: ${{ inputs.branch_name }}
       approvers: "philippemnoel,rebasedming,stuhood,mdashti"

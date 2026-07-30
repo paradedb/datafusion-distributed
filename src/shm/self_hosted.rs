@@ -1175,11 +1175,10 @@ mod tests {
     }
 
     async fn run(ctx: &SessionContext) -> Result<(String, Vec<String>)> {
-        // Ships `s` itself out of the aggregate on purpose: the emit is an offset slice of the
-        // partition's accumulated state, and arrow-ipc writes a sliced variable-length array's
-        // whole values buffer, so the raw frame balloons to the state's size no matter the
-        // batch size. The send path's compact-and-chunk is what carries every frame through these
-        // tiny rings; this query is its end-to-end exercise.
+        // Shipping `s` itself out of the aggregate is the point of this query: each emitted
+        // batch is an offset slice of the aggregate's accumulated state, and arrow-ipc
+        // serializes the slice's whole backing buffer, so the raw frames dwarf these tiny
+        // rings. The query only completes if the send path compacts and chunks them.
         let query = "SELECT val, max(s) AS m FROM t GROUP BY val";
         let plan = ctx.sql(query).await?.create_physical_plan().await?;
         let display = display_plan_ascii(plan.as_ref(), false);

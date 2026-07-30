@@ -403,6 +403,14 @@ fn encode_frame_into(
 /// send path exists to undo. `take` materializes only the selected rows; view arrays
 /// additionally need a `gc`, because `take` copies their views but keeps referencing the
 /// shared data blocks, so the encoded size wouldn't shrink no matter how few rows remain.
+///
+/// The flight path applies the same collection idea in `garbage_collect_arrays`
+/// (`protocol/grpc/worker_service.rs`), unconditionally and with dictionary gc on top.
+/// They stay separate on purpose: everything outside `shm` follows upstream, and the
+/// dictionary kernel lives in `arrow-select`, which only the `grpc` feature pulls in.
+/// Dictionaries therefore ride uncollected here: `take` re-maps the keys but keeps the
+/// whole values array, so an oversized dictionary frame streams in chunks instead of
+/// shrinking.
 fn compact_rows(
     batch: &RecordBatch,
     offset: usize,

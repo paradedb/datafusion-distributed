@@ -663,6 +663,15 @@ impl DsmMpscSender {
         }
     }
 
+    /// Largest frame `try_send` can accept: every slot's payload capacity combined. Senders
+    /// consult this before encoding, so an oversized batch can be split to fit instead of
+    /// erroring with `MessageTooLarge`.
+    pub(super) fn max_frame_bytes(&self) -> usize {
+        let header = unsafe { self.ring.as_ref() };
+        (header.slot_capacity as usize).saturating_sub(SLOT_HEADER_BYTES)
+            * header.ring_size as usize
+    }
+
     /// Wake the registered consumer, if any. Reads the token the consumer stored via
     /// [`DsmMpscReceiver::set_receiver`] and hands it to the injected [`Wakeup`]; skips when no
     /// consumer is registered ([`NO_RECEIVER_TOKEN`]).
@@ -709,8 +718,9 @@ impl DsmMpscSender {
         let n_slots_usize = bytes.len().div_ceil(payload_cap);
         if n_slots_usize > header.ring_size as usize || n_slots_usize > FLAGS_NSLOTS_MAX as usize {
             // Frame is larger than the entire ring (or larger than the n_slots field
-            // can encode). Either bump `mpp_queue_size` or land a chunked-stream
-            // protocol that spans rounds.
+            // can encode). The transport chunks frames under this bound before they
+            // reach the ring (see transport.rs), so hitting it through `MppSender`
+            // means a chunk-sizing bug, not an operator emitting wide state.
             return Err(SendError::MessageTooLarge);
         }
         let n_slots = n_slots_usize as u32;

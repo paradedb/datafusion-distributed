@@ -33,7 +33,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use datafusion::common::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{
+    ArrayRef, BinaryViewArray, RecordBatch, StringViewArray, UInt64Array,
+};
+use datafusion::arrow::compute::take;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::DataFusionError;
@@ -82,6 +86,12 @@ pub(super) enum MppFrameKind {
     /// ring stays healthy for metrics and every other stream, the way gRPC closes one stream
     /// without dropping the channel.
     Cancel = 6,
+    /// One piece of a frame too large for the channel's frame bound. The payload is a
+    /// `[total_len: u64][offset: u64]` prefix followed by that byte range of the inner frame.
+    /// The receiver reassembles per `(sender_proc, stage_id, partition)` and decodes the inner
+    /// frame once `total_len` bytes have arrived, so no single ring-resident message ever
+    /// exceeds the ring and frame size is never an error.
+    Chunk = 7,
 }
 
 /// Payload of a `SetPlan` frame: the plan-delivery message a worker needs to run one task,
@@ -272,6 +282,19 @@ impl MppFrameHeader {
         }
     }
 
+    /// Build a `Chunk` header for one piece of an oversized frame. `stage_id`/`partition`
+    /// mirror the inner frame's addressing: together with `sender_proc` they key the
+    /// receiver's reassembly, so chunked frames from two streams of the same proc can
+    /// interleave without corrupting each other.
+    pub fn chunk(stage_id: u32, partition: u32, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::Chunk, sender_proc),
+            stage_id,
+            partition,
+        }
+    }
+
     /// The mesh peer that wrote this frame. The drain demuxes incoming frames into the
     /// per-channel buffer registry by `(sender_proc, stage_id, partition)`.
     pub fn sender_proc(&self) -> u32 {
@@ -297,6 +320,7 @@ impl MppFrameHeader {
             4 => Ok(MppFrameKind::TaskMetrics),
             5 => Ok(MppFrameKind::SetPlan),
             6 => Ok(MppFrameKind::Cancel),
+            7 => Ok(MppFrameKind::Chunk),
             other => Err(DataFusionError::Internal(format!(
                 "mpp: unknown frame kind {other:#x}"
             ))),
@@ -373,6 +397,53 @@ fn encode_frame_into(
     Ok(())
 }
 
+/// Copy `len` rows starting at `offset` into fresh, tightly-packed arrays. A plain
+/// `RecordBatch::slice` keeps the original backing buffers, and arrow-ipc writes a sliced
+/// variable-length array's values buffer whole, which is exactly the ballooning the oversized
+/// send path exists to undo. `take` materializes only the selected rows; view arrays
+/// additionally need a `gc`, because `take` copies their views but keeps referencing the
+/// shared data blocks, so the encoded size wouldn't shrink no matter how few rows remain.
+///
+/// The flight path applies the same collection idea in `garbage_collect_arrays`
+/// (`protocol/grpc/worker_service.rs`), unconditionally and with dictionary gc on top.
+/// They stay separate on purpose: everything outside `shm` follows upstream, and the
+/// dictionary kernel lives in `arrow-select`, which only the `grpc` feature pulls in.
+/// Dictionaries therefore ride uncollected here: `take` re-maps the keys but keeps the
+/// whole values array, so an oversized dictionary frame streams in chunks instead of
+/// shrinking.
+fn compact_rows(
+    batch: &RecordBatch,
+    offset: usize,
+    len: usize,
+) -> Result<RecordBatch, DataFusionError> {
+    let indices = UInt64Array::from_iter_values(offset as u64..(offset + len) as u64);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            let taken = take(column.as_ref(), &indices, None)?;
+            Ok(match taken.data_type() {
+                DataType::Utf8View => Arc::new(
+                    taken
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .unwrap()
+                        .gc(),
+                ) as ArrayRef,
+                DataType::BinaryView => Arc::new(
+                    taken
+                        .as_any()
+                        .downcast_ref::<BinaryViewArray>()
+                        .unwrap()
+                        .gc(),
+                ) as ArrayRef,
+                _ => taken,
+            })
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
 /// Serialize a payload-less [`MppFrameKind::Eof`] frame for `(stage_id, partition)`
 /// into `buf`. The shm_mq peer reads this as a 16-byte message and routes it to
 /// the channel buffer's source-done counter without touching Arrow IPC.
@@ -391,6 +462,46 @@ fn encode_eof_frame_into(
     MppFrameHeader::eof(stage_id, partition, sender_proc)
         .write_to(&mut buf[..MPP_FRAME_HEADER_SIZE]);
     Ok(())
+}
+
+/// Byte length of the `[total_len: u64][offset: u64]` prefix on every `Chunk` payload.
+const CHUNK_PREFIX_SIZE: usize = 16;
+
+/// Serialize one piece of an oversized frame: chunk header, `[total_len, offset]` prefix, then
+/// `data` (the inner frame's bytes at `offset`).
+fn encode_chunk_frame_into(
+    header: MppFrameHeader,
+    total_len: u64,
+    offset: u64,
+    data: &[u8],
+    buf: &mut Vec<u8>,
+) {
+    buf.clear();
+    buf.resize(MPP_FRAME_HEADER_SIZE, 0);
+    header.write_to(&mut buf[..MPP_FRAME_HEADER_SIZE]);
+    buf.extend_from_slice(&total_len.to_le_bytes());
+    buf.extend_from_slice(&offset.to_le_bytes());
+    buf.extend_from_slice(data);
+}
+
+/// Parse a `Chunk` frame's payload into `(total_len, offset, data)`. The caller has already
+/// parsed and validated the 16-byte frame header.
+fn parse_chunk_frame(bytes: &[u8]) -> Result<(usize, usize, &[u8]), DataFusionError> {
+    let payload = &bytes[MPP_FRAME_HEADER_SIZE..];
+    if payload.len() < CHUNK_PREFIX_SIZE {
+        return Err(DataFusionError::Internal(format!(
+            "mpp: chunk frame too short for its prefix ({} < {CHUNK_PREFIX_SIZE})",
+            payload.len()
+        )));
+    }
+    let total_len = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let (Ok(total_len), Ok(offset)) = (usize::try_from(total_len), usize::try_from(offset)) else {
+        return Err(DataFusionError::Internal(format!(
+            "mpp: chunk prefix out of range (total_len {total_len}, offset {offset})"
+        )));
+    };
+    Ok((total_len, offset, &payload[CHUNK_PREFIX_SIZE..]))
 }
 
 /// Serialize a prost-encoded control payload (`WorkUnit` / `TaskMetrics`) behind `header`.
@@ -461,6 +572,10 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
             })??;
             Ok((header, FrameBody::Batch(batch)))
         }
+        MppFrameKind::Chunk => Err(DataFusionError::Internal(
+            "mpp: chunk frame reached decode_frame; chunks reassemble in MppReceiver first"
+                .to_string(),
+        )),
     }
 }
 
@@ -634,6 +749,13 @@ pub(crate) trait BatchChannelSender: Send + Sync {
     /// sibling task land a different payload mid-message and corrupt the queue. In-proc
     /// channels return a per-instance mutex too, just to keep the call sites uniform.
     fn send_lock(&self) -> &tokio::sync::Mutex<()>;
+
+    /// Largest single frame the channel accepts, when bounded. The batch send path splits
+    /// oversized batches to fit under it. `None` (the default, for in-proc channels) disables
+    /// splitting.
+    fn max_frame_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Pluggable "drain everything inbound" hook for [`MppSender`]'s cooperative send spin. The
@@ -856,35 +978,7 @@ impl MppSender {
             self.header.sender_proc(),
             scratch,
         )?;
-        let Some(drain) = self.cooperative_drain.as_ref() else {
-            return self.channel.send_bytes(scratch);
-        };
-        // Lock the channel before the spin so a sibling task can't interleave a different
-        // partial write through the shared shm_mq handle. See `BatchChannelSender::send_lock`.
-        let _send_guard = self.channel.send_lock().lock().await;
-        let mut first_try = true;
-        let t_wait_start = Instant::now();
-        loop {
-            drain.check_interrupt()?;
-            // The consumer cancelled this stream, so end the send cleanly and let the producer
-            // fragment complete. Checked before the send so a cancel that landed mid-spin stops
-            // the next iteration.
-            if drain.stream_cancelled(self.header.stage_id, self.header.partition) {
-                return Ok(());
-            }
-            if self.spin_try_send_bytes(scratch).await? {
-                if !first_try {
-                    stats.send_wait += t_wait_start.elapsed();
-                }
-                return Ok(());
-            }
-            first_try = false;
-            stats.spin_iters += 1;
-            let t_drain = Instant::now();
-            self.spin_try_drain_pass(drain).await?;
-            stats.coop_drain_in_spin += t_drain.elapsed();
-            tokio::task::yield_now().await;
-        }
+        self.spin_send_frame(scratch, stats).await.map(|_| ())
     }
 
     /// Spin-loop helper: call `channel.try_send_bytes(scratch)`.
@@ -909,20 +1003,99 @@ impl MppSender {
         let t_enc = Instant::now();
         encode_frame_into(self.header, batch, scratch)?;
         stats.encode += t_enc.elapsed();
+        if self
+            .channel
+            .max_frame_bytes()
+            .is_none_or(|cap| scratch.len() <= cap)
+        {
+            return self.spin_send_scratch(scratch, stats).await;
+        }
+        // An over-cap frame usually means the batch carries offset slices of an upstream
+        // operator's accumulated state: arrow-ipc writes a sliced variable-length array's
+        // whole values buffer, so the frame balloons to the state's size no matter the row
+        // count. Compacting into fresh arrays drops the shared buffers. It's an
+        // optimization, not a bound: whatever stays over the cap streams through the ring
+        // in chunks.
+        let compacted = compact_rows(batch, 0, batch.num_rows())?;
+        let t_enc = Instant::now();
+        encode_frame_into(self.header, &compacted, scratch)?;
+        stats.encode += t_enc.elapsed();
         self.spin_send_scratch(scratch, stats).await
     }
 
-    /// Push an already-encoded frame through the channel via the cooperative-drain spin (or the
-    /// blocking fallback when no drain is attached). Shared by every frame kind's send path.
+    /// Push an already-encoded frame through the channel, splitting it into `Chunk` frames
+    /// first when it exceeds the channel's frame bound. Shared by every frame kind's send
+    /// path, so an oversized `SetPlan` streams the same way an oversized batch does.
     async fn spin_send_scratch(
         &self,
         scratch: &[u8],
         stats: &mut SendBatchStats,
     ) -> Result<(), DataFusionError> {
+        match self.channel.max_frame_bytes() {
+            Some(cap) if scratch.len() > cap => self.send_chunked(scratch, cap, stats).await,
+            _ => self.spin_send_frame(scratch, stats).await.map(|_| ()),
+        }
+    }
+
+    /// Stream one oversized frame through the bounded channel as a sequence of `Chunk`
+    /// frames, each within the channel's bound. The whole frame exists only in this
+    /// sender's scratch and the receiver's reassembly buffer, never in the ring, so the
+    /// ring bounds backpressure granularity rather than message size. A cancel observed
+    /// between chunks abandons the remainder; the receiver's reassembly rules (offset-0
+    /// restart, cleanup on the stream's `Eof`) tolerate the orphaned prefix.
+    async fn send_chunked(
+        &self,
+        frame: &[u8],
+        cap: usize,
+        stats: &mut SendBatchStats,
+    ) -> Result<(), DataFusionError> {
+        let Some(chunk_data_max) = cap
+            .checked_sub(MPP_FRAME_HEADER_SIZE + CHUNK_PREFIX_SIZE)
+            .filter(|n| *n > 0)
+        else {
+            return Err(DataFusionError::Internal(format!(
+                "mpp: channel frame bound {cap} cannot fit a chunk header"
+            )));
+        };
+        let header = MppFrameHeader::chunk(
+            self.header.stage_id,
+            self.header.partition,
+            self.header.sender_proc(),
+        );
+        let total_len = frame.len() as u64;
+        let mut buf =
+            Vec::with_capacity(MPP_FRAME_HEADER_SIZE + CHUNK_PREFIX_SIZE + chunk_data_max);
+        let mut offset = 0usize;
+        while offset < frame.len() {
+            let end = usize::min(offset + chunk_data_max, frame.len());
+            encode_chunk_frame_into(
+                header,
+                total_len,
+                offset as u64,
+                &frame[offset..end],
+                &mut buf,
+            );
+            if !self.spin_send_frame(&buf, stats).await? {
+                // The consumer cancelled the stream mid-frame; drop the rest.
+                return Ok(());
+            }
+            offset = end;
+        }
+        Ok(())
+    }
+
+    /// Push one channel-bounded frame through the cooperative-drain spin (or the blocking
+    /// fallback when no drain is attached). Returns `false` when the spin ended because the
+    /// consumer cancelled this sender's stream, so multi-frame callers can stop early.
+    async fn spin_send_frame(
+        &self,
+        scratch: &[u8],
+        stats: &mut SendBatchStats,
+    ) -> Result<bool, DataFusionError> {
         let Some(drain) = self.cooperative_drain.as_ref() else {
             // No drain attached (unit tests, in-proc channels): fall
             // back to the blocking send path.
-            return self.channel.send_bytes(scratch);
+            return self.channel.send_bytes(scratch).map(|()| true);
         };
         // Lock the channel before the spin so a sibling task can't interleave a different
         // partial write through the shared shm_mq handle. See `BatchChannelSender::send_lock`.
@@ -950,13 +1123,13 @@ impl MppSender {
             // fragment complete. Checked before the send so a cancel that landed mid-spin stops
             // the next iteration.
             if drain.stream_cancelled(self.header.stage_id, self.header.partition) {
-                return Ok(());
+                return Ok(false);
             }
             if self.spin_try_send_bytes(scratch).await? {
                 if !first_try {
                     stats.send_wait += t_wait_start.elapsed();
                 }
-                return Ok(());
+                return Ok(true);
             }
             first_try = false;
             stats.spin_iters += 1;
@@ -1121,34 +1294,130 @@ impl crate::PartitionSink for MppPartitionSink {
 /// into `RecordBatch`. Used by the drain thread.
 pub(super) struct MppReceiver {
     channel: Box<dyn BatchChannelReceiver>,
+    /// In-progress oversized frames, keyed by the chunk headers' `(sender_proc, stage_id,
+    /// partition)`. One entry per stream: a sender's frames for one stream are sequential,
+    /// so its chunks never interleave with each other, while chunked frames of two streams
+    /// from the same proc may. A prefix abandoned mid-frame (the producer observed the
+    /// stream's cancel) sits here until the stream's `Eof` clears it or a fresh frame for
+    /// the stream restarts at offset 0.
+    assemblies: Mutex<HashMap<(u32, u32, u32), FrameAssembly>>,
+}
+
+/// One stream's partially reassembled oversized frame.
+struct FrameAssembly {
+    total_len: usize,
+    buf: Vec<u8>,
 }
 
 impl MppReceiver {
     pub fn new(channel: Box<dyn BatchChannelReceiver>) -> Self {
-        Self { channel }
+        Self {
+            channel,
+            assemblies: Mutex::new(HashMap::default()),
+        }
     }
 
     pub(super) fn try_recv_batch(&self) -> RecvBatchOutcome {
-        match self.channel.try_recv() {
-            RecvOutcome::Bytes(bytes) => match decode_frame(&bytes) {
-                Ok((header, FrameBody::Batch(batch))) => RecvBatchOutcome::Batch { header, batch },
-                Ok((header, FrameBody::Eof)) => RecvBatchOutcome::Eof { header },
-                Ok((header, FrameBody::WorkUnit(unit))) => {
-                    RecvBatchOutcome::WorkUnit { header, unit }
+        loop {
+            match self.channel.try_recv() {
+                RecvOutcome::Bytes(bytes) => {
+                    let complete = match self.ingest(bytes) {
+                        Ok(Some(frame)) => frame,
+                        // Absorbed one chunk of a larger frame; pull the next message.
+                        Ok(None) => continue,
+                        Err(e) => return RecvBatchOutcome::Error(e),
+                    };
+                    return match decode_frame(&complete) {
+                        Ok((header, FrameBody::Batch(batch))) => {
+                            RecvBatchOutcome::Batch { header, batch }
+                        }
+                        Ok((header, FrameBody::Eof)) => RecvBatchOutcome::Eof { header },
+                        Ok((header, FrameBody::WorkUnit(unit))) => {
+                            RecvBatchOutcome::WorkUnit { header, unit }
+                        }
+                        Ok((header, FrameBody::FeedEof)) => RecvBatchOutcome::FeedEof { header },
+                        Ok((header, FrameBody::TaskMetrics(metrics))) => {
+                            RecvBatchOutcome::TaskMetrics { header, metrics }
+                        }
+                        Ok((header, FrameBody::SetPlan(frame))) => {
+                            RecvBatchOutcome::SetPlan { header, frame }
+                        }
+                        Ok((header, FrameBody::Cancel)) => RecvBatchOutcome::Cancel { header },
+                        Err(e) => RecvBatchOutcome::Error(e),
+                    };
                 }
-                Ok((header, FrameBody::FeedEof)) => RecvBatchOutcome::FeedEof { header },
-                Ok((header, FrameBody::TaskMetrics(metrics))) => {
-                    RecvBatchOutcome::TaskMetrics { header, metrics }
-                }
-                Ok((header, FrameBody::SetPlan(frame))) => {
-                    RecvBatchOutcome::SetPlan { header, frame }
-                }
-                Ok((header, FrameBody::Cancel)) => RecvBatchOutcome::Cancel { header },
-                Err(e) => RecvBatchOutcome::Error(e),
-            },
-            RecvOutcome::Empty => RecvBatchOutcome::Empty,
-            RecvOutcome::Detached => RecvBatchOutcome::Detached,
+                RecvOutcome::Empty => return RecvBatchOutcome::Empty,
+                RecvOutcome::Detached => return RecvBatchOutcome::Detached,
+            }
         }
+    }
+
+    /// Route one raw ring message through reassembly. Complete frames pass through untouched;
+    /// `Chunk` frames accumulate per stream until `total_len` bytes arrived, at which point the
+    /// reassembled inner frame returns for normal decoding.
+    fn ingest(&self, bytes: Vec<u8>) -> Result<Option<Vec<u8>>, DataFusionError> {
+        let header = MppFrameHeader::parse(&bytes)?;
+        let kind = header.kind()?;
+        if kind != MppFrameKind::Chunk {
+            if kind == MppFrameKind::Eof {
+                // The stream is over; drop any prefix its producer abandoned mid-frame.
+                self.assemblies.lock().unwrap().remove(&(
+                    header.sender_proc(),
+                    header.stage_id,
+                    header.partition,
+                ));
+            }
+            return Ok(Some(bytes));
+        }
+        let (total_len, offset, data) = parse_chunk_frame(&bytes)?;
+        if total_len < MPP_FRAME_HEADER_SIZE
+            || offset
+                .checked_add(data.len())
+                .is_none_or(|end| end > total_len)
+        {
+            return Err(DataFusionError::Internal(format!(
+                "mpp: chunk bounds exceed the frame ({offset} + {} > {total_len})",
+                data.len()
+            )));
+        }
+        let key = (header.sender_proc(), header.stage_id, header.partition);
+        let mut assemblies = self.assemblies.lock().unwrap();
+        if offset == 0 {
+            // Start of a new frame; replaces any abandoned predecessor for the same stream.
+            let mut buf = Vec::new();
+            // `try_reserve` so a corrupt total_len surfaces as a query error, not an abort.
+            buf.try_reserve_exact(total_len).map_err(|e| {
+                DataFusionError::ResourcesExhausted(format!(
+                    "mpp: cannot buffer a {total_len}-byte reassembled frame: {e}"
+                ))
+            })?;
+            buf.extend_from_slice(data);
+            if buf.len() == total_len {
+                return Ok(Some(buf));
+            }
+            assemblies.insert(key, FrameAssembly { total_len, buf });
+            return Ok(None);
+        }
+        let Some(assembly) = assemblies.get_mut(&key) else {
+            return Err(DataFusionError::Internal(format!(
+                "mpp: continuation chunk (offset {offset}) with no first chunk for \
+                 sender {} stage {} partition {}",
+                key.0, key.1, key.2
+            )));
+        };
+        if assembly.total_len != total_len || assembly.buf.len() != offset {
+            return Err(DataFusionError::Internal(format!(
+                "mpp: chunk out of sequence (have {} of {}, got offset {offset} of {total_len})",
+                assembly.buf.len(),
+                assembly.total_len
+            )));
+        }
+        assembly.buf.extend_from_slice(data);
+        if assembly.buf.len() == total_len {
+            let assembly = assemblies.remove(&key).expect("assembly present");
+            return Ok(Some(assembly.buf));
+        }
+        Ok(None)
     }
 }
 
@@ -1829,7 +2098,9 @@ pub(super) const SELF_LOOP_CAPACITY: usize = 1 << 20;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, Int64Array, StringArray, UInt64Array};
+    use datafusion::arrow::array::{
+        Int32Array, Int64Array, StringArray, StringViewArray, UInt64Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as StdArc;
     use std::thread;
@@ -2411,6 +2682,339 @@ mod tests {
             };
             assert_eq!(orig.num_rows(), decoded.num_rows());
         }
+    }
+
+    /// Bounded in-proc sink standing in for a DSM ring: rejects frames over `cap` the way
+    /// `try_send` does, records every accepted frame, and advertises the bound so the send
+    /// path's chunker engages.
+    struct BoundedSink {
+        cap: usize,
+        frames: Mutex<Vec<Vec<u8>>>,
+        send_lock: tokio::sync::Mutex<()>,
+    }
+
+    impl BoundedSink {
+        fn new(cap: usize) -> Arc<Self> {
+            Arc::new(Self {
+                cap,
+                frames: Mutex::new(Vec::new()),
+                send_lock: tokio::sync::Mutex::new(()),
+            })
+        }
+    }
+
+    impl BatchChannelSender for BoundedSink {
+        fn send_bytes(&self, bytes: &[u8]) -> Result<(), DataFusionError> {
+            if bytes.len() > self.cap {
+                return Err(DataFusionError::Execution(
+                    "mpp: DSM MPSC frame exceeds the entire ring capacity \
+                     (raise the embedder's queue-size knob)"
+                        .into(),
+                ));
+            }
+            self.frames.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn send_lock(&self) -> &tokio::sync::Mutex<()> {
+            &self.send_lock
+        }
+
+        fn max_frame_bytes(&self) -> Option<usize> {
+            Some(self.cap)
+        }
+    }
+
+    /// `rows` of ~1 KiB unique strings, so slices drag a large values buffer through
+    /// arrow-ipc.
+    fn wide_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let strings = StringArray::from_iter_values(
+            (0..rows).map(|i| format!("{i:06}-{}", "x".repeat(1024))),
+        );
+        let vals = Int64Array::from_iter_values(0..rows as i64);
+        RecordBatch::try_new(schema, vec![Arc::new(strings), Arc::new(vals)]).unwrap()
+    }
+
+    /// Replays recorded frames as a `BatchChannelReceiver`, standing in for the ring's recv
+    /// side so reassembly can be exercised without a DSM region.
+    struct ReplayChannel {
+        frames: Mutex<VecDeque<Vec<u8>>>,
+    }
+
+    impl ReplayChannel {
+        fn over(frames: Vec<Vec<u8>>) -> Box<Self> {
+            Box::new(Self {
+                frames: Mutex::new(frames.into_iter().collect()),
+            })
+        }
+    }
+
+    impl BatchChannelReceiver for ReplayChannel {
+        fn try_recv(&self) -> RecvOutcome {
+            match self.frames.lock().unwrap().pop_front() {
+                Some(f) => RecvOutcome::Bytes(f),
+                None => RecvOutcome::Empty,
+            }
+        }
+    }
+
+    /// Pull one decoded batch out of a receiver fed by `frames`, asserting nothing else is
+    /// queued behind it.
+    fn reassemble_single_batch(frames: Vec<Vec<u8>>) -> (MppFrameHeader, RecordBatch) {
+        let receiver = MppReceiver::new(ReplayChannel::over(frames));
+        let RecvBatchOutcome::Batch { header, batch } = receiver.try_recv_batch() else {
+            panic!("expected a reassembled batch");
+        };
+        assert!(matches!(receiver.try_recv_batch(), RecvBatchOutcome::Empty));
+        (header, batch)
+    }
+
+    #[test]
+    fn oversized_sliced_batch_compacts_then_chunks() {
+        let cap = 64 * 1024;
+        let base = wide_batch(512);
+        // 128 rows, but the slice keeps the whole ~512 KiB values buffer alive.
+        let sliced = base.slice(64, 128);
+
+        // Premise: the sliced encode really does balloon past the cap. If arrow-ipc ever
+        // learns to truncate sliced buffers, this assert flags the test (and the compact
+        // step's main motivation) for review.
+        let mut probe = Vec::new();
+        encode_frame_into(MppFrameHeader::batch(3, 7, 0), &sliced, &mut probe).expect("probe");
+        assert!(
+            probe.len() > cap,
+            "premise: sliced encode ({} bytes) must exceed cap ({cap})",
+            probe.len()
+        );
+
+        let sink = BoundedSink::new(cap);
+        let sender = MppSender::with_header(
+            Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
+            MppFrameHeader::batch(3, 7, 0),
+        );
+        sender.send_batch(&sliced).expect("chunked send");
+
+        // The compacted 128 rows (~135 KiB of strings) still exceed the cap, so the frame
+        // streams as chunks, every ring message within the cap.
+        let frames = sink.frames.lock().unwrap().clone();
+        assert!(
+            frames.len() > 1,
+            "expected the oversized frame to chunk, got {} frame(s)",
+            frames.len()
+        );
+        for frame in &frames {
+            assert!(
+                frame.len() <= cap,
+                "frame of {} bytes over cap",
+                frame.len()
+            );
+            let header = MppFrameHeader::parse(frame).expect("chunk header");
+            assert_eq!(header.kind().expect("kind"), MppFrameKind::Chunk);
+            assert_eq!((header.stage_id, header.partition), (3, 7));
+        }
+        let (header, got) = reassemble_single_batch(frames);
+        assert_eq!((header.stage_id, header.partition), (3, 7));
+        // Row order and content must survive; compare against a compacted copy (`take` of
+        // every row) since the decoded side never sees the original buffers.
+        let want = compact_rows(&sliced, 0, sliced.num_rows()).expect("compact reference");
+        assert_eq!(got, want);
+    }
+
+    /// Same as above but through `Utf8View`: `take` copies the views yet keeps the shared
+    /// data blocks, so without the compact-time `gc` every frame would drag the full data
+    /// blocks through the ring no matter how it is chunked.
+    #[test]
+    fn oversized_view_array_batch_compacts_then_chunks() {
+        let cap = 64 * 1024;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let strings = StringViewArray::from_iter_values(
+            (0..512).map(|i| format!("{i:06}-{}", "x".repeat(1024))),
+        );
+        let base = RecordBatch::try_new(schema, vec![Arc::new(strings)]).unwrap();
+        let sliced = base.slice(64, 128);
+
+        let sink = BoundedSink::new(cap);
+        let sender = MppSender::with_header(
+            Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
+            MppFrameHeader::batch(1, 1, 0),
+        );
+        sender.send_batch(&sliced).expect("view-array chunked send");
+
+        let frames = sink.frames.lock().unwrap().clone();
+        for frame in &frames {
+            assert!(
+                frame.len() <= cap,
+                "frame of {} bytes over cap",
+                frame.len()
+            );
+        }
+        let (_, got) = reassemble_single_batch(frames);
+        assert_eq!(got.num_rows(), 128);
+    }
+
+    /// A single row bigger than the whole ring streams through in chunks; frame size is
+    /// never an error.
+    #[test]
+    fn single_oversized_row_streams_through() {
+        let cap = 64 * 1024;
+        let value = "y".repeat(128 * 1024);
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from_iter_values([value.as_str()]))],
+        )
+        .unwrap();
+
+        let sink = BoundedSink::new(cap);
+        let sender = MppSender::with_header(
+            Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
+            MppFrameHeader::batch(0, 0, 0),
+        );
+        sender.send_batch(&batch).expect("giant row streams");
+
+        let frames = sink.frames.lock().unwrap().clone();
+        assert!(
+            frames.len() > 2,
+            "a 128 KiB row needs several 64 KiB chunks"
+        );
+        let (_, got) = reassemble_single_batch(frames);
+        assert_eq!(got.num_rows(), 1);
+        let strings = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(strings.value(0), value);
+    }
+
+    /// Chunked frames from two streams of one proc may interleave on the shared inbox; the
+    /// per-stream reassembly keys keep them apart, and a complete frame passes through the
+    /// middle of an assembly untouched.
+    #[test]
+    fn chunk_reassembly_keys_by_stream() {
+        let sender_proc = 2;
+        let inner_a = {
+            let mut buf = Vec::new();
+            encode_frame_into(
+                MppFrameHeader::batch(1, 1, sender_proc),
+                &sample_batch(4),
+                &mut buf,
+            )
+            .expect("encode inner A");
+            buf
+        };
+        let chunk_header = MppFrameHeader::chunk(1, 1, sender_proc);
+        let split_at = inner_a.len() / 2;
+        let mut a0 = Vec::new();
+        encode_chunk_frame_into(
+            chunk_header,
+            inner_a.len() as u64,
+            0,
+            &inner_a[..split_at],
+            &mut a0,
+        );
+        let mut a1 = Vec::new();
+        encode_chunk_frame_into(
+            chunk_header,
+            inner_a.len() as u64,
+            split_at as u64,
+            &inner_a[split_at..],
+            &mut a1,
+        );
+        let mut b = Vec::new();
+        encode_frame_into(
+            MppFrameHeader::batch(1, 2, sender_proc),
+            &sample_batch(7),
+            &mut b,
+        )
+        .expect("encode B");
+
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![a0, b, a1]));
+        // B lands first: its complete frame doesn't wait on A's assembly.
+        let RecvBatchOutcome::Batch { header, batch } = receiver.try_recv_batch() else {
+            panic!("expected B");
+        };
+        assert_eq!((header.partition, batch.num_rows()), (2, 7));
+        let RecvBatchOutcome::Batch { header, batch } = receiver.try_recv_batch() else {
+            panic!("expected reassembled A");
+        };
+        assert_eq!((header.partition, batch.num_rows()), (1, 4));
+        assert!(matches!(receiver.try_recv_batch(), RecvBatchOutcome::Empty));
+    }
+
+    /// A producer that observes its stream's cancel stops mid-frame; the stream's `Eof`
+    /// clears the orphaned prefix, and a later frame for the stream restarts at offset 0.
+    #[test]
+    fn eof_clears_abandoned_chunk_prefix() {
+        let sender_proc = 3;
+        let mut inner = Vec::new();
+        encode_frame_into(
+            MppFrameHeader::batch(5, 0, sender_proc),
+            &sample_batch(4),
+            &mut inner,
+        )
+        .expect("encode inner");
+        let chunk_header = MppFrameHeader::chunk(5, 0, sender_proc);
+        let mut partial = Vec::new();
+        encode_chunk_frame_into(
+            chunk_header,
+            inner.len() as u64,
+            0,
+            &inner[..inner.len() / 2],
+            &mut partial,
+        );
+        let mut eof = Vec::new();
+        encode_eof_frame_into(5, 0, sender_proc, &mut eof).expect("encode eof");
+        // A fresh frame for the stream after the abandonment restarts cleanly at offset 0.
+        let mut whole = Vec::new();
+        encode_chunk_frame_into(chunk_header, inner.len() as u64, 0, &inner, &mut whole);
+
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![partial, eof, whole]));
+        let RecvBatchOutcome::Eof { header } = receiver.try_recv_batch() else {
+            panic!("expected the Eof to pass through");
+        };
+        assert_eq!((header.stage_id, header.partition), (5, 0));
+        assert!(
+            receiver.assemblies.lock().unwrap().is_empty(),
+            "the Eof must clear the abandoned prefix"
+        );
+        assert!(matches!(
+            receiver.try_recv_batch(),
+            RecvBatchOutcome::Batch { .. }
+        ));
+    }
+
+    /// Reassembly rejects a continuation with no first chunk and an offset that doesn't
+    /// line up: both mean the per-sender FIFO the protocol rides on was violated.
+    #[test]
+    fn chunk_out_of_sequence_errors() {
+        let sender_proc = 4;
+        let chunk_header = MppFrameHeader::chunk(1, 0, sender_proc);
+        let mut orphan = Vec::new();
+        encode_chunk_frame_into(chunk_header, 1000, 500, &[0u8; 16], &mut orphan);
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![orphan]));
+        assert!(matches!(
+            receiver.try_recv_batch(),
+            RecvBatchOutcome::Error(_)
+        ));
+
+        let mut first = Vec::new();
+        encode_chunk_frame_into(chunk_header, 1000, 0, &[0u8; 100], &mut first);
+        let mut skipped = Vec::new();
+        encode_chunk_frame_into(chunk_header, 1000, 200, &[0u8; 100], &mut skipped);
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![first, skipped]));
+        assert!(matches!(
+            receiver.try_recv_batch(),
+            RecvBatchOutcome::Error(_)
+        ));
     }
 
     #[test]

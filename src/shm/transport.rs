@@ -93,6 +93,10 @@ pub(super) enum MppFrameKind {
     /// exceeds the ring and frame size is never an error.
     Chunk = 7,
     ExecuteTask = 8,
+    /// Carries a worker's unrecoverable error (e.g. a panic or `DataFusionError`) string
+    /// to the consumer, so it sees the actual crash reason instead of a
+    /// detached channel.
+    TaskError = 9,
 }
 
 /// Payload of a `SetPlan` frame: the plan-delivery message a worker needs to run one task,
@@ -322,6 +326,16 @@ impl MppFrameHeader {
         }
     }
 
+    /// Build a `TaskError` header destined for the consumer of `(stage_id, task_number)`.
+    pub fn task_error(stage_id: u32, partition: u32, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::TaskError, sender_proc),
+            stage_id,
+            partition,
+        }
+    }
+
     /// Build a `SetPlan` header for `(stage_id, task_number)`: the frame delivers that task's
     /// plan to the proc hosting it.
     pub fn set_plan(stage_id: u32, task_number: u32, sender_proc: u32) -> Self {
@@ -394,6 +408,7 @@ impl MppFrameHeader {
             6 => Ok(MppFrameKind::Cancel),
             7 => Ok(MppFrameKind::Chunk),
             8 => Ok(MppFrameKind::ExecuteTask),
+            9 => Ok(MppFrameKind::TaskError),
             other => Err(DataFusionError::Internal(format!(
                 "mpp: unknown frame kind {other:#x}"
             ))),
@@ -602,6 +617,7 @@ enum FrameBody {
     SetPlan(SetPlanFrame),
     ExecuteTask(ExecuteTaskFrame),
     Cancel,
+    TaskError(String),
 }
 
 /// Inverse of the frame encoders. Parses the 16-byte header and decodes the payload according
@@ -655,6 +671,10 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
             "mpp: chunk frame reached decode_frame; chunks reassemble in MppReceiver first"
                 .to_string(),
         )),
+        MppFrameKind::TaskError => {
+            let msg = String::from_utf8_lossy(payload).into_owned();
+            Ok((header, FrameBody::TaskError(msg)))
+        }
     }
 }
 
@@ -1326,6 +1346,47 @@ impl MppSender {
         self.scratch.replace(scratch);
         result
     }
+
+    /// Like `send_task_metrics_best_effort`, but for sending a task's fatal error message.
+    /// Sent explicitly by the producer (via `run_execute_task_loop`) on a panic.
+    pub(crate) async fn send_task_error_best_effort(
+        &self,
+        msg: &str,
+    ) -> Result<(), DataFusionError> {
+        let mut scratch = self.scratch.replace(Vec::new());
+        let result = async {
+            scratch.clear();
+            scratch.resize(MPP_FRAME_HEADER_SIZE, 0);
+            let error_header = MppFrameHeader::task_error(
+                self.header.stage_id,
+                self.header.partition,
+                self.header.sender_proc(),
+            );
+            error_header.write_to(&mut scratch[..MPP_FRAME_HEADER_SIZE]);
+
+            let mut msg_bytes = msg.as_bytes();
+            if let Some(cap) = self.channel.max_frame_bytes() {
+                let max_payload_len = cap.saturating_sub(MPP_FRAME_HEADER_SIZE);
+                if msg_bytes.len() > max_payload_len {
+                    msg_bytes = &msg_bytes[..max_payload_len];
+                }
+            }
+            scratch.extend_from_slice(msg_bytes);
+
+            let _send_guard = self.channel.send_lock().lock().await;
+            for _ in 0..MAX_CONTROL_SEND_SPINS {
+                match self.channel.try_send_bytes(&scratch) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => tokio::task::yield_now().await,
+                    Err(_) => return Ok(()),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.scratch.replace(scratch);
+        result
+    }
 }
 
 impl Clone for MppSender {
@@ -1426,7 +1487,7 @@ impl MppReceiver {
                         Ok(Some(frame)) => frame,
                         // Absorbed one chunk of a larger frame; pull the next message.
                         Ok(None) => continue,
-                        Err(e) => return RecvBatchOutcome::Error(e),
+                        Err(e) => return RecvBatchOutcome::TransportError(e),
                     };
                     return match decode_frame(&complete) {
                         Ok((header, FrameBody::Batch(batch))) => {
@@ -1447,7 +1508,10 @@ impl MppReceiver {
                             RecvBatchOutcome::ExecuteTask { header, frame }
                         }
                         Ok((header, FrameBody::Cancel)) => RecvBatchOutcome::Cancel { header },
-                        Err(e) => RecvBatchOutcome::Error(e),
+                        Ok((header, FrameBody::TaskError(msg))) => {
+                            RecvBatchOutcome::TaskError { header, msg }
+                        }
+                        Err(e) => RecvBatchOutcome::TransportError(e),
                     };
                 }
                 RecvOutcome::Empty => return RecvBatchOutcome::Empty,
@@ -1571,7 +1635,15 @@ pub(super) enum RecvBatchOutcome {
     },
     Empty,
     Detached,
-    Error(DataFusionError),
+    /// An explicitly transmitted error from a remote worker for a specific task (e.g. panic or query error).
+    /// The transport channel itself is perfectly healthy and may continue to yield frames.
+    TaskError {
+        header: MppFrameHeader,
+        msg: String,
+    },
+    /// A fatal structural or protocol error on the local side (e.g. corrupt bytes, IPC
+    /// decode failure). The transport channel is unusable.
+    TransportError(DataFusionError),
 }
 
 /// Per-`(sender_proc, stage_id, partition)` channel buffer registry owned by a cooperative
@@ -2161,8 +2233,22 @@ impl DrainHandle {
                     RecvBatchOutcome::Cancel { header } => {
                         self.note_cancel(header.stage_id, header.partition);
                     }
+                    RecvBatchOutcome::TaskError { header, msg } => {
+                        // The remote worker sent a crash message, but the transport is intact.
+                        // Fail the scope to unblock waiters, but leave this receiver in the slot:
+                        // the worker will likely close the channel next, yielding `Detached`.
+                        self.fail_scope(
+                            scope,
+                            &format!(
+                                "remote task {}.{} failed: {}",
+                                header.stage_id, header.partition, msg
+                            ),
+                        );
+                    }
                     RecvBatchOutcome::Empty => break,
                     RecvBatchOutcome::Detached => {
+                        // The channel was physically disconnected. Polling it again is useless.
+                        // We evict this receiver (`*slot = None`) to prevent future polls.
                         // Only THIS receiver is dead. The drain holds multiple receivers
                         // (own-inbox MPSC + self-loop in-proc); one going away doesn't
                         // imply the others have. Fail only the channels this receiver's
@@ -2178,7 +2264,9 @@ impl DrainHandle {
                         );
                         break;
                     }
-                    RecvBatchOutcome::Error(e) => {
+                    RecvBatchOutcome::TransportError(e) => {
+                        // The channel is corrupted or broken. Polling it again is dangerous.
+                        // We evict this receiver (`*slot = None`) to prevent future polls.
                         // Same scoping as Detached, but the ring reported corruption (or the
                         // receiver poisoned itself), so even completed siblings can't be
                         // trusted to have been the last word. Still scope-limited: the other
@@ -2305,6 +2393,32 @@ mod tests {
         let rx2 = drain.take_execute_task_rx(1, 0);
         assert!(rx2.is_err());
         assert!(rx2.unwrap_err().to_string().contains("already taken"));
+    }
+
+    #[tokio::test]
+    async fn send_task_error_best_effort_fails_drain_scope() {
+        let (tx, rx) = in_proc_channel(8);
+        let header = MppFrameHeader::task_metrics(1, 0, 1);
+        let sender = MppSender::new(Arc::new(tx)).clone_with_header(header);
+        let receiver = MppReceiver::new(Box::new(rx));
+        let drain = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
+
+        let mut task_rx = drain.take_execute_task_rx(1, 0).unwrap();
+
+        sender
+            .send_task_error_best_effort("worker failed: out of memory")
+            .await
+            .unwrap();
+
+        drain.try_drain_pass().unwrap();
+
+        let recv_item = task_rx.recv().await;
+        assert!(recv_item.is_some());
+        let err = recv_item.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("worker failed: out of memory"),
+            "expected error string, got: {err}"
+        );
     }
 
     impl DrainBuffer {
@@ -2469,13 +2583,14 @@ mod tests {
                     | RecvBatchOutcome::TaskMetrics { .. }
                     | RecvBatchOutcome::SetPlan { .. }
                     | RecvBatchOutcome::ExecuteTask { .. }
-                    | RecvBatchOutcome::Cancel { .. } => {}
+                    | RecvBatchOutcome::Cancel { .. }
+                    | RecvBatchOutcome::TaskError { .. } => {}
                     RecvBatchOutcome::Empty => {}
                     RecvBatchOutcome::Detached => {
                         done[i] = true;
                         buffer.notify_source_done();
                     }
-                    RecvBatchOutcome::Error(e) => {
+                    RecvBatchOutcome::TransportError(e) => {
                         // Treat a decode error as a fatal detach for this source
                         // so the consumer can observe EOF and abort the query.
                         done[i] = true;
@@ -3204,7 +3319,7 @@ mod tests {
         let receiver = MppReceiver::new(ReplayChannel::over(vec![orphan]));
         assert!(matches!(
             receiver.try_recv_batch(),
-            RecvBatchOutcome::Error(_)
+            RecvBatchOutcome::TransportError(_)
         ));
 
         let mut first = Vec::new();
@@ -3214,7 +3329,7 @@ mod tests {
         let receiver = MppReceiver::new(ReplayChannel::over(vec![first, skipped]));
         assert!(matches!(
             receiver.try_recv_batch(),
-            RecvBatchOutcome::Error(_)
+            RecvBatchOutcome::TransportError(_)
         ));
     }
 

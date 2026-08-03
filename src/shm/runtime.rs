@@ -211,7 +211,7 @@ impl MppMesh {
     }
 
     /// Obtains the channel receiver for incoming `ExecuteTask` requests targeting `(stage_id, task_number)`.
-    pub fn take_execute_task_rx(
+    pub(crate) fn take_execute_task_rx(
         self: &Arc<Self>,
         stage_id: u32,
         task_number: u32,
@@ -236,6 +236,25 @@ impl MppMesh {
         if let Some(Some(sender)) = senders.get(producer_proc as usize) {
             sender.try_send_cancel(stage_id, partition);
         }
+    }
+
+    /// Obtains an outbound sender pre-configured to route a `TaskError` frame to the leader
+    /// for the given `(stage_id, task_number)`.
+    pub(crate) fn error_sender(
+        &self,
+        stage_id: u32,
+        task_number: u32,
+    ) -> Option<crate::shm::transport::MppSender> {
+        let guard = self.cancel_senders.lock().unwrap();
+        let senders = guard.as_ref()?;
+        let senders = senders.lock().unwrap();
+        senders.first().and_then(|s| s.as_ref()).map(|base| {
+            base.clone_with_header(crate::shm::transport::MppFrameHeader::task_error(
+                stage_id,
+                task_number,
+                self.this_proc,
+            ))
+        })
     }
 
     /// The single cooperative inbound handle that pulls frames from every peer (and the

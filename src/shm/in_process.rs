@@ -441,16 +441,12 @@ async fn run_worker_proc(
         let worker_sink = Arc::clone(&worker_sink);
 
         futures.push(async move {
-            let rx = mesh.take_execute_task_rx(stage_id, task_idx)?;
-            let mesh = Arc::clone(&mesh);
             crate::shm::setup::run_execute_task_loop(
-                rx,
+                &mesh,
+                stage_id,
+                task_idx,
                 n_out,
                 tokio_util::sync::CancellationToken::new(),
-                || {
-                    mesh.inbound_receiver().try_drain_pass()?;
-                    Ok(())
-                },
                 |_request, _headers, range| {
                     let plan = Arc::clone(&plan);
                     let task_ctx = Arc::clone(&task_ctx);

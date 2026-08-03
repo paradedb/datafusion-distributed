@@ -400,7 +400,7 @@ pub async fn run_worker_fragment(
 /// ranges, and delegating execution of each requested range to `spawn_range`.
 ///
 /// # Lifecycle & Guarantees
-/// - **On-Demand Range Execution:** Listens on `rx` for incoming [`ExecuteTaskFrame`] messages,
+/// - **On-Demand Range Execution:** Listens on the mesh for incoming [`ExecuteTaskFrame`] messages,
 ///   extracting the requested partition range (`start..end`) and headers.
 /// - **Partition Validation & Single-Claim Accounting:** Ensures that `start <= end` and `end <= n_partitions`,
 ///   and verifies that no partition within `start..end` has been claimed by a previous frame. Returns an
@@ -408,18 +408,43 @@ pub async fn run_worker_fragment(
 /// - **Cancellation & Early Termination Unwinding:** Selects on `token.cancelled()`. If the query is
 ///   cancelled or terminates early (e.g. satisfied by a `LIMIT` clause downstream), the request loop
 ///   breaks out immediately and drops active sub-futures.
-/// - **Cooperative Inbound Ring Flushing:** Periodically invokes `drain_pass` to drive the inbound ring
-///   buffer drain pass while awaiting frame arrivals or stream completions.
-/// - **Completion:** Exits cleanly once all `n_partitions` have been requested (or `rx` closes) AND all
+/// - **Cooperative Inbound Ring Flushing:** Periodically invokes the mesh's inbound receiver's drain pass
+///   while awaiting frame arrivals or stream completions.
+/// - **Completion:** Exits cleanly once all `n_partitions` have been requested (or the channel closes) AND all
 ///   spawned stream futures in `spawn_range` have completed to EOF.
 ///
-/// # Arguments
-/// * `rx`: The receiver channel for incoming [`ExecuteTaskFrame`] messages obtained via `MppMesh::take_execute_task_rx`.
+/// * `mesh`: The MPP mesh used to coordinate routing, draining, and error handling.
+/// * `stage_id`: The stage ID this task belongs to.
+/// * `task_number`: The task index within the stage.
 /// * `n_partitions`: Total number of output partitions expected across all request frames for this task.
 /// * `token`: Cancellation token used to unwind the request loop on query cancellation or early teardown.
-/// * `drain_pass`: Callback invoked periodically to drive inbound ring buffer draining (e.g. `mesh.inbound_receiver().try_drain_pass()`).
 /// * `spawn_range`: Closure invoked for each valid, unclaimed partition range `start..end`. Must return a future executing the partition streams for that range.
 pub async fn run_execute_task_loop<F, Fut>(
+    mesh: &Arc<MppMesh>,
+    stage_id: u32,
+    task_number: u32,
+    n_partitions: usize,
+    token: CancellationToken,
+    spawn_range: F,
+) -> Result<()>
+where
+    F: FnMut(pb::ExecuteTaskRequest, http::HeaderMap, std::ops::Range<usize>) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let rx = mesh.take_execute_task_rx(stage_id, task_number)?;
+    let error_sender = mesh.error_sender(stage_id, task_number);
+    let drain_pass = {
+        let inbound = Arc::clone(mesh.inbound_receiver());
+        move || inbound.try_drain_pass()
+    };
+    let res = run_execute_task_loop_inner(rx, n_partitions, token, drain_pass, spawn_range).await;
+    if let (Err(e), Some(sender)) = (&res, error_sender) {
+        let _ = sender.send_task_error_best_effort(&e.to_string()).await;
+    }
+    res
+}
+
+async fn run_execute_task_loop_inner<F, Fut>(
     rx: ExecuteTaskRx,
     n_partitions: usize,
     token: CancellationToken,
@@ -473,10 +498,29 @@ where
                             *claimed_slot = true;
                         }
 
-                        let len = end - start;
                         let range_fut = spawn_range(request, headers, start..end);
-                        sub_futures.push(range_fut);
+                        sub_futures.push(async move {
+                            use futures::FutureExt;
+                            let res = std::panic::AssertUnwindSafe(range_fut)
+                                .catch_unwind()
+                                .await;
+                            match res {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(e)) => Err(e),
+                                Err(payload) => {
+                                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                        s.to_string()
+                                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                                        s.clone()
+                                    } else {
+                                        "Box<dyn Any>".to_string()
+                                    };
+                                    Err(DataFusionError::Execution(msg))
+                                }
+                            }
+                        });
 
+                        let len = end - start;
                         partitions_requested += len;
                         if partitions_requested >= n_partitions {
                             rx_opt = None;
@@ -555,7 +599,7 @@ mod tests {
         let ranges_counter = Arc::clone(&ranges_processed);
         let len_counter = Arc::clone(&total_partition_len_processed);
 
-        let res = run_execute_task_loop(
+        let res = run_execute_task_loop_inner(
             rx,
             total_partitions,
             token,

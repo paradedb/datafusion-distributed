@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::ExecutionPlan;
 use futures::stream::StreamExt;
 
 use super::dsm::{
@@ -182,12 +182,13 @@ pub unsafe fn leader_setup(
     // work-unit frames (and later dynamic filters) flow leader -> worker through them. Empty
     // when the embedder did not opt in: a ring latches `detached` once its sender count hits
     // zero, so senders that might drop before every worker attached must never exist.
-    // The leader's `Cancel` senders are wired by the embedder (it shares the same outbound senders
-    // it holds for plan delivery and releases before the DSM unmaps), so drop the cancel set here.
-    let (outbound_senders, _cancel_senders) =
+    let (outbound_senders, cancel_senders) =
         build_outbound_senders(0, n_procs, attach.outbound_senders);
+    let mesh = Arc::new(MppMesh::new(0, n_procs, inbound, interrupt, attach.alive));
+    mesh.set_cancel_senders(Arc::new(std::sync::Mutex::new(cancel_senders)));
+    mesh.set_keep_alive_senders(outbound_senders.clone());
     Ok(LeaderAttach {
-        mesh: Arc::new(MppMesh::new(0, n_procs, inbound, interrupt, attach.alive)),
+        mesh,
         outbound_senders,
     })
 }
@@ -277,7 +278,7 @@ pub unsafe fn worker_setup(
             .map_err(DataFusionError::Internal)?;
     let total_procs = header.n_procs;
 
-    let (mut outbound, cancel) =
+    let (mut outbound, mut cancel) =
         build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
 
     // Self-loop in-proc channel: peer-mesh routing can land a producer and its consumer on the same
@@ -286,7 +287,11 @@ pub unsafe fn worker_setup(
     let (self_tx, self_rx) = in_proc_channel(SELF_LOOP_CAPACITY);
     let self_tx_arc: Arc<dyn BatchChannelSender> = Arc::new(self_tx);
     outbound[proc_idx as usize] = Some(MppSender::with_header(
-        self_tx_arc,
+        Arc::clone(&self_tx_arc),
+        MppFrameHeader::batch(0, 0, proc_idx),
+    ));
+    cancel[proc_idx as usize] = Some(MppSender::with_header(
+        Arc::clone(&self_tx_arc),
         MppFrameHeader::batch(0, 0, proc_idx),
     ));
 
@@ -310,6 +315,7 @@ pub unsafe fn worker_setup(
     // its mesh the control-plane cancel senders; they drop with the mesh at the end of the worker's
     // run, well before the DSM unmaps, so no explicit release is needed.
     mesh.set_cancel_senders(Arc::new(std::sync::Mutex::new(cancel)));
+    mesh.set_keep_alive_senders(outbound.clone());
     Ok(WorkerAttach {
         mesh,
         outbound_senders: outbound,
@@ -328,16 +334,19 @@ pub async fn run_worker_fragment(
     plan: Arc<dyn ExecutionPlan>,
     sinks: Vec<Box<dyn PartitionSink>>,
     ctx: Arc<TaskContext>,
+    partition_range: std::ops::Range<usize>,
 ) -> Result<()> {
-    let n_partitions = plan.output_partitioning().partition_count();
-    if n_partitions != sinks.len() {
+    if partition_range.end.saturating_sub(partition_range.start) != sinks.len() {
         return Err(DataFusionError::Internal(format!(
-            "run_worker_fragment: plan has {n_partitions} output partitions but {} sinks",
+            "run_worker_fragment: partition range {}..{} requires {} sinks but got {}",
+            partition_range.start,
+            partition_range.end,
+            partition_range.end.saturating_sub(partition_range.start),
             sinks.len()
         )));
     }
-    let mut futures = Vec::with_capacity(n_partitions);
-    for (partition, mut sink) in sinks.into_iter().enumerate() {
+    let mut futures = Vec::with_capacity(sinks.len());
+    for (partition, mut sink) in partition_range.zip(sinks.into_iter()) {
         let plan = Arc::clone(&plan);
         let ctx = Arc::clone(&ctx);
         futures.push(async move {

@@ -105,6 +105,7 @@ pub struct MppMesh {
     /// a `Cancel` frame to a producing proc when this proc abandons a stream. `None` until the
     /// embedder installs it.
     cancel_senders: Mutex<Option<PeerSenders>>,
+    _keep_alive_senders: Mutex<Option<Vec<Option<crate::shm::transport::MppSender>>>>,
     alive: AliveFlag,
 }
 
@@ -123,8 +124,19 @@ impl MppMesh {
             inbound_receiver,
             interrupt,
             cancel_senders: Mutex::new(None),
+            _keep_alive_senders: Mutex::new(None),
             alive,
         }
+    }
+
+    pub fn set_keep_alive_senders(&self, senders: Vec<Option<crate::shm::transport::MppSender>>) {
+        *self._keep_alive_senders.lock().unwrap() = Some(senders);
+    }
+
+    /// Drop the keep-alive senders held by this mesh so outbound peer inboxes see `Detached`
+    /// if this worker process exits early or encounters a fatal error.
+    pub fn clear_keep_alive_senders(&self) {
+        *self._keep_alive_senders.lock().unwrap() = None;
     }
 
     /// Mark this proc's DSM mesh detached so every ring handle's operations become no-ops.
@@ -132,6 +144,8 @@ impl MppMesh {
     /// so handles dropped afterward (e.g. by a memory-context reset) never touch freed memory.
     pub fn mark_detached(&self) {
         self.alive.store(false, Ordering::Release);
+        self.clear_keep_alive_senders();
+        *self.cancel_senders.lock().unwrap() = None;
     }
 
     /// The raw liveness flag shared with every ring handle, for embedders that register a C
@@ -178,6 +192,48 @@ impl MppMesh {
         sender.send_set_plan_traced(&frame, &mut stats).await
     }
 
+    /// Sends an `ExecuteTask` control frame to `dest_proc` to request partition stream execution
+    /// for `(stage_id, task_number)`.
+    pub async fn send_execute_task(
+        self: &Arc<Self>,
+        stage_id: u32,
+        task_number: u32,
+        frame: crate::shm::transport::ExecuteTaskFrame,
+    ) -> Result<()> {
+        let dest_proc = proc_for_task(self.n_workers(), task_number);
+        let sender = {
+            let guard = self.cancel_senders.lock().unwrap();
+            let Some(senders) = guard.as_ref() else {
+                return internal_err!(
+                    "shm mesh: control senders not installed; cannot route ExecuteTask"
+                );
+            };
+            let senders = senders.lock().unwrap();
+            let Some(Some(base)) = senders.get(dest_proc as usize) else {
+                return internal_err!("shm mesh: no control sender for proc {dest_proc}");
+            };
+            base.clone_with_header(crate::shm::transport::MppFrameHeader::execute_task(
+                stage_id,
+                task_number,
+                self.this_proc,
+            ))
+            .with_cooperative_drain(Arc::clone(self) as Arc<dyn CooperativeDrainSet>)
+        };
+        let mut stats = crate::shm::transport::SendBatchStats::default();
+        sender.send_execute_task_traced(&frame, &mut stats).await
+    }
+
+    /// Obtains the channel receiver for incoming `ExecuteTask` requests targeting `(stage_id, task_number)`.
+    pub async fn take_execute_task_rx(
+        self: &Arc<Self>,
+        stage_id: u32,
+        task_number: u32,
+    ) -> Result<crate::shm::transport::ExecuteTaskRx> {
+        self.inbound_receiver
+            .take_execute_task_rx(stage_id, task_number)
+            .await
+    }
+
     /// Tell the producer on `producer_proc` to stop the `(stage_id, partition)` stream: this proc's
     /// consumer of it stopped reading before EOF. Ships one `Cancel` frame, leaving the rings
     /// healthy for metrics and every other stream. A no-op when no senders are installed (the
@@ -198,7 +254,7 @@ impl MppMesh {
 
     /// The single cooperative inbound handle that pulls frames from every peer (and the
     /// self-loop) into per-`(sender_proc, stage_id, partition)` channel buffers.
-    pub(super) fn inbound_receiver(&self) -> &Arc<DrainHandle> {
+    pub fn inbound_receiver(&self) -> &Arc<DrainHandle> {
         &self.inbound_receiver
     }
 
@@ -403,6 +459,51 @@ impl WorkerChannel for ShmWorkerChannel {
                 self.mesh.n_procs
             )));
         }
+
+        let pb_request = crate::proto::ExecuteTaskRequest {
+            task_key: Some(crate::proto::TaskKey {
+                query_id: crate::common::serialize_uuid(&request.task_key.query_id),
+                stage_id: request.task_key.stage_id as u64,
+                task_number: request.task_key.task_number as u64,
+            }),
+            target_partition_start: request.target_partition_start as u64,
+            target_partition_end: request.target_partition_end as u64,
+            producer_head: Some(match request.producer_head_spec {
+                crate::protocol::ProducerHeadSpec::None => {
+                    crate::proto::execute_task_request::ProducerHead::None(
+                        crate::proto::NoneHead {},
+                    )
+                }
+                crate::protocol::ProducerHeadSpec::BroadcastExec { output_partitions } => {
+                    crate::proto::execute_task_request::ProducerHead::Broadcast(
+                        crate::proto::BroadcastExecHead {
+                            output_partitions: output_partitions as u64,
+                        },
+                    )
+                }
+                crate::protocol::ProducerHeadSpec::RepartitionExec { partitioning } => {
+                    crate::proto::execute_task_request::ProducerHead::Repartition(
+                        crate::proto::RepartitionExecHead { partitioning },
+                    )
+                }
+            }),
+        };
+
+        let frame = match crate::shm::transport::ExecuteTaskFrame::from_parts(
+            pb_request,
+            &HeaderMap::new(),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(DataFusionError::Internal(format!(
+                    "ExecuteTask frame build failed: {e}"
+                )));
+            }
+        };
+        self.mesh
+            .send_execute_task(stage_id, task_number, frame)
+            .await?;
+
         // First line to grep when a query hangs on a channel nothing registered.
         log::debug!(
             "shm transport execute_task: this_proc={} stage_id={stage_id} \

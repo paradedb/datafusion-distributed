@@ -464,12 +464,7 @@ impl DsmMpscReceiver {
         let seq = unsafe { (*slot).seq.load(Ordering::Acquire) };
         let expected_ready = head.wrapping_add(1);
         if seq != expected_ready {
-            // Slot not ready. Use `<=` rather than `==` so a strict invariant
-            // violation (tail < head, impossible under correct operation) still
-            // surfaces as Detached rather than wedging Empty forever.
-            if header.detached.load(Ordering::Acquire)
-                && header.tail.load(Ordering::Acquire) <= head
-            {
+            if header.detached.load(Ordering::Acquire) {
                 return RecvOutcome::Detached;
             }
             return RecvOutcome::Empty;
@@ -646,6 +641,21 @@ impl DsmMpscSender {
             ring,
             wakeup,
             counts_as_data: true,
+            alive,
+        }
+    }
+
+    /// Wrap an already-initialized ring as a control sender. Does NOT increment `sender_count`,
+    /// so it doesn't prevent the consumer from detecting when all true data producers drop.
+    pub(super) unsafe fn new_control(
+        ring: NonNull<DsmMpscRingHeader>,
+        wakeup: Arc<dyn Wakeup>,
+        alive: AliveFlag,
+    ) -> Self {
+        Self {
+            ring,
+            wakeup,
+            counts_as_data: false,
             alive,
         }
     }

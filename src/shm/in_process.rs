@@ -363,7 +363,7 @@ fn fragment_task_ctx(
 }
 
 /// Run all fragments owned by one worker proc, then signal completion. Mirrors the body of
-/// pg_search's `run_mpp_worker`: build a [`WorkerSink`] that routes by partition, open a
+/// pg_search's `run_mpp_worker`: build a [`WorkerSink`] that routes by task and partition, open a
 /// [`PartitionSink`] per output partition, execute each dispatched fragment as-is (it arrives
 /// ready-to-run, nested stages `Remote`, boundary leaves reading the mesh), and join.
 async fn run_worker_proc(
@@ -387,7 +387,7 @@ async fn run_worker_proc(
         .map(|s| s.clone_with_header(MppFrameHeader::task_metrics(0, 0, mesh.this_proc)));
 
     // One sink serves every stage this proc produces; it owns the base outbound senders and routes
-    // each (stage, partition) to the destination proc's send end.
+    // each (stage, task, partition) to the destination proc's send end.
     let worker_sink = Arc::new(ShmMqWorkerSink {
         outbound,
         mesh: Arc::clone(&mesh),
@@ -458,7 +458,11 @@ async fn run_worker_proc(
                     async move {
                         let mut task_sinks = Vec::with_capacity(range.len());
                         for q in range.clone() {
-                            task_sinks.push(worker_sink.open_partition(stage_id as usize, q)?);
+                            task_sinks.push(worker_sink.open_partition(
+                                stage_id as usize,
+                                task_idx as usize,
+                                q,
+                            )?);
                         }
                         crate::shm::setup::run_worker_fragment(plan, task_sinks, task_ctx, range)
                             .await
@@ -487,7 +491,7 @@ async fn run_worker_proc(
     Ok(())
 }
 
-/// Test-harness [`WorkerSink`]: routes each `(stage, partition)` to the destination proc's outbound
+/// Test-harness [`WorkerSink`]: routes each `(stage, task, partition)` to the destination proc's outbound
 /// send end, the in-process analog of what pg_search builds on a real backend. Holds the base
 /// senders plus the per-stage routing so `open_partition` reproduces the header + cooperative-drain
 /// wiring the produce loop used to apply inline.
@@ -499,7 +503,12 @@ struct ShmMqWorkerSink {
 }
 
 impl WorkerSink for ShmMqWorkerSink {
-    fn open_partition(&self, stage: usize, partition: usize) -> Result<Box<dyn PartitionSink>> {
+    fn open_partition(
+        &self,
+        stage: usize,
+        task: usize,
+        partition: usize,
+    ) -> Result<Box<dyn PartitionSink>> {
         let routing = self.routing.get(&(stage as u32)).ok_or_else(|| {
             DataFusionError::Internal(format!("run_worker_proc: no routing for stage {stage}"))
         })?;
@@ -517,6 +526,11 @@ impl WorkerSink for ShmMqWorkerSink {
         let sender = base
             .clone_with_header(MppFrameHeader::batch(
                 stage as u32,
+                u32::try_from(task).map_err(|_| {
+                    DataFusionError::Internal(format!(
+                        "run_worker_proc: task {task} exceeds transport u32"
+                    ))
+                })?,
                 partition as u32,
                 self.mesh.this_proc,
             ))
@@ -605,10 +619,10 @@ mod tests {
         ]))
     }
 
-    /// `N_WORKERS` partitions, two rows each, so the shard estimator hands one partition per task.
-    fn table_partitions() -> Vec<Vec<RecordBatch>> {
+    /// Two rows per partition, so the shard estimator can hand one partition to each task.
+    fn table_partitions(n_partitions: i32) -> Vec<Vec<RecordBatch>> {
         let schema = table_schema();
-        (0..N_WORKERS as i32)
+        (0..n_partitions)
             .map(|p| {
                 let ids = Int32Array::from(vec![p * 2, p * 2 + 1]);
                 let vals = Int32Array::from(vec![p * 20, p * 20 + 10]);
@@ -621,8 +635,17 @@ mod tests {
     }
 
     fn register_table(ctx: &SessionContext) {
-        let table = MemTable::try_new(table_schema(), table_partitions()).unwrap();
+        register_table_with_partitions(ctx, N_WORKERS as i32);
+    }
+
+    fn register_table_with_partitions(ctx: &SessionContext, n_partitions: i32) {
+        let table = MemTable::try_new(table_schema(), table_partitions(n_partitions)).unwrap();
         ctx.register_table("t", Arc::new(table)).unwrap();
+    }
+
+    fn replace_table_with_partitions(ctx: &SessionContext, n_partitions: i32) {
+        let _ = ctx.deregister_table("t").unwrap();
+        register_table_with_partitions(ctx, n_partitions);
     }
 
     fn wide_table_schema() -> SchemaRef {
@@ -675,16 +698,16 @@ mod tests {
         let consumer = Arc::clone(&boot.workers[0].1); // proc 1
         let producer = Arc::clone(&boot.workers[1].1); // proc 2
 
-        assert!(!producer.stream_cancelled(7, 0));
+        assert!(!producer.stream_cancelled(7, 0, 0));
 
-        // Proc 1 abandons the `(stage 7, partition 0)` stream it reads from proc 2.
-        consumer.cancel_stream(2, 7, 0);
+        // Proc 1 abandons task 0's `(stage 7, partition 0)` stream it reads from proc 2.
+        consumer.cancel_stream(2, 7, 0, 0);
 
         // Proc 2 drains its inbox and sees the cancel its consumer sent.
         producer.try_drain_pass().unwrap();
-        assert!(producer.stream_cancelled(7, 0));
+        assert!(producer.stream_cancelled(7, 0, 0));
         // Scoped to that one stream: a sibling partition stays live.
-        assert!(!producer.stream_cancelled(7, 1));
+        assert!(!producer.stream_cancelled(7, 0, 1));
     }
 
     /// `dispatch_capture` is Some on the leader session only: its coordinator is the one that
@@ -694,12 +717,34 @@ mod tests {
         mesh: Arc<MppMesh>,
         dispatch_capture: Option<CapturedPlans>,
     ) -> SessionContext {
-        let config = SessionConfig::new().with_target_partitions(N_WORKERS as usize);
+        build_session_with_target_partitions(mesh, dispatch_capture, N_WORKERS as usize)
+    }
+
+    fn build_session_with_target_partitions(
+        mesh: Arc<MppMesh>,
+        dispatch_capture: Option<CapturedPlans>,
+        target_partitions: usize,
+    ) -> SessionContext {
+        build_session_with_worker_and_target_partitions(
+            mesh,
+            dispatch_capture,
+            N_WORKERS as usize,
+            target_partitions,
+        )
+    }
+
+    fn build_session_with_worker_and_target_partitions(
+        mesh: Arc<MppMesh>,
+        dispatch_capture: Option<CapturedPlans>,
+        planner_workers: usize,
+        target_partitions: usize,
+    ) -> SessionContext {
+        let config = SessionConfig::new().with_target_partitions(target_partitions);
         let mut builder = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
             .with_distributed_option_extension(DistributedConfig::default())
-            .with_distributed_worker_resolver(InProcessWorkerResolver::new(N_WORKERS as usize))
+            .with_distributed_worker_resolver(InProcessWorkerResolver::new(planner_workers))
             .with_distributed_channel_resolver(ShmChannelResolver::new(mesh))
             .with_distributed_planner();
         if let Some(captured) = dispatch_capture {
@@ -749,12 +794,13 @@ mod tests {
     /// PG worker runs, and it's exactly the cooperative model the transport is built for (the
     /// producer send spin and the consumer pull loop interleave by yielding, not by parallelism).
     #[tokio::test(flavor = "current_thread")]
-    async fn in_process_distributed_query_matches_serial() {
+    async fn in_process_distributed_query_multiplexes_tasks_without_losing_eofs() {
         let query = "SELECT id, val FROM t ORDER BY id";
+        const N_TASKS: usize = 5;
 
         // Serial reference: same query, no distribution.
         let serial_ctx = SessionContext::new();
-        register_table(&serial_ctx);
+        register_table_with_partitions(&serial_ctx, N_TASKS as i32);
         let expected = serial_ctx
             .sql(query)
             .await
@@ -763,7 +809,7 @@ mod tests {
             .await
             .unwrap();
         let expected_ids = ids_of(&expected);
-        assert_eq!(expected_ids, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(expected_ids, (0..(N_TASKS as i32 * 2)).collect::<Vec<_>>());
 
         // One heap region stands in for the DSM segment; size it for n_procs = leader + workers.
         let n_procs = N_WORKERS + 1;
@@ -810,7 +856,13 @@ mod tests {
 
         // Build the distributed plan once on the leader session; producers and consumer share it.
         let captured = new_captured_plans();
-        let leader_ctx = build_session(Arc::clone(&leader_mesh), Some(Arc::clone(&captured)));
+        let leader_ctx = build_session_with_worker_and_target_partitions(
+            Arc::clone(&leader_mesh),
+            Some(Arc::clone(&captured)),
+            N_TASKS,
+            N_TASKS,
+        );
+        replace_table_with_partitions(&leader_ctx, N_TASKS as i32);
         let physical = leader_ctx
             .sql(query)
             .await
@@ -825,13 +877,25 @@ mod tests {
         );
 
         let entries = collect_dispatched_stages(&physical, N_WORKERS);
-        // Guard against a planner change that silently collapses the query to a trivial one-task
-        // gather: the producer stage must actually fan across every worker, or the transport's
-        // multi-task routing never gets exercised.
+        // There are five producer tasks but only three workers. Round-robin assignment puts
+        // tasks 0 and 3 on worker 1, and they both send stage output partition 0 to the leader.
+        // The task id in the transport header is what keeps task 0's EOF from closing task 3.
         assert!(
-            entries.iter().any(|e| e.task_count == N_WORKERS as usize),
-            "expected a producer stage with task_count = {N_WORKERS}; got {:?}",
+            entries.iter().any(|e| e.task_count == N_TASKS),
+            "expected a producer stage with task_count = {N_TASKS}; got {:?}",
             entries.iter().map(|e| e.task_count).collect::<Vec<_>>()
+        );
+        let multiplexed = entries
+            .iter()
+            .find(|e| e.task_count == N_TASKS)
+            .expect("five-task producer stage");
+        assert_eq!(
+            fragments_for_proc(std::slice::from_ref(multiplexed), 1, N_WORKERS)
+                .iter()
+                .map(|fragment| fragment.task_idx)
+                .collect::<Vec<_>>(),
+            vec![0, 3],
+            "worker 1 must own two populated producer tasks"
         );
 
         // Launch the producer fragments before the leader pulls, so the mesh has data flowing while
@@ -840,7 +904,7 @@ mod tests {
         let mut workers = JoinSet::new();
         for (proc_idx, mesh, outbound) in worker_setups {
             let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
-            let session = build_session(Arc::clone(&mesh), None);
+            let session = build_session_with_target_partitions(Arc::clone(&mesh), None, N_TASKS);
             workers.spawn(run_worker_proc(
                 fragments,
                 outbound,

@@ -67,10 +67,8 @@ pub type PeerSenders = Arc<Mutex<Vec<Option<MppSender>>>>;
 /// (consumer-only), workers are `1..n_procs` (each hosts producer fragments).
 ///
 /// A stage's task count is set by the DF-D task estimator chain, not by the worker proc count.
-/// The transport does NOT support more tasks than producer procs: channels are keyed
-/// `(sender_proc, stage, partition)`, so two tasks wrapped onto one proc would interleave on one
-/// channel and the first EOF would truncate the other task's output. `ShmWorkerChannel::execute_task`
-/// rejects that shape; the modulo here only keeps the function total.
+/// Several tasks may share a worker; their data streams remain independent because the transport
+/// key includes `task_id` in addition to the sender proc, stage, and output partition.
 #[inline]
 pub fn proc_for_task(n_workers: u32, task_idx: u32) -> u32 {
     1 + (task_idx % n_workers.max(1))
@@ -81,7 +79,7 @@ pub fn proc_for_task(n_workers: u32, task_idx: u32) -> u32 {
 /// Each process owns one MPSC inbox in DSM that receives frames from every peer.
 /// `inbound_receiver` consolidates that inbox plus the in-proc self-loop channel (for
 /// producer-and-consumer-on-same-worker fragments) into a single `DrainHandle`. Frames
-/// carry `(sender_proc, stage_id, partition)` in their header so the routing registry
+/// carry `(sender_proc, stage_id, task_id, partition)` in their header so the routing registry
 /// inside the handle delivers each frame to the matching consumer.
 ///
 /// [`MppFrameHeader`]: super::transport::MppFrameHeader
@@ -94,7 +92,7 @@ pub struct MppMesh {
     pub n_procs: u32,
     /// Single cooperative inbound handle pulling every frame addressed to this proc. The
     /// DSM MPSC inbox and an in-proc self-loop receiver both feed into this handle. Demux
-    /// to per-`(sender_proc, stage_id, partition)` channel buffers happens inside via
+    /// to per-`(sender_proc, stage_id, task_id, partition)` channel buffers happens inside via
     /// `DrainHandle::register_channel`.
     pub(super) inbound_receiver: Arc<DrainHandle>,
     /// Cancellation hook, injected by the embedder, checked at the transport's block points (the
@@ -220,26 +218,26 @@ impl MppMesh {
             .take_execute_task_rx(stage_id, task_number)
     }
 
-    /// Tell the producer on `producer_proc` to stop the `(stage_id, partition)` stream: this proc's
+    /// Tell the producer on `producer_proc` to stop the `(stage_id, task_id, partition)` stream: this proc's
     /// consumer of it stopped reading before EOF. Ships one `Cancel` frame, leaving the rings
     /// healthy for metrics and every other stream. A no-op when no senders are installed (the
     /// embedder hasn't wired this proc, or teardown cleared them).
     ///
-    /// Stream-level so any consumer can cancel its own input: every `(producer_proc, stage,
+    /// Stream-level so any consumer can cancel its own input: every `(producer_proc, stage, task,
     /// partition)` channel has a single consumer, so one stream's drop never cuts off a sibling's.
-    pub fn cancel_stream(&self, producer_proc: u32, stage_id: u32, partition: u32) {
+    pub fn cancel_stream(&self, producer_proc: u32, stage_id: u32, task_id: u32, partition: u32) {
         let guard = self.cancel_senders.lock().unwrap();
         let Some(senders) = guard.as_ref() else {
             return;
         };
         let senders = senders.lock().unwrap();
         if let Some(Some(sender)) = senders.get(producer_proc as usize) {
-            sender.try_send_cancel(stage_id, partition);
+            sender.try_send_cancel(stage_id, task_id, partition);
         }
     }
 
     /// The single cooperative inbound handle that pulls frames from every peer (and the
-    /// self-loop) into per-`(sender_proc, stage_id, partition)` channel buffers.
+    /// self-loop) into per-`(sender_proc, stage_id, task_id, partition)` channel buffers.
     pub fn inbound_receiver(&self) -> &Arc<DrainHandle> {
         &self.inbound_receiver
     }
@@ -318,8 +316,9 @@ impl CooperativeDrainSet for MppMesh {
         self.interrupt.check()
     }
 
-    fn stream_cancelled(&self, stage_id: u32, partition: u32) -> bool {
-        self.inbound_receiver.stream_cancelled(stage_id, partition)
+    fn stream_cancelled(&self, stage_id: u32, task_id: u32, partition: u32) -> bool {
+        self.inbound_receiver
+            .stream_task_cancelled(stage_id, task_id, partition)
     }
 }
 
@@ -351,7 +350,7 @@ impl ChannelResolver for ShmChannelResolver {
 /// A [`WorkerChannel`] over the mesh. `execute_task((stage, task), partition_range)` translates the
 /// DF-D `(stage, task)` addressing into the proc-pair grid: `proc_for_task(n_workers, task_number)`
 /// selects which `sender_proc` hosts the producer-side task, and each returned stream pulls that
-/// proc's `(sender_proc, stage_id, partition)` slice from the inbound drain.
+/// task's `(sender_proc, stage_id, task_id, partition)` slice from the inbound drain.
 struct ShmWorkerChannel {
     mesh: Arc<MppMesh>,
 }
@@ -434,10 +433,8 @@ impl WorkerChannel for ShmWorkerChannel {
             ))
         })?;
         let sender_proc = proc_for_task(self.mesh.n_workers(), task_number);
-        // More tasks than producer procs would fold two tasks onto one
-        // `(sender_proc, stage, partition)` channel: interleaved batches, and the first task's EOF
-        // truncates the second. With no input_stage here to count tasks, the equivalent guard is
-        // that the routed proc stays in range, as the old code also checked.
+        // Several tasks can fold onto this sender proc. `task_number` remains part of the stream
+        // identity, while this range check protects the mesh lookup itself.
         if sender_proc >= self.mesh.n_procs {
             return Err(DataFusionError::Internal(format!(
                 "ShmWorkerChannel: sender_proc={sender_proc} >= n_procs={} \
@@ -509,6 +506,7 @@ impl WorkerChannel for ShmWorkerChannel {
                 Arc::clone(&self.mesh),
                 sender_proc,
                 stage_id,
+                task_number,
                 partition_u32,
             ));
         }
@@ -525,7 +523,7 @@ impl WorkerChannel for ShmWorkerChannel {
     }
 }
 
-/// Build the cooperative pull-loop stream for one `(producer_proc, stage_id, partition)` channel.
+/// Build the cooperative pull-loop stream for one `(producer_proc, stage_id, task_id, partition)` channel.
 ///
 /// The inbound drain runs inline on the consumer's thread. Each iteration checks for cancellation
 /// (via the injected interrupt extension point), drains the receiver into the registry, pops one
@@ -535,17 +533,19 @@ fn pull_partition_stream(
     mesh: Arc<MppMesh>,
     producer_proc: u32,
     stage_id: u32,
+    task_id: u32,
     partition: u32,
 ) -> BoxStream<'static, Result<RecordBatch>> {
     // One drain per process, shared across all sender_procs. The channel-buffer registry keys by
-    // (sender_proc, stage_id, partition) so this consumer still sees only its named sender's slice
+    // `(sender_proc, stage_id, task_id, partition)` so this consumer still sees only its named
+    // sender's slice
     // even though the underlying inbox is shared with all peers.
     let drain = Arc::clone(mesh.inbound_receiver());
     log::debug!(
         "shm transport execute: register channel sender_proc={producer_proc} stage_id={stage_id} \
-         partition={partition}"
+         task_id={task_id} partition={partition}"
     );
-    let buffer = drain.register_channel(producer_proc, stage_id, partition);
+    let buffer = drain.register_task_channel(producer_proc, stage_id, task_id, partition);
     let stream = async_stream::stream! {
         // Any consumer cancels its own input stream when it drops early. The mesh no-ops the send
         // until the embedder wires this proc's outbound senders.
@@ -553,6 +553,7 @@ fn pull_partition_stream(
             mesh: Arc::clone(&mesh),
             producer_proc,
             stage_id,
+            task_id,
             partition,
             armed: true,
         };
@@ -613,7 +614,7 @@ impl WorkerResolver for InProcessWorkerResolver {
     }
 }
 
-/// Cancels one `(stage_id, partition)` stream if its consumer drops before EOF, telling the
+/// Cancels one `(stage_id, task_id, partition)` stream if its consumer drops before EOF, telling the
 /// producer on `producer_proc` to stop. A consumer that stops pulling early (a top-N `LIMIT`, an
 /// inner merge join exhausting a side, etc.) would otherwise leave that producer spinning on the
 /// full inbox until the statement timeout. Disarmed on a clean EOF: there the producer already
@@ -622,6 +623,7 @@ struct StreamCancelGuard {
     mesh: Arc<MppMesh>,
     producer_proc: u32,
     stage_id: u32,
+    task_id: u32,
     partition: u32,
     armed: bool,
 }
@@ -629,8 +631,12 @@ struct StreamCancelGuard {
 impl Drop for StreamCancelGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.mesh
-                .cancel_stream(self.producer_proc, self.stage_id, self.partition);
+            self.mesh.cancel_stream(
+                self.producer_proc,
+                self.stage_id,
+                self.task_id,
+                self.partition,
+            );
         }
     }
 }

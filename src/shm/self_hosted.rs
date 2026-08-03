@@ -767,7 +767,12 @@ impl QueryHarness {
                         );
                     };
                     let sender = base
-                        .clone_with_header(MppFrameHeader::batch(stage_num, q as u32, proc))
+                        .clone_with_header(MppFrameHeader::batch(
+                            stage_num,
+                            task_i as u32,
+                            q as u32,
+                            proc,
+                        ))
                         .with_cooperative_drain(Arc::clone(mesh) as Arc<dyn CooperativeDrainSet>);
                     sinks.push(Box::new(MppPartitionSink::new(sender)));
                 }

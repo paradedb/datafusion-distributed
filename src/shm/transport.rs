@@ -218,9 +218,7 @@ impl ExecuteTaskFrame {
 
 /// Identity of one task's output partition within a distributed stage.
 ///
-/// Every data-plane operation must use the same key: batches, EOF, cancellation, and chunk
-/// reassembly. Keeping the three identifiers together prevents a task/partition swap from
-/// silently routing a stream to a sibling consumer.
+/// Batches, EOF, cancellation, and data chunks must use this key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MppDataStreamKey {
     pub stage_id: u32,
@@ -240,8 +238,7 @@ impl MppDataStreamKey {
 
 /// One data stream as it appears on a receiver's shared inbox.
 ///
-/// `sender_proc` remains part of this key because it identifies the physical producer and, in
-/// turn, whether the drain should use the peer inbox or this process's self-loop.
+/// `sender_proc` distinguishes producers sharing an inbox, including the self-loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PhysicalStreamKey {
     sender_proc: u32,
@@ -980,12 +977,6 @@ pub struct MppSender {
 unsafe impl Sync for MppSender {}
 
 impl MppSender {
-    /// Construct a sender that tags every outgoing batch with `header`. Production call sites
-    /// clone one shared `Arc<dyn BatchChannelSender>` across N senders, each with a different
-    /// `MppFrameHeader::batch(MppDataStreamKey::new(stage, task, partition), sender)`. That's
-    /// the multiplexed
-    /// pattern for fanning multiple
-    /// partitions over one shm_mq queue.
     pub(super) fn with_header(
         channel: Arc<dyn BatchChannelSender>,
         header: MppFrameHeader,
@@ -1015,10 +1006,8 @@ impl MppSender {
     /// produce loop to stop pulling its input, not just skip the send. `false` without a drain
     /// (in-proc test channels carry no inbound cancel).
     pub(super) fn stream_cancelled(&self) -> bool {
-        // Only batch senders represent data streams. Control frames retain their existing
-        // `(stage_id, partition = task_number)` address, which can numerically match a task 0
-        // data stream; treating that coincidence as a cancel would drop a plan, work unit, or
-        // metrics frame.
+        // A data-stream cancel can numerically match a control address; control traffic is never
+        // cancelled by a stream-level cancel.
         if !matches!(self.header.kind(), Ok(MppFrameKind::Batch)) {
             return false;
         }
@@ -2619,8 +2608,6 @@ mod tests {
         assert!(!drain.stream_cancelled(cancelled));
         drain.note_cancel(cancelled);
         assert!(drain.stream_cancelled(cancelled));
-        // A cancel for one stream leaves the others alive, including a sibling task with the
-        // same stage and partition.
         assert!(!drain.stream_cancelled(MppDataStreamKey::new(7, 3, 1)));
         assert!(!drain.stream_cancelled(MppDataStreamKey::new(8, 0, 1)));
     }
@@ -2628,8 +2615,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn control_sender_ignores_matching_data_stream_cancel() {
         let drain = Arc::new(DrainHandle::cooperative(0, Vec::new()));
-        // A control frame for task 1 uses the legacy header address `(stage 7, task_id 0,
-        // partition 1)`. It must not be mistaken for task 0's output partition 1.
+        // Control frames encode their target task in `partition`, so task 1 overlaps data
+        // `(stage 7, task 0, partition 1)`.
         drain.note_cancel(MppDataStreamKey::new(7, 0, 1));
         let (tx, _rx) = in_proc_channel(1);
         let sender = MppSender::with_header(Arc::new(tx), MppFrameHeader::task_metrics(7, 1, 0))
@@ -2684,10 +2671,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Cancellation is scoped to one logical stream even when two tasks share the same physical
-    /// producer queue. After task 0 is cancelled, task 3 must still deliver its batch and EOF.
-    /// This is the live-sibling case behind a short PostgreSQL launch that assigns tasks 0 and 3
-    /// to one worker: they share stage 7 / output partition 0 and differ only by task id.
+    /// Tasks 0 and 3 can share one worker and output partition.
     #[tokio::test(flavor = "current_thread")]
     async fn cancelling_one_task_does_not_stop_sibling_sender() {
         let (out_tx, out_rx) = in_proc_channel(4);

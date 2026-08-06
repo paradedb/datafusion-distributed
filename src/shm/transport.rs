@@ -2684,6 +2684,59 @@ mod tests {
             .unwrap();
     }
 
+    /// Cancellation is scoped to one logical stream even when two tasks share the same physical
+    /// producer queue. After task 0 is cancelled, task 3 must still deliver its batch and EOF.
+    /// This is the live-sibling case behind a short PostgreSQL launch that assigns tasks 0 and 3
+    /// to one worker: they share stage 7 / output partition 0 and differ only by task id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_one_task_does_not_stop_sibling_sender() {
+        let (out_tx, out_rx) = in_proc_channel(4);
+        let out_tx: Arc<dyn BatchChannelSender> = Arc::new(out_tx);
+        let (inbox_tx, inbox_rx) = in_proc_channel(4);
+        let drain = Arc::new(DrainHandle::cooperative(
+            1,
+            vec![(ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox_rx)))],
+        ));
+        let task_0_stream = MppDataStreamKey::new(7, 0, 0);
+        let task_3_stream = MppDataStreamKey::new(7, 3, 0);
+        let task_0 =
+            MppSender::with_header(Arc::clone(&out_tx), MppFrameHeader::batch(task_0_stream, 1))
+                .with_cooperative_drain(Arc::clone(&drain) as Arc<dyn CooperativeDrainSet>);
+        let task_3 =
+            MppSender::with_header(Arc::clone(&out_tx), MppFrameHeader::batch(task_3_stream, 1))
+                .with_cooperative_drain(Arc::clone(&drain) as Arc<dyn CooperativeDrainSet>);
+
+        let mut cancel = vec![0u8; MPP_FRAME_HEADER_SIZE];
+        MppFrameHeader::cancel(task_0_stream, 0).write_to(&mut cancel);
+        inbox_tx.send_bytes(&cancel).unwrap();
+        drain.try_drain_pass().unwrap();
+        assert!(task_0.stream_cancelled());
+        assert!(!task_3.stream_cancelled());
+
+        let mut stats = SendBatchStats::default();
+        task_0
+            .send_batch_traced(&sample_batch(2), &mut stats)
+            .await
+            .unwrap();
+        task_3
+            .send_batch_traced(&sample_batch(3), &mut stats)
+            .await
+            .unwrap();
+        task_3.send_eof_traced(&mut stats).await.unwrap();
+
+        let receiver = MppReceiver::new(Box::new(out_rx));
+        let RecvBatchOutcome::Batch { header, batch } = receiver.try_recv_batch() else {
+            panic!("task 3 batch must be delivered");
+        };
+        assert_eq!(header.data_stream(), task_3_stream);
+        assert_eq!(batch.num_rows(), 3);
+        let RecvBatchOutcome::Eof { header } = receiver.try_recv_batch() else {
+            panic!("task 3 EOF must be delivered");
+        };
+        assert_eq!(header.data_stream(), task_3_stream);
+        assert!(matches!(receiver.try_recv_batch(), RecvBatchOutcome::Empty));
+    }
+
     #[test]
     fn frame_round_trips_a_work_unit_and_feed_eof() {
         let unit = pb::WorkUnit {

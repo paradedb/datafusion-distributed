@@ -47,8 +47,51 @@ The shared-memory transport mirrors the canonical gRPC protocol's pull-based RPC
 
 ## Lifecycle & Memory Safety
 
-- **Keep-Alive Senders**: `MppMesh` holds internal `_keep_alive_senders` while active to ensure worker inboxes maintain `sender_count > 0` and do not mark shared-memory slots detached prematurely while control requests (`ExecuteTask`, `Cancel`) are pending.
-- **Teardown & Detachment**: Embedders invoke `MppMesh::mark_detached()` when unmapping memory segments or shutting down, clearing keep-alive senders so peer inboxes observe `Detached` cleanly without accessing freed shared-memory buffers.
+- **Session Handles (`LeaderSession` / `WorkerSession`)**: `leader_setup` and `worker_setup` hand back `LeaderSession` and `WorkerSession` handles owning the process's outbound data senders.
+- **Scope Retention**: Internal sender fields are private to prevent premature destructuring at compile time. Embedders hold `session` as a local variable for the execution scope.
+- **Teardown & Detachment**: When `session` drops (on normal return, `?` error, or panic/unwind), its outbound senders drop automatically, causing peer inboxes to observe `Detached` without requiring manual cleanup calls. Embedders invoke `MppMesh::mark_detached()` when unmapping shared-memory segments to clear liveness flags.
+
+---
+
+## Embedder Usage & Session Lifecycles
+
+### Worker Execution Loop (`pg_search` / parallel workers)
+
+```rust
+pub fn run_mpp_worker(...) -> Result<()> {
+    // 1. Attach to shared memory region and obtain the opaque WorkerSession handle.
+    let session = unsafe {
+        worker_setup(base, region_total, proc_idx, wakeup, token, interrupt)?
+    };
+
+    // 2. Access session.mesh and session.plan_bytes.
+    let ctx = build_session(Arc::clone(&session.mesh));
+
+    // 3. Drive worker execution loop.
+    run_execute_task_loop(&session.mesh, ...).await?;
+
+    Ok(())
+    // 4. `session` drops here on normal exit, `?` error, or panic unwind,
+    //    automatically detaching peer inboxes.
+}
+```
+
+### Leader Query Execution
+
+```rust
+pub async fn run_leader_query(...) -> Result<Vec<RecordBatch>> {
+    // 1. Initialize DSM region and obtain LeaderSession.
+    let session = unsafe {
+        leader_setup(base, n_procs, queue_bytes, plan_bytes, wakeup, token, interrupt, true)?
+    };
+
+    // 2. Execute plan over session.mesh.
+    let results = execute_plan(&session.mesh).await?;
+
+    Ok(results)
+    // 3. `session` drops at query completion, releasing leader control senders.
+}
+```
 
 ---
 

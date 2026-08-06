@@ -720,7 +720,7 @@ impl QueryHarness {
                     Arc::clone(&interrupt),
                 )
             }?;
-            worker_meshes.push((attach.mesh, attach.outbound_senders));
+            worker_meshes.push((attach.mesh, attach.outbound_senders().to_vec()));
         }
 
         // Build every fragment's launch package: one routed sink per output partition, sharing
@@ -784,7 +784,7 @@ impl QueryHarness {
 
         state.n_workers = n_workers;
         state.leader_mesh = Some(leader_mesh);
-        state.leader_senders = leader_attach.outbound_senders;
+        state.leader_senders = leader_attach.outbound_senders().to_vec();
         state.worker_meshes = worker_meshes.iter().map(|(m, _)| Arc::clone(m)).collect();
         state.launches = launches;
         state.region = Some(region);

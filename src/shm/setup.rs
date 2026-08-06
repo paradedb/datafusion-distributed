@@ -120,19 +120,20 @@ fn build_outbound_senders(
     (senders, cancel)
 }
 
-/// What [`leader_setup`] hands back to the embedder.
-pub struct LeaderAttach {
+/// What [`leader_setup`] hands back to the embedder: the active leader session on the mesh.
+///
+/// Dropping this handle drops `_outbound_senders`, notifying peer worker inboxes that the leader
+/// has detached. Fields `mesh` and `plan_bytes` are accessible, while `_outbound_senders` is private
+/// to prevent premature destructuring.
+pub struct LeaderSession {
     /// The leader's mesh, installed on its DataFusion session.
     pub mesh: Arc<MppMesh>,
     /// Outbound senders keyed by destination proc index, for the control plane: work-unit
-    /// frames flow leader -> worker through them. Slot 0 (the leader itself) stays `None`;
-    /// empty unless `attach_senders` was passed. Holders must keep them alive for the whole
-    /// query: dropping them before a worker attaches latches that worker's inbox as detached.
-    pub outbound_senders: Vec<Option<MppSender>>,
+    /// frames flow leader -> worker through them. Private to enforce session scope retention.
+    _outbound_senders: Vec<Option<MppSender>>,
 }
 
-/// Initialize the shared region as the leader (`proc 0`) and return its mesh plus its outbound
-/// senders.
+/// Initialize the shared region as the leader (`proc 0`) and return its session handle.
 ///
 /// Writes the region header, copies `plan_bytes` in, initializes the `n_procs` inboxes, and
 /// attaches the leader as receiver to its own inbox. `receiver_token` is registered so producers
@@ -153,7 +154,7 @@ pub unsafe fn leader_setup(
     receiver_token: u64,
     interrupt: Arc<dyn Interrupt>,
     attach_senders: bool,
-) -> Result<LeaderAttach> {
+) -> Result<LeaderSession> {
     if receiver_token == NO_RECEIVER_TOKEN {
         return Err(DataFusionError::Internal(
             "mpp: leader_setup: receiver_token is the NO_RECEIVER_TOKEN sentinel; wakeups \
@@ -188,10 +189,9 @@ pub unsafe fn leader_setup(
         build_outbound_senders(0, n_procs, attach.outbound_senders);
     let mesh = Arc::new(MppMesh::new(0, n_procs, inbound, interrupt, attach.alive));
     mesh.set_cancel_senders(Arc::new(std::sync::Mutex::new(cancel_senders)));
-    mesh.set_keep_alive_senders(outbound_senders.clone());
-    Ok(LeaderAttach {
+    Ok(LeaderSession {
         mesh,
-        outbound_senders,
+        _outbound_senders: outbound_senders,
     })
 }
 
@@ -244,15 +244,29 @@ pub fn install_work_unit_channels(
     mesh.register_work_unit_senders(stage_id, task_number, channels.senders);
 }
 
-/// What [`worker_setup`] hands back to the embedder.
-pub struct WorkerAttach {
+/// What [`worker_setup`] hands back to the embedder: the active worker session on the mesh.
+///
+/// Dropping this handle drops `_outbound_senders`, notifying peer inboxes that this worker
+/// has detached. Private `_outbound_senders` prevents premature destructuring.
+pub struct WorkerSession {
     /// The worker's mesh, installed on its DataFusion session.
     pub mesh: Arc<MppMesh>,
-    /// Outbound senders keyed by destination proc index. The slot at `this_proc` is the in-proc
-    /// self-loop; every other slot writes to that peer's inbox.
-    pub outbound_senders: Vec<Option<MppSender>>,
     /// The plan bytes the leader wrote into the region, copied out for this worker.
     pub plan_bytes: Vec<u8>,
+    /// Outbound senders keyed by destination proc index. Private to enforce session scope retention.
+    _outbound_senders: Vec<Option<MppSender>>,
+}
+
+impl LeaderSession {
+    pub fn outbound_senders(&self) -> &[Option<MppSender>] {
+        &self._outbound_senders
+    }
+}
+
+impl WorkerSession {
+    pub fn outbound_senders(&self) -> &[Option<MppSender>] {
+        &self._outbound_senders
+    }
 }
 
 /// Attach to the leader-initialized region as worker `proc_idx` (`>= 1`).
@@ -267,7 +281,7 @@ pub unsafe fn worker_setup(
     wakeup: Arc<dyn Wakeup>,
     receiver_token: u64,
     interrupt: Arc<dyn Interrupt>,
-) -> Result<WorkerAttach> {
+) -> Result<WorkerSession> {
     if receiver_token == NO_RECEIVER_TOKEN {
         return Err(DataFusionError::Internal(
             "mpp: worker_setup: receiver_token is the NO_RECEIVER_TOKEN sentinel; wakeups \
@@ -317,11 +331,10 @@ pub unsafe fn worker_setup(
     // its mesh the control-plane cancel senders; they drop with the mesh at the end of the worker's
     // run, well before the DSM unmaps, so no explicit release is needed.
     mesh.set_cancel_senders(Arc::new(std::sync::Mutex::new(cancel)));
-    mesh.set_keep_alive_senders(outbound.clone());
-    Ok(WorkerAttach {
+    Ok(WorkerSession {
         mesh,
-        outbound_senders: outbound,
         plan_bytes,
+        _outbound_senders: outbound,
     })
 }
 

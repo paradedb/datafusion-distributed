@@ -803,7 +803,11 @@ mod tests {
                 )
             }
             .unwrap();
-            worker_setups.push((proc_idx, attach.mesh, attach.outbound_senders));
+            worker_setups.push((
+                proc_idx,
+                Arc::clone(&attach.mesh),
+                attach.outbound_senders().to_vec(),
+            ));
         }
 
         // Build the distributed plan once on the leader session; producers and consumer share it.
@@ -957,7 +961,11 @@ mod tests {
                 )
             }
             .unwrap();
-            workers.push((proc_idx, attach.mesh, attach.outbound_senders));
+            workers.push((
+                proc_idx,
+                Arc::clone(&attach.mesh),
+                attach.outbound_senders().to_vec(),
+            ));
         }
         Bootstrap {
             leader_mesh,

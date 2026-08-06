@@ -65,8 +65,9 @@ mod transport;
 pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
 pub use runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
 pub use setup::{
-    LeaderAttach, WorkerAttach, collect_task_metrics, dsm_region_bytes, install_work_unit_channels,
-    leader_setup, region_total, run_execute_task_loop, run_worker_fragment, worker_setup,
+    LeaderSession, WorkerSession, collect_task_metrics, dsm_region_bytes,
+    install_work_unit_channels, leader_setup, region_total, run_execute_task_loop,
+    run_worker_fragment, worker_setup,
 };
 pub use sink::{PartitionSink, WorkerSink};
 pub use transport::{

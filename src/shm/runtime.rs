@@ -105,7 +105,6 @@ pub struct MppMesh {
     /// a `Cancel` frame to a producing proc when this proc abandons a stream. `None` until the
     /// embedder installs it.
     cancel_senders: Mutex<Option<PeerSenders>>,
-    _keep_alive_senders: Mutex<Option<Vec<Option<crate::shm::transport::MppSender>>>>,
     alive: AliveFlag,
 }
 
@@ -124,19 +123,8 @@ impl MppMesh {
             inbound_receiver,
             interrupt,
             cancel_senders: Mutex::new(None),
-            _keep_alive_senders: Mutex::new(None),
             alive,
         }
-    }
-
-    pub fn set_keep_alive_senders(&self, senders: Vec<Option<crate::shm::transport::MppSender>>) {
-        *self._keep_alive_senders.lock().unwrap() = Some(senders);
-    }
-
-    /// Drop the keep-alive senders held by this mesh so outbound peer inboxes see `Detached`
-    /// if this worker process exits early or encounters a fatal error.
-    pub fn clear_keep_alive_senders(&self) {
-        *self._keep_alive_senders.lock().unwrap() = None;
     }
 
     /// Mark this proc's DSM mesh detached so every ring handle's operations become no-ops.
@@ -144,7 +132,6 @@ impl MppMesh {
     /// so handles dropped afterward (e.g. by a memory-context reset) never touch freed memory.
     pub fn mark_detached(&self) {
         self.alive.store(false, Ordering::Release);
-        self.clear_keep_alive_senders();
         *self.cancel_senders.lock().unwrap() = None;
     }
 

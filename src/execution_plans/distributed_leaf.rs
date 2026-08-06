@@ -62,6 +62,14 @@ use std::sync::Arc;
 ///
 /// This way, the different workers get to execute different versions of the same plan, each
 /// handling its own range of non-overlapping data.
+///
+/// ## Leaf Variant Execution Contract
+/// When a task's specialized variant is executed on a worker, upstream stage operators (such as
+/// `RepartitionExec`) may call `variant.execute(partition, context)` for every partition index
+/// `partition` in the stage's requested partition range. Specialized leaf plans that map to a
+/// specific physical partition should return an empty record batch stream (such as
+/// `EmptyRecordBatchStream`) when `partition` does not match their assigned partition, allowing
+/// multi-partition stage pipelines to pull and repartition data without failing.
 #[derive(Debug)]
 pub struct DistributedLeafExec {
     pub(crate) original: Arc<dyn ExecutionPlan>,

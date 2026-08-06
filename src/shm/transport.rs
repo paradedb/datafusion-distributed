@@ -1718,7 +1718,6 @@ enum SetPlanSlot {
     Waiting(tokio::sync::oneshot::Sender<Result<SetPlanFrame, DataFusionError>>),
 }
 
-#[allow(dead_code)]
 pub type ExecuteTaskRx =
     tokio::sync::mpsc::UnboundedReceiver<Result<ExecuteTaskFrame, DataFusionError>>;
 
@@ -1728,7 +1727,6 @@ struct ExecuteTaskRegistry {
     dead: Option<String>,
 }
 
-#[allow(dead_code)]
 enum ExecuteTaskSlot {
     Pending(Vec<Result<ExecuteTaskFrame, DataFusionError>>),
     Active(tokio::sync::mpsc::UnboundedSender<Result<ExecuteTaskFrame, DataFusionError>>),
@@ -1995,8 +1993,7 @@ impl DrainHandle {
         }
     }
 
-    #[allow(dead_code)]
-    pub(super) async fn take_execute_task_rx(
+    pub(super) fn take_execute_task_rx(
         &self,
         stage_id: u32,
         task_number: u32,
@@ -2005,17 +2002,26 @@ impl DrainHandle {
         if let Some(msg) = &guard.dead {
             return Err(DataFusionError::Execution(msg.clone()));
         }
-        let slot = guard
-            .map
-            .entry((stage_id, task_number))
-            .or_insert_with(|| ExecuteTaskSlot::Pending(Vec::new()));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        if let ExecuteTaskSlot::Pending(queue) = slot {
-            for item in queue.drain(..) {
-                let _ = tx.send(item);
+        if let Some(slot) = guard.map.get_mut(&(stage_id, task_number)) {
+            match slot {
+                ExecuteTaskSlot::Active(_) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "take_execute_task_rx: execute_task_rx for stage {stage_id} task {task_number} already taken"
+                    )));
+                }
+                ExecuteTaskSlot::Pending(queue) => {
+                    for item in queue.drain(..) {
+                        let _ = tx.send(item);
+                    }
+                    *slot = ExecuteTaskSlot::Active(tx);
+                }
             }
+        } else {
+            guard
+                .map
+                .insert((stage_id, task_number), ExecuteTaskSlot::Active(tx));
         }
-        *slot = ExecuteTaskSlot::Active(tx);
         Ok(rx)
     }
 
@@ -2290,6 +2296,16 @@ mod tests {
     use std::thread;
 
     use std::thread::JoinHandle;
+
+    #[test]
+    fn take_execute_task_rx_second_take_errors() {
+        let drain = DrainHandle::cooperative(0, vec![]);
+        let rx1 = drain.take_execute_task_rx(1, 0);
+        assert!(rx1.is_ok());
+        let rx2 = drain.take_execute_task_rx(1, 0);
+        assert!(rx2.is_err());
+        assert!(rx2.unwrap_err().to_string().contains("already taken"));
+    }
 
     impl DrainBuffer {
         /// Block until a batch is available, EOF is reached, or the buffer is cancelled.

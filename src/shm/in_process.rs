@@ -68,7 +68,6 @@ use super::setup::{collect_task_metrics, dsm_region_bytes, leader_setup, worker_
 use super::transport::{
     CooperativeDrainSet, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
 };
-use futures::stream::StreamExt;
 
 /// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
 /// batches, so backpressure never kicks in. Production sizes this from `paradedb.mpp_queue_size`.
@@ -414,6 +413,9 @@ async fn run_worker_proc(
     }
 
     let drain_mesh = Arc::clone(&mesh);
+    // `in_process.rs` is an in-process test harness running under a multi-threaded Tokio test
+    // runtime. Unlike production cooperative workers (which run single-threaded without tokio::spawn),
+    // spawning a background task here is acceptable to keep mock worker meshes drained during tests.
     #[allow(clippy::disallowed_methods)]
     let _drain_guard = AbortOnDrop(tokio::spawn(async move {
         loop {
@@ -439,62 +441,31 @@ async fn run_worker_proc(
         let worker_sink = Arc::clone(&worker_sink);
 
         futures.push(async move {
-            let mut rx = mesh.take_execute_task_rx(stage_id, task_idx).await?;
-            let mut sub_futures = futures::stream::FuturesUnordered::new();
-            let mut partitions_requested = 0;
-            let mut channel_open = true;
-            // No partitions to execute, return early
-            if n_out == 0 {
-                return Ok::<_, DataFusionError>(());
-            }
-            loop {
-                if (partitions_requested >= n_out || !channel_open) && sub_futures.is_empty() {
-                    break;
-                }
-                tokio::select! {
-                    frame_res = rx.recv(), if channel_open && partitions_requested < n_out => {
-                        match frame_res {
-                            Some(Ok(frame)) => {
-                                let (request, _headers) = frame.into_parts()?;
-                                let start = request.target_partition_start as usize;
-                                let end = request.target_partition_end as usize;
-                                let len = end - start;
-
-                                let mut task_sinks = Vec::with_capacity(len);
-                                for q in start..end {
-                                    task_sinks.push(worker_sink.open_partition(stage_id as usize, q)?);
-                                }
-
-                                sub_futures.push(crate::shm::setup::run_worker_fragment(
-                                    Arc::clone(&plan),
-                                    task_sinks,
-                                    Arc::clone(&task_ctx),
-                                    start..end,
-                                ));
-                                partitions_requested += len;
-                            }
-                            Some(Err(e)) => return Err(DataFusionError::Execution(format!("rx error: {e}, stage: {stage_id}, task: {task_idx}, requested: {partitions_requested}/{n_out}"))),
-                            None => {
-                                channel_open = false;
-                            }
+            let rx = mesh.take_execute_task_rx(stage_id, task_idx)?;
+            let mesh = Arc::clone(&mesh);
+            crate::shm::setup::run_execute_task_loop(
+                rx,
+                n_out,
+                tokio_util::sync::CancellationToken::new(),
+                || {
+                    mesh.inbound_receiver().try_drain_pass()?;
+                    Ok(())
+                },
+                |_request, _headers, range| {
+                    let plan = Arc::clone(&plan);
+                    let task_ctx = Arc::clone(&task_ctx);
+                    let worker_sink = Arc::clone(&worker_sink);
+                    async move {
+                        let mut task_sinks = Vec::with_capacity(range.len());
+                        for q in range.clone() {
+                            task_sinks.push(worker_sink.open_partition(stage_id as usize, q)?);
                         }
+                        crate::shm::setup::run_worker_fragment(plan, task_sinks, task_ctx, range)
+                            .await
                     }
-                    next_res = sub_futures.next(), if !sub_futures.is_empty() => {
-                        match next_res {
-                            Some(Ok(_)) => {
-                            }
-                            Some(Err(e)) => return Err(DataFusionError::Execution(format!("sub_future error: {e}, stage: {stage_id}, task: {task_idx}, requested: {partitions_requested}/{n_out}"))),
-                            None => unreachable!(),
-                        }
-                    }
-                    _ = tokio::task::yield_now() => {
-                        if let Err(e) = mesh.inbound_receiver().try_drain_pass() {
-                            return Err(DataFusionError::Execution(format!("drain error: {e}, stage: {stage_id}, task: {task_idx}, requested: {partitions_requested}/{n_out}"))); 
-                        }
-                    }
-                }
-            }
-            Ok::<_, DataFusionError>(())
+                },
+            )
+            .await
         });
     }
     for r in futures::future::join_all(futures).await {
@@ -1022,10 +993,6 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap();
-        println!(
-            "Physical plan:\n{}",
-            datafusion::physical_plan::displayable(physical.as_ref()).indent(true)
-        );
         let entries = collect_dispatched_stages(&physical, N_WORKERS);
         assert!(
             entries
@@ -1034,7 +1001,6 @@ mod tests {
             "expected a hash-routed producer stage; got {:?}",
             entries.iter().map(|e| &e.routing).collect::<Vec<_>>()
         );
-        println!("entries: {:#?}", entries);
 
         let mut workers = JoinSet::new();
         for (proc_idx, mesh, outbound) in boot.workers {

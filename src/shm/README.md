@@ -30,11 +30,12 @@ The shared-memory transport mirrors the canonical gRPC protocol's pull-based RPC
 
 ## Control & Data Plane Design
 
-### 1. Control Plane (`MppMesh` & `DrainHandle`)
+### 1. Control Plane (`MppMesh`, `DrainHandle` & `run_execute_task_loop`)
 - **Messages**: Control frames (`ExecuteTask`, `SetPlan`, `TaskMetrics`, `Cancel`, `EOF`) are tagged with a 16-byte [`MppFrameHeader`](./transport.rs) (`kind`, `stage_id`, `partition`, `sender_proc`) and routed through `MppMesh`.
 - **Demand-Driven Pull Execution**:
   - Downstream consumers issue `ExecuteTaskFrame` to upstream producer tasks via `MppMesh::send_execute_task`.
-  - Upstream worker tasks wait on `MppMesh::take_execute_task_rx(stage_id, task_number)` for incoming execution requests before spawning task fragments.
+  - Upstream worker tasks wait on `MppMesh::take_execute_task_rx(stage_num, task_idx)` for incoming execution requests before spawning task fragments.
+  - Workers run the demand loop via [`run_execute_task_loop`](./setup.rs), which validates requested partition ranges (`start..end`), guards against duplicate/overlapping partition claims, listens to `CancellationToken` for prompt cancellation unwinding, and periodically drives inbound ring draining.
 - **Demuxing**: Incoming frames are demuxed cooperatively by [`DrainHandle`](./transport.rs) into per-`(stage_id, task_number)` request registries and per-channel record batch buffers.
 
 ### 2. Data Plane (DSM Ring Buffers)
@@ -53,6 +54,7 @@ The shared-memory transport mirrors the canonical gRPC protocol's pull-based RPC
 
 ## Extension Points for Embedders
 
-Embedders (such as ParadeDB / Postgres backend engines) supply platform primitives via extension traits:
+Embedders (such as ParadeDB / Postgres backend engines or custom runners) consume the `src/shm` API:
 - **Buffer Allocation**: Standard POSIX `mmap` or Postgres Shared Memory allocations (`dsm.rs`).
+- **Worker Execution Loop**: [`run_execute_task_loop`](./setup.rs) for driving worker tasks, range validation, and cancellation unwinding.
 - **Wakeup Primitives**: Custom signal/wakeup hooks (`NO_RECEIVER_TOKEN`, [`Wakeup`](./mpsc_ring.rs)).

@@ -224,14 +224,13 @@ impl MppMesh {
     }
 
     /// Obtains the channel receiver for incoming `ExecuteTask` requests targeting `(stage_id, task_number)`.
-    pub async fn take_execute_task_rx(
+    pub fn take_execute_task_rx(
         self: &Arc<Self>,
         stage_id: u32,
         task_number: u32,
     ) -> Result<crate::shm::transport::ExecuteTaskRx> {
         self.inbound_receiver
             .take_execute_task_rx(stage_id, task_number)
-            .await
     }
 
     /// Tell the producer on `producer_proc` to stop the `(stage_id, partition)` stream: this proc's
@@ -427,7 +426,7 @@ impl WorkerChannel for ShmWorkerChannel {
 
     async fn execute_task(
         &mut self,
-        _headers: HeaderMap,
+        headers: HeaderMap,
         request: ExecuteTaskRequest,
         metrics: ExecutionPlanMetricsSet,
         _task_ctx: &Arc<TaskContext>,
@@ -489,10 +488,8 @@ impl WorkerChannel for ShmWorkerChannel {
             }),
         };
 
-        let frame = match crate::shm::transport::ExecuteTaskFrame::from_parts(
-            pb_request,
-            &HeaderMap::new(),
-        ) {
+        let frame = match crate::shm::transport::ExecuteTaskFrame::from_parts(pb_request, &headers)
+        {
             Ok(f) => f,
             Err(e) => {
                 return Err(DataFusionError::Internal(format!(

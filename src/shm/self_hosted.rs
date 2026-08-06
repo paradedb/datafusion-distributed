@@ -893,105 +893,80 @@ impl TaskDriver {
             );
         }
 
-        let mut rx = launch
-            .mesh
-            .take_execute_task_rx(stage_num, task_i as u32)
-            .await?;
-        let produce = async {
-            let mut sub_futures = futures::stream::FuturesUnordered::new();
-            let mut partitions_requested = 0;
-            let mut channel_open = true;
-            let mut sinks_opt: Vec<_> = launch.sinks.into_iter().map(Some).collect();
-
-            if n_partitions == 0 {
-                return Ok::<_, DataFusionError>(());
-            }
-
-            loop {
-                if (partitions_requested >= n_partitions || !channel_open) && sub_futures.is_empty()
-                {
-                    break;
+        let rx = launch.mesh.take_execute_task_rx(stage_num, task_i as u32)?;
+        let mut sinks_opt: Vec<_> = launch.sinks.into_iter().map(Some).collect();
+        let mesh = Arc::clone(&launch.mesh);
+        let produce = crate::shm::setup::run_execute_task_loop(
+            rx,
+            n_partitions,
+            token.clone(),
+            || {
+                mesh.inbound_receiver().try_drain_pass()?;
+                Ok(())
+            },
+            |request, _headers, range| {
+                let len = range.len();
+                let mut task_sinks = Vec::with_capacity(len);
+                for i in range {
+                    task_sinks.push(sinks_opt[i].take().unwrap());
                 }
-                tokio::select! {
-                    frame_res = rx.recv(), if channel_open && partitions_requested < n_partitions => {
-                        match frame_res {
-                            Some(Ok(frame)) => {
-                                let (request, _headers) = frame.into_parts()?;
-                                let start = request.target_partition_start as usize;
-                                let end = request.target_partition_end as usize;
-                                let len = end - start;
+                let token = token.clone();
+                let worker = Arc::clone(&worker);
+                async move {
+                    // execute_local_task gives streams for the requested range.
+                    let (streams, _ctx) =
+                        execute_local_task(worker.task_data_entries(), request).await?;
+                    if streams.len() != task_sinks.len() {
+                        return internal_err!(
+                            "self-hosted shm transport: stage {stage_num} task {task_i} decoded into {} \
+                             partitions but routed {} sinks",
+                            streams.len(),
+                            task_sinks.len()
+                        );
+                    }
 
-                                let mut task_sinks = Vec::with_capacity(len);
-                                for i in start..end {
-                                    task_sinks.push(sinks_opt[i].take().unwrap());
+                    let mut stream_futs = Vec::with_capacity(streams.len());
+                    for (mut stream, mut sink) in streams.into_iter().zip(task_sinks) {
+                        let token = token.clone();
+                        stream_futs.push(async move {
+                            let stream_result: Result<()> = async {
+                                loop {
+                                    let batch = tokio::select! {
+                                        next = stream.next() => next,
+                                        // Head stream dropped: stop pulling so this fragment and its upstream
+                                        // scan unwind, instead of draining the input into a buffer no one reads.
+                                        _ = token.cancelled() => break,
+                                    };
+                                    let Some(batch) = batch else { break };
+                                    let batch = batch?;
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
+                                    sink.send(&batch).await?;
+                                    // A downstream worker abandoned this stream (its mesh carries the cancel
+                                    // senders): stop pulling so the cancel cascades to this fragment's own
+                                    // producers, matching the embedder's `run_worker_fragment` loop.
+                                    if sink.cancelled() {
+                                        break;
+                                    }
                                 }
-
-                                // execute_local_task gives streams for the requested range.
-                                let (streams, _ctx) = execute_local_task(worker.task_data_entries(), request).await?;
-                                if streams.len() != task_sinks.len() {
-                                    return internal_err!(
-                                        "self-hosted shm transport: stage {stage_num} task {task_i} decoded into {} \
-                                         partitions but routed {} sinks",
-                                        streams.len(),
-                                        task_sinks.len()
-                                    );
-                                }
-
-                                for (mut stream, mut sink) in streams.into_iter().zip(task_sinks) {
-                                    let token = token.clone();
-                                    sub_futures.push(async move {
-                                        let stream_result: Result<()> = async {
-                                            loop {
-                                                let batch = tokio::select! {
-                                                    next = stream.next() => next,
-                                                    // Head stream dropped: stop pulling so this fragment and its upstream
-                                                    // scan unwind, instead of draining the input into a buffer no one reads.
-                                                    _ = token.cancelled() => break,
-                                                };
-                                                let Some(batch) = batch else { break };
-                                                let batch = batch?;
-                                                if batch.num_rows() == 0 {
-                                                    continue;
-                                                }
-                                                sink.send(&batch).await?;
-                                                // A downstream worker abandoned this stream (its mesh carries the cancel
-                                                // senders): stop pulling so the cancel cascades to this fragment's own
-                                                // producers, matching the embedder's `run_worker_fragment` loop.
-                                                if sink.cancelled() {
-                                                    break;
-                                                }
-                                            }
-                                            Ok(())
-                                        }
-                                        .await;
-                                        // EOF always, even after a failed send, so the consumer side unblocks; the
-                                        // stream error stays the primary one.
-                                        let eof_result = sink.finish().await;
-                                        stream_result.and(eof_result)
-                                    });
-                                }
-                                partitions_requested += len;
+                                Ok(())
                             }
-                            Some(Err(e)) => return Err(e),
-                            None => {
-                                channel_open = false;
-                            }
-                        }
+                            .await;
+                            // EOF always, even after a failed send, so the consumer side unblocks; the
+                            // stream error stays the primary one.
+                            let eof_result = sink.finish().await;
+                            stream_result.and(eof_result)
+                        });
                     }
-                    next_res = sub_futures.next(), if !sub_futures.is_empty() => {
-                        match next_res {
-                            Some(Ok(())) => {}
-                            Some(Err(e)) => return Err(e),
-                            None => unreachable!(),
-                        }
+                    let results = futures::future::join_all(stream_futs).await;
+                    for r in results {
+                        r?;
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                        launch.mesh.inbound_receiver().try_drain_pass()?;
-                    }
+                    Ok(())
                 }
-            }
-            Ok(())
-        };
+            },
+        );
         let produce_res: Result<()> = produce.await;
 
         // The metrics receiver resolves as the last partition stream above completes, so this

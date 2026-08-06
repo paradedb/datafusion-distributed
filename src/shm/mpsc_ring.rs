@@ -464,6 +464,12 @@ impl DsmMpscReceiver {
         let seq = unsafe { (*slot).seq.load(Ordering::Acquire) };
         let expected_ready = head.wrapping_add(1);
         if seq != expected_ready {
+            // If the next expected slot is not yet ready, check if producers have detached.
+            // Under teardown or worker exit, once `detached` latches to true, no further slots
+            // will be published. Checking `detached` directly here ensures the consumer unblocks
+            // immediately with `RecvOutcome::Detached` during teardown, rather than remaining
+            // wedged on `RecvOutcome::Empty` waiting for a claimed-but-unpublished slot from an
+            // exited sender.
             if header.detached.load(Ordering::Acquire) {
                 return RecvOutcome::Detached;
             }

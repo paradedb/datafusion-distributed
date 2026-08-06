@@ -66,7 +66,7 @@ use super::mpsc_ring::Wakeup;
 use super::runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
 use super::setup::{collect_task_metrics, dsm_region_bytes, leader_setup, worker_setup};
 use super::transport::{
-    CooperativeDrainSet, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
+    CooperativeDrainSet, MppDataStreamKey, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
 };
 
 /// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
@@ -525,13 +525,15 @@ impl WorkerSink for ShmMqWorkerSink {
         })?;
         let sender = base
             .clone_with_header(MppFrameHeader::batch(
-                stage as u32,
-                u32::try_from(task).map_err(|_| {
-                    DataFusionError::Internal(format!(
-                        "run_worker_proc: task {task} exceeds transport u32"
-                    ))
-                })?,
-                partition as u32,
+                MppDataStreamKey::new(
+                    stage as u32,
+                    u32::try_from(task).map_err(|_| {
+                        DataFusionError::Internal(format!(
+                            "run_worker_proc: task {task} exceeds transport u32"
+                        ))
+                    })?,
+                    partition as u32,
+                ),
                 self.mesh.this_proc,
             ))
             .with_cooperative_drain(Arc::clone(&self.mesh) as Arc<dyn CooperativeDrainSet>);
@@ -698,16 +700,19 @@ mod tests {
         let consumer = Arc::clone(&boot.workers[0].1); // proc 1
         let producer = Arc::clone(&boot.workers[1].1); // proc 2
 
-        assert!(!producer.stream_cancelled(7, 0, 0));
+        let cancelled = MppDataStreamKey::new(7, 0, 0);
+        let sibling_task = MppDataStreamKey::new(7, 3, 0);
+        assert!(!producer.stream_cancelled(cancelled));
 
         // Proc 1 abandons task 0's `(stage 7, partition 0)` stream it reads from proc 2.
-        consumer.cancel_stream(2, 7, 0, 0);
+        consumer.cancel_stream(2, cancelled);
 
         // Proc 2 drains its inbox and sees the cancel its consumer sent.
         producer.try_drain_pass().unwrap();
-        assert!(producer.stream_cancelled(7, 0, 0));
-        // Scoped to that one stream: a sibling partition stays live.
-        assert!(!producer.stream_cancelled(7, 0, 1));
+        assert!(producer.stream_cancelled(cancelled));
+        // Scoped to that one stream: a sibling task using the same stage and output partition
+        // stays live.
+        assert!(!producer.stream_cancelled(sibling_task));
     }
 
     /// `dispatch_capture` is Some on the leader session only: its coordinator is the one that

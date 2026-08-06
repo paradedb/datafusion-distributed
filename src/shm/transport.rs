@@ -216,6 +216,47 @@ impl ExecuteTaskFrame {
     }
 }
 
+/// Identity of one task's output partition within a distributed stage.
+///
+/// Every data-plane operation must use the same key: batches, EOF, cancellation, and chunk
+/// reassembly. Keeping the three identifiers together prevents a task/partition swap from
+/// silently routing a stream to a sibling consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MppDataStreamKey {
+    pub stage_id: u32,
+    pub task_id: u32,
+    pub partition: u32,
+}
+
+impl MppDataStreamKey {
+    pub const fn new(stage_id: u32, task_id: u32, partition: u32) -> Self {
+        Self {
+            stage_id,
+            task_id,
+            partition,
+        }
+    }
+}
+
+/// One data stream as it appears on a receiver's shared inbox.
+///
+/// `sender_proc` remains part of this key because it identifies the physical producer and, in
+/// turn, whether the drain should use the peer inbox or this process's self-loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PhysicalStreamKey {
+    sender_proc: u32,
+    stream: MppDataStreamKey,
+}
+
+impl PhysicalStreamKey {
+    const fn new(sender_proc: u32, stream: MppDataStreamKey) -> Self {
+        Self {
+            sender_proc,
+            stream,
+        }
+    }
+}
+
 /// 20-byte prefix on every transport frame.
 ///
 /// The fixed layout `[magic, flags, stage_id, task_id, partition]` (5×u32) is what
@@ -273,28 +314,26 @@ fn pack_flags(kind: MppFrameKind, sender_proc: u32) -> u32 {
 }
 
 impl MppFrameHeader {
-    /// Build a `Batch` header for one `(stage_id, task_id, partition)` stream stamped with
-    /// `sender_proc`.
-    pub fn batch(stage_id: u32, task_id: u32, partition: u32, sender_proc: u32) -> Self {
+    /// Build a `Batch` header for one data stream stamped with `sender_proc`.
+    pub fn batch(stream: MppDataStreamKey, sender_proc: u32) -> Self {
         Self {
             magic: MPP_FRAME_MAGIC,
             flags: pack_flags(MppFrameKind::Batch, sender_proc),
-            stage_id,
-            task_id,
-            partition,
+            stage_id: stream.stage_id,
+            task_id: stream.task_id,
+            partition: stream.partition,
         }
     }
 
-    /// Build an `Eof` header for the given `(stage_id, task_id, partition)` stamped with
-    /// `sender_proc`.
+    /// Build an `Eof` header for the given data stream stamped with `sender_proc`.
     /// Carries no payload; receivers route it to the channel buffer's source-done counter.
-    pub fn eof(stage_id: u32, task_id: u32, partition: u32, sender_proc: u32) -> Self {
+    pub fn eof(stream: MppDataStreamKey, sender_proc: u32) -> Self {
         Self {
             magic: MPP_FRAME_MAGIC,
             flags: pack_flags(MppFrameKind::Eof, sender_proc),
-            stage_id,
-            task_id,
-            partition,
+            stage_id: stream.stage_id,
+            task_id: stream.task_id,
+            partition: stream.partition,
         }
     }
 
@@ -355,30 +394,36 @@ impl MppFrameHeader {
         }
     }
 
-    /// Build a `Cancel` header for the `(stage_id, task_id, partition)` stream, stamped with the consumer's
-    /// `sender_proc`. Carries no payload; the producer reads it as "stop sending this stream."
-    pub fn cancel(stage_id: u32, task_id: u32, partition: u32, sender_proc: u32) -> Self {
+    /// Build a `Cancel` header for a data stream, stamped with the consumer's `sender_proc`.
+    /// Carries no payload; the producer reads it as "stop sending this stream."
+    pub fn cancel(stream: MppDataStreamKey, sender_proc: u32) -> Self {
         Self {
             magic: MPP_FRAME_MAGIC,
             flags: pack_flags(MppFrameKind::Cancel, sender_proc),
-            stage_id,
-            task_id,
-            partition,
+            stage_id: stream.stage_id,
+            task_id: stream.task_id,
+            partition: stream.partition,
         }
     }
 
-    /// Build a `Chunk` header for one piece of an oversized frame. `stage_id`/`task_id`/`partition`
-    /// mirror the inner frame's addressing: together with `sender_proc` they key the
+    /// Build a `Chunk` header for one piece of an oversized frame. The data stream mirrors the
+    /// inner frame's addressing: together with `sender_proc` they key the
     /// receiver's reassembly, so chunked frames from two streams of the same proc can
     /// interleave without corrupting each other.
-    pub fn chunk(stage_id: u32, task_id: u32, partition: u32, sender_proc: u32) -> Self {
+    pub fn chunk(stream: MppDataStreamKey, sender_proc: u32) -> Self {
         Self {
             magic: MPP_FRAME_MAGIC,
             flags: pack_flags(MppFrameKind::Chunk, sender_proc),
-            stage_id,
-            task_id,
-            partition,
+            stage_id: stream.stage_id,
+            task_id: stream.task_id,
+            partition: stream.partition,
         }
+    }
+
+    /// Returns the data-stream address carried by a `Batch`, `Eof`, `Cancel`, or `Chunk` frame.
+    /// Control frames are a distinct tagged layout and keep their task address in `partition`.
+    pub(super) const fn data_stream(&self) -> MppDataStreamKey {
+        MppDataStreamKey::new(self.stage_id, self.task_id, self.partition)
     }
 
     /// The mesh peer that wrote this frame. The drain demuxes incoming frames into the
@@ -541,16 +586,13 @@ fn compact_rows(
 /// channel buffer transitions to `Eof` even though the multiplexed shm_mq queue
 /// stays attached for other channels.
 fn encode_eof_frame_into(
-    stage_id: u32,
-    task_id: u32,
-    partition: u32,
+    stream: MppDataStreamKey,
     sender_proc: u32,
     buf: &mut Vec<u8>,
 ) -> Result<(), DataFusionError> {
     buf.clear();
     buf.resize(MPP_FRAME_HEADER_SIZE, 0);
-    MppFrameHeader::eof(stage_id, task_id, partition, sender_proc)
-        .write_to(&mut buf[..MPP_FRAME_HEADER_SIZE]);
+    MppFrameHeader::eof(stream, sender_proc).write_to(&mut buf[..MPP_FRAME_HEADER_SIZE]);
     Ok(())
 }
 
@@ -871,7 +913,7 @@ pub trait CooperativeDrainSet: Send + Sync {
     /// Whether a consumer cancelled the `(stage_id, task_id, partition)` stream (a `Cancel` frame arrived on
     /// this proc's inbox). The send spin ends the producer's stream cleanly when it's set. Default
     /// `false` for drains that don't carry inbound control frames (in-proc test channels).
-    fn stream_cancelled(&self, _stage_id: u32, _task_id: u32, _partition: u32) -> bool {
+    fn stream_cancelled(&self, _stream: MppDataStreamKey) -> bool {
         false
     }
 }
@@ -896,8 +938,8 @@ impl CooperativeDrainSet for DrainHandle {
         DrainHandle::try_drain_pass(self)
     }
 
-    fn stream_cancelled(&self, stage_id: u32, task_id: u32, partition: u32) -> bool {
-        DrainHandle::stream_task_cancelled(self, stage_id, task_id, partition)
+    fn stream_cancelled(&self, stream: MppDataStreamKey) -> bool {
+        DrainHandle::stream_cancelled(self, stream)
     }
 }
 
@@ -940,7 +982,8 @@ unsafe impl Sync for MppSender {}
 impl MppSender {
     /// Construct a sender that tags every outgoing batch with `header`. Production call sites
     /// clone one shared `Arc<dyn BatchChannelSender>` across N senders, each with a different
-    /// `MppFrameHeader::batch(stage, task, partition, sender)`. That's the multiplexed
+    /// `MppFrameHeader::batch(MppDataStreamKey::new(stage, task, partition), sender)`. That's
+    /// the multiplexed
     /// pattern for fanning multiple
     /// partitions over one shm_mq queue.
     pub(super) fn with_header(
@@ -972,13 +1015,16 @@ impl MppSender {
     /// produce loop to stop pulling its input, not just skip the send. `false` without a drain
     /// (in-proc test channels carry no inbound cancel).
     pub(super) fn stream_cancelled(&self) -> bool {
-        self.cooperative_drain.as_ref().is_some_and(|d| {
-            d.stream_cancelled(
-                self.header.stage_id,
-                self.header.task_id,
-                self.header.partition,
-            )
-        })
+        // Only batch senders represent data streams. Control frames retain their existing
+        // `(stage_id, partition = task_number)` address, which can numerically match a task 0
+        // data stream; treating that coincidence as a cancel would drop a plan, work unit, or
+        // metrics frame.
+        if !matches!(self.header.kind(), Ok(MppFrameKind::Batch)) {
+            return false;
+        }
+        self.cooperative_drain
+            .as_ref()
+            .is_some_and(|d| d.stream_cancelled(self.header.data_stream()))
     }
 
     /// Attach a [`CooperativeDrainSet`] so `Self::send_batch_traced`'s spin
@@ -1057,9 +1103,8 @@ impl MppSender {
     /// makes the leader's wait-for-workers error out rather than hang.
     /// Send a `Cancel` frame for one task-aware stream. Used by the shared-memory runtime when
     /// several tasks on one producer proc have distinct streams for the same output partition.
-    pub fn try_send_cancel(&self, stage_id: u32, task_id: u32, partition: u32) {
-        let header =
-            MppFrameHeader::cancel(stage_id, task_id, partition, self.header.sender_proc());
+    pub fn try_send_cancel(&self, stream: MppDataStreamKey) {
+        let header = MppFrameHeader::cancel(stream, self.header.sender_proc());
         let mut buf = [0u8; MPP_FRAME_HEADER_SIZE];
         header.write_to(&mut buf);
         for _ in 0..MAX_CONTROL_SEND_SPINS {
@@ -1077,9 +1122,7 @@ impl MppSender {
         stats: &mut SendBatchStats,
     ) -> Result<(), DataFusionError> {
         encode_eof_frame_into(
-            self.header.stage_id,
-            self.header.task_id,
-            self.header.partition,
+            self.header.data_stream(),
             self.header.sender_proc(),
             scratch,
         )?;
@@ -1162,12 +1205,7 @@ impl MppSender {
                 "mpp: channel frame bound {cap} cannot fit a chunk header"
             )));
         };
-        let header = MppFrameHeader::chunk(
-            self.header.stage_id,
-            self.header.task_id,
-            self.header.partition,
-            self.header.sender_proc(),
-        );
+        let header = MppFrameHeader::chunk(self.header.data_stream(), self.header.sender_proc());
         let total_len = frame.len() as u64;
         let mut buf =
             Vec::with_capacity(MPP_FRAME_HEADER_SIZE + CHUNK_PREFIX_SIZE + chunk_data_max);
@@ -1228,11 +1266,7 @@ impl MppSender {
             // The consumer cancelled this stream, so end the send cleanly and let the producer
             // fragment complete. Checked before the send so a cancel that landed mid-spin stops
             // the next iteration.
-            if drain.stream_cancelled(
-                self.header.stage_id,
-                self.header.task_id,
-                self.header.partition,
-            ) {
+            if self.stream_cancelled() {
                 return Ok(false);
             }
             if self.spin_try_send_bytes(scratch).await? {
@@ -1432,7 +1466,7 @@ pub(super) struct MppReceiver {
     /// from the same proc may. A prefix abandoned mid-frame (the producer observed the
     /// stream's cancel) sits here until the stream's `Eof` clears it or a fresh frame for
     /// the stream restarts at offset 0.
-    assemblies: Mutex<HashMap<(u32, u32, u32, u32), FrameAssembly>>,
+    assemblies: Mutex<HashMap<PhysicalStreamKey, FrameAssembly>>,
 }
 
 /// One stream's partially reassembled oversized frame.
@@ -1496,12 +1530,13 @@ impl MppReceiver {
         if kind != MppFrameKind::Chunk {
             if kind == MppFrameKind::Eof {
                 // The stream is over; drop any prefix its producer abandoned mid-frame.
-                self.assemblies.lock().unwrap().remove(&(
-                    header.sender_proc(),
-                    header.stage_id,
-                    header.task_id,
-                    header.partition,
-                ));
+                self.assemblies
+                    .lock()
+                    .unwrap()
+                    .remove(&PhysicalStreamKey::new(
+                        header.sender_proc(),
+                        header.data_stream(),
+                    ));
             }
             return Ok(Some(bytes));
         }
@@ -1516,12 +1551,7 @@ impl MppReceiver {
                 data.len()
             )));
         }
-        let key = (
-            header.sender_proc(),
-            header.stage_id,
-            header.task_id,
-            header.partition,
-        );
+        let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
         let mut assemblies = self.assemblies.lock().unwrap();
         if offset == 0 {
             // Start of a new frame; replaces any abandoned predecessor for the same stream.
@@ -1543,7 +1573,7 @@ impl MppReceiver {
             return Err(DataFusionError::Internal(format!(
                 "mpp: continuation chunk (offset {offset}) with no first chunk for \
                  sender {} stage {} task {} partition {}",
-                key.0, key.1, key.2, key.3
+                key.sender_proc, key.stream.stage_id, key.stream.task_id, key.stream.partition,
             )));
         };
         if assembly.total_len != total_len || assembly.buf.len() != offset {
@@ -1626,7 +1656,7 @@ struct ChannelBufferRegistry {
     /// from every peer, so each `(stage, task, partition)` consumer gets its own per-sender
     /// buffer. This preserves the implicit "one stream per sender" semantics that
     /// `WorkerConnection::execute` consumers rely on.
-    map: HashMap<(u32, u32, u32, u32), Arc<DrainBuffer>>,
+    map: HashMap<PhysicalStreamKey, Arc<DrainBuffer>>,
     /// Scopes whose receiver detached (or errored) before draining cleanly. Channels fed by a
     /// dead scope fail at registration time too, so a consumer that registers after the detach
     /// does not wait on a channel nothing will ever fill.
@@ -1690,7 +1720,7 @@ pub struct DrainHandle {
     /// `Cancel` frames. A producer blocked on a full outbound checks it in its send spin and ends
     /// that stream cleanly, so a consumer that stopped reading early doesn't leave it spinning to
     /// the statement timeout.
-    cancelled_streams: Mutex<HashSet<(u32, u32, u32)>>,
+    cancelled_streams: Mutex<HashSet<MppDataStreamKey>>,
 }
 
 #[derive(Default)]
@@ -1792,37 +1822,16 @@ impl DrainHandle {
         }
     }
 
-    /// Record a `Cancel` frame: the consumer abandoned the `(stage_id, task_id, partition)` stream, so this
-    /// proc's producer of it stops. Idempotent.
-    #[cfg(test)]
-    fn note_cancel(&self, stage_id: u32, partition: u32) {
-        self.note_task_cancel(stage_id, 0, partition);
+    /// Record a `Cancel` frame: the consumer abandoned this data stream, so this proc's producer
+    /// of it stops. Idempotent.
+    fn note_cancel(&self, stream: MppDataStreamKey) {
+        self.cancelled_streams.lock().unwrap().insert(stream);
     }
 
-    fn note_task_cancel(&self, stage_id: u32, task_id: u32, partition: u32) {
-        self.cancelled_streams
-            .lock()
-            .unwrap()
-            .insert((stage_id, task_id, partition));
-    }
-
-    /// Whether a consumer cancelled the `(stage_id, task_id, partition)` stream. Read by the send spin to
-    /// end a producer's stream cleanly when the consumer stopped reading.
-    #[cfg(test)]
-    pub(super) fn stream_cancelled(&self, stage_id: u32, partition: u32) -> bool {
-        self.stream_task_cancelled(stage_id, 0, partition)
-    }
-
-    pub(super) fn stream_task_cancelled(
-        &self,
-        stage_id: u32,
-        task_id: u32,
-        partition: u32,
-    ) -> bool {
-        self.cancelled_streams
-            .lock()
-            .unwrap()
-            .contains(&(stage_id, task_id, partition))
+    /// Whether a consumer cancelled this data stream. Read by the send spin to end a producer's
+    /// stream cleanly when the consumer stopped reading.
+    pub(super) fn stream_cancelled(&self, stream: MppDataStreamKey) -> bool {
+        self.cancelled_streams.lock().unwrap().contains(&stream)
     }
 
     /// Take the receiving end of the `TaskMetrics` frame stream. The embedder (the leader)
@@ -1990,7 +1999,7 @@ impl DrainHandle {
             guard
                 .map
                 .iter()
-                .filter(|((sender_proc, _, _, _), _)| self.scope_for_sender(*sender_proc) == scope)
+                .filter(|(key, _)| self.scope_for_sender(key.sender_proc) == scope)
                 .map(|(_, buf)| buf.clone())
                 .collect::<Vec<_>>()
         };
@@ -2077,26 +2086,14 @@ impl DrainHandle {
         Ok(rx)
     }
 
-    /// Register (or look up) the channel buffer for `(sender_proc, stage_id, task_id, partition)`.
+    /// Register (or look up) the channel buffer for one producer's data stream.
     /// The returned `Arc<DrainBuffer>` is the canonical destination for frames matching
     /// that key: `try_drain_pass` pushes into the same entry on every `Batch { header, .. }`
     /// whose `header.sender_proc()` / `stage_id` / `partition` matches.
-    #[cfg(test)]
-    pub(super) fn register_channel(
+    pub(super) fn register_data_channel(
         &self,
         sender_proc: u32,
-        stage_id: u32,
-        partition: u32,
-    ) -> Arc<DrainBuffer> {
-        self.register_task_channel(sender_proc, stage_id, 0, partition)
-    }
-
-    pub(super) fn register_task_channel(
-        &self,
-        sender_proc: u32,
-        stage_id: u32,
-        task_id: u32,
-        partition: u32,
+        stream: MppDataStreamKey,
     ) -> Arc<DrainBuffer> {
         let mut guard = self
             .channel_buffers
@@ -2108,7 +2105,7 @@ impl DrainHandle {
         };
         let buf = guard
             .map
-            .entry((sender_proc, stage_id, task_id, partition))
+            .entry(PhysicalStreamKey::new(sender_proc, stream))
             .or_insert_with(|| {
                 // num_sources stays 1: each (sender_proc, stage, task, partition) tuple has
                 // exactly one upstream (the named sender), even though the underlying
@@ -2186,21 +2183,13 @@ impl DrainHandle {
             for _ in 0..MAX_BATCHES_PER_SOURCE_PER_PASS {
                 match rx.try_recv_batch() {
                     RecvBatchOutcome::Batch { header, batch } => {
-                        let buf = self.register_task_channel(
-                            header.sender_proc(),
-                            header.stage_id,
-                            header.task_id,
-                            header.partition,
-                        );
+                        let buf =
+                            self.register_data_channel(header.sender_proc(), header.data_stream());
                         buf.push_batch(batch);
                     }
                     RecvBatchOutcome::Eof { header } => {
-                        let buf = self.register_task_channel(
-                            header.sender_proc(),
-                            header.stage_id,
-                            header.task_id,
-                            header.partition,
-                        );
+                        let buf =
+                            self.register_data_channel(header.sender_proc(), header.data_stream());
                         buf.notify_source_done();
                         // Other channels may still flow on this queue, so the receiver slot
                         // stays live.
@@ -2225,7 +2214,7 @@ impl DrainHandle {
                         self.route_execute_task(header.stage_id, header.partition, frame);
                     }
                     RecvBatchOutcome::Cancel { header } => {
-                        self.note_task_cancel(header.stage_id, header.task_id, header.partition);
+                        self.note_cancel(header.data_stream());
                     }
                     RecvBatchOutcome::Empty => break,
                     RecvBatchOutcome::Detached => {
@@ -2411,7 +2400,10 @@ mod tests {
         /// Construct a sender with the default `(stage_id=0, task_id=0, partition=0)` header. Used where
         /// the header carries no actionable routing info.
         fn new(channel: Arc<dyn BatchChannelSender>) -> Self {
-            Self::with_header(channel, MppFrameHeader::batch(0, 0, 0, 0))
+            Self::with_header(
+                channel,
+                MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0),
+            )
         }
 
         /// Stats-less wrapper around `send_batch_traced`. Production call sites
@@ -2573,7 +2565,7 @@ mod tests {
     #[test]
     fn frame_round_trips_a_batch_with_header() {
         let orig = sample_batch(64);
-        let header = MppFrameHeader::batch(7, 0, 3, 0);
+        let header = MppFrameHeader::batch(MppDataStreamKey::new(7, 0, 3), 0);
         let mut buf = Vec::with_capacity(1024);
         encode_frame_into(header, &orig, &mut buf).expect("encode_frame");
 
@@ -2594,18 +2586,21 @@ mod tests {
     #[test]
     fn frame_round_trips_eof() {
         let mut buf = Vec::new();
-        encode_eof_frame_into(2, 0, 5, 0, &mut buf).expect("encode_eof");
+        encode_eof_frame_into(MppDataStreamKey::new(2, 0, 5), 0, &mut buf).expect("encode_eof");
         assert_eq!(buf.len(), MPP_FRAME_HEADER_SIZE);
 
         let (header, body) = decode_frame(&buf).expect("decode_frame");
-        assert_eq!(header, MppFrameHeader::eof(2, 0, 5, 0));
+        assert_eq!(
+            header,
+            MppFrameHeader::eof(MppDataStreamKey::new(2, 0, 5), 0)
+        );
         assert_eq!(header.kind().unwrap(), MppFrameKind::Eof);
         assert!(matches!(body, FrameBody::Eof));
     }
 
     #[test]
     fn frame_round_trips_cancel() {
-        let header = MppFrameHeader::cancel(4, 0, 2, 0);
+        let header = MppFrameHeader::cancel(MppDataStreamKey::new(4, 0, 2), 0);
         let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
         header.write_to(&mut buf);
 
@@ -2620,13 +2615,33 @@ mod tests {
     #[test]
     fn drain_records_cancel_scoped_to_its_stream() {
         let drain = DrainHandle::cooperative(0, Vec::new());
-        assert!(!drain.stream_cancelled(7, 1));
-        drain.note_cancel(7, 1);
-        assert!(drain.stream_cancelled(7, 1));
-        // A cancel for one stream leaves the others alive, the way gRPC closes one stream: same
-        // stage but a different partition, and a different stage, both stay live.
-        assert!(!drain.stream_cancelled(7, 2));
-        assert!(!drain.stream_cancelled(8, 1));
+        let cancelled = MppDataStreamKey::new(7, 0, 1);
+        assert!(!drain.stream_cancelled(cancelled));
+        drain.note_cancel(cancelled);
+        assert!(drain.stream_cancelled(cancelled));
+        // A cancel for one stream leaves the others alive, including a sibling task with the
+        // same stage and partition.
+        assert!(!drain.stream_cancelled(MppDataStreamKey::new(7, 3, 1)));
+        assert!(!drain.stream_cancelled(MppDataStreamKey::new(8, 0, 1)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_sender_ignores_matching_data_stream_cancel() {
+        let drain = Arc::new(DrainHandle::cooperative(0, Vec::new()));
+        // A control frame for task 1 uses the legacy header address `(stage 7, task_id 0,
+        // partition 1)`. It must not be mistaken for task 0's output partition 1.
+        drain.note_cancel(MppDataStreamKey::new(7, 0, 1));
+        let (tx, _rx) = in_proc_channel(1);
+        let sender = MppSender::with_header(Arc::new(tx), MppFrameHeader::task_metrics(7, 1, 0))
+            .with_cooperative_drain(drain as Arc<dyn CooperativeDrainSet>);
+
+        let mut stats = SendBatchStats::default();
+        assert!(
+            sender
+                .spin_send_frame(&[0xCA, 0xFE], &mut stats)
+                .await
+                .expect("control frame must not observe data cancellation")
+        );
     }
 
     /// The producer-side half of the early-termination fix: a producer blocked on a full outbound
@@ -2643,13 +2658,16 @@ mod tests {
             vec![(ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox_rx)))],
         ));
         // Producer of the `(stage 7, partition 0)` stream.
-        let sender = MppSender::with_header(Arc::new(out_tx), MppFrameHeader::batch(7, 0, 0, 1))
-            .with_cooperative_drain(Arc::clone(&drain) as Arc<dyn CooperativeDrainSet>);
+        let sender = MppSender::with_header(
+            Arc::new(out_tx),
+            MppFrameHeader::batch(MppDataStreamKey::new(7, 0, 0), 1),
+        )
+        .with_cooperative_drain(Arc::clone(&drain) as Arc<dyn CooperativeDrainSet>);
 
         // The consumer abandons that stream (it stopped reading before EOF): a `Cancel` reaches the
         // inbox.
         let mut buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
-        MppFrameHeader::cancel(7, 0, 0, 0).write_to(&mut buf);
+        MppFrameHeader::cancel(MppDataStreamKey::new(7, 0, 0), 0).write_to(&mut buf);
         inbox_tx.send_bytes(&buf).unwrap();
 
         let mut stats = SendBatchStats::default();
@@ -2913,7 +2931,8 @@ mod tests {
     fn frame_sender_proc_round_trip() {
         // sender_proc lives in flags bits 16..32 and shouldn't collide with kind or reserved.
         for &sp in &[0u32, 1, 7, 255, 256, 1023, 65534, MPP_MAX_SENDER_PROC] {
-            let header = MppFrameHeader::batch(11, 0, 5, sp);
+            let stream = MppDataStreamKey::new(11, 0, 5);
+            let header = MppFrameHeader::batch(stream, sp);
             assert_eq!(header.sender_proc(), sp, "batch round-trip sp={sp}");
             assert_eq!(header.kind().unwrap(), MppFrameKind::Batch);
 
@@ -2924,7 +2943,7 @@ mod tests {
             assert_eq!(parsed.sender_proc(), sp, "decoded batch sender_proc");
 
             let mut eof_buf = Vec::new();
-            encode_eof_frame_into(11, 0, 5, sp, &mut eof_buf).expect("encode eof");
+            encode_eof_frame_into(stream, sp, &mut eof_buf).expect("encode eof");
             let (parsed_eof, _) = decode_frame(&eof_buf).expect("decode eof");
             assert_eq!(parsed_eof.sender_proc(), sp, "decoded eof sender_proc");
             assert_eq!(parsed_eof.kind().unwrap(), MppFrameKind::Eof);
@@ -2934,7 +2953,7 @@ mod tests {
     #[test]
     fn frame_eof_with_payload_is_rejected() {
         let mut buf = Vec::with_capacity(32);
-        encode_eof_frame_into(0, 0, 0, 0, &mut buf).expect("encode_eof");
+        encode_eof_frame_into(MppDataStreamKey::new(0, 0, 0), 0, &mut buf).expect("encode_eof");
         buf.push(0xAB); // smuggle a payload byte after the Eof header
         let err = decode_frame(&buf).expect_err("Eof+payload must fail");
         assert!(format!("{err}").contains("payload-less frame carries payload"));
@@ -2945,7 +2964,12 @@ mod tests {
         let mut buf = Vec::with_capacity(1024);
         for rows in [0, 1, 7, 64, 1024] {
             let orig = sample_batch(rows);
-            encode_frame_into(MppFrameHeader::batch(0, 0, 0, 0), &orig, &mut buf).expect("encode");
+            encode_frame_into(
+                MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0),
+                &orig,
+                &mut buf,
+            )
+            .expect("encode");
             let (_header, body) = decode_frame(&buf).expect("decode");
             let FrameBody::Batch(decoded) = body else {
                 panic!("Batch frame must carry a batch payload");
@@ -3054,7 +3078,12 @@ mod tests {
         // learns to truncate sliced buffers, this assert flags the test (and the compact
         // step's main motivation) for review.
         let mut probe = Vec::new();
-        encode_frame_into(MppFrameHeader::batch(3, 0, 7, 0), &sliced, &mut probe).expect("probe");
+        encode_frame_into(
+            MppFrameHeader::batch(MppDataStreamKey::new(3, 0, 7), 0),
+            &sliced,
+            &mut probe,
+        )
+        .expect("probe");
         assert!(
             probe.len() > cap,
             "premise: sliced encode ({} bytes) must exceed cap ({cap})",
@@ -3064,7 +3093,7 @@ mod tests {
         let sink = BoundedSink::new(cap);
         let sender = MppSender::with_header(
             Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
-            MppFrameHeader::batch(3, 0, 7, 0),
+            MppFrameHeader::batch(MppDataStreamKey::new(3, 0, 7), 0),
         );
         sender.send_batch(&sliced).expect("chunked send");
 
@@ -3114,7 +3143,7 @@ mod tests {
         let sink = BoundedSink::new(cap);
         let sender = MppSender::with_header(
             Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
-            MppFrameHeader::batch(1, 0, 1, 0),
+            MppFrameHeader::batch(MppDataStreamKey::new(1, 0, 1), 0),
         );
         sender.send_batch(&sliced).expect("view-array chunked send");
 
@@ -3146,7 +3175,7 @@ mod tests {
         let sink = BoundedSink::new(cap);
         let sender = MppSender::with_header(
             Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
-            MppFrameHeader::batch(0, 0, 0, 0),
+            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0),
         );
         sender.send_batch(&batch).expect("giant row streams");
 
@@ -3165,58 +3194,80 @@ mod tests {
         assert_eq!(strings.value(0), value);
     }
 
-    /// Chunked frames from two streams of one proc may interleave on the shared inbox; the
-    /// per-stream reassembly keys keep them apart, and a complete frame passes through the
-    /// middle of an assembly untouched.
+    /// Chunked frames from two tasks on one proc may interleave on the shared inbox. Their stage
+    /// and output partition deliberately match, so only task identity keeps their reassembly
+    /// buffers apart.
     #[test]
     fn chunk_reassembly_keys_by_stream() {
         let sender_proc = 2;
+        let stream_a = MppDataStreamKey::new(1, 0, 1);
+        let stream_b = MppDataStreamKey::new(1, 3, 1);
         let inner_a = {
             let mut buf = Vec::new();
             encode_frame_into(
-                MppFrameHeader::batch(1, 0, 1, sender_proc),
+                MppFrameHeader::batch(stream_a, sender_proc),
                 &sample_batch(4),
                 &mut buf,
             )
             .expect("encode inner A");
             buf
         };
-        let chunk_header = MppFrameHeader::chunk(1, 0, 1, sender_proc);
-        let split_at = inner_a.len() / 2;
+        let inner_b = {
+            let mut buf = Vec::new();
+            encode_frame_into(
+                MppFrameHeader::batch(stream_b, sender_proc),
+                &sample_batch(7),
+                &mut buf,
+            )
+            .expect("encode inner B");
+            buf
+        };
+        let a_split = inner_a.len() / 2;
+        let b_split = inner_b.len() / 2;
         let mut a0 = Vec::new();
         encode_chunk_frame_into(
-            chunk_header,
+            MppFrameHeader::chunk(stream_a, sender_proc),
             inner_a.len() as u64,
             0,
-            &inner_a[..split_at],
+            &inner_a[..a_split],
             &mut a0,
         );
         let mut a1 = Vec::new();
         encode_chunk_frame_into(
-            chunk_header,
+            MppFrameHeader::chunk(stream_a, sender_proc),
             inner_a.len() as u64,
-            split_at as u64,
-            &inner_a[split_at..],
+            a_split as u64,
+            &inner_a[a_split..],
             &mut a1,
         );
-        let mut b = Vec::new();
-        encode_frame_into(
-            MppFrameHeader::batch(1, 0, 2, sender_proc),
-            &sample_batch(7),
-            &mut b,
-        )
-        .expect("encode B");
+        let mut b0 = Vec::new();
+        encode_chunk_frame_into(
+            MppFrameHeader::chunk(stream_b, sender_proc),
+            inner_b.len() as u64,
+            0,
+            &inner_b[..b_split],
+            &mut b0,
+        );
+        let mut b1 = Vec::new();
+        encode_chunk_frame_into(
+            MppFrameHeader::chunk(stream_b, sender_proc),
+            inner_b.len() as u64,
+            b_split as u64,
+            &inner_b[b_split..],
+            &mut b1,
+        );
 
-        let receiver = MppReceiver::new(ReplayChannel::over(vec![a0, b, a1]));
-        // B lands first: its complete frame doesn't wait on A's assembly.
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![a0, b0, a1, b1]));
         let RecvBatchOutcome::Batch { header, batch } = receiver.try_recv_batch() else {
-            panic!("expected B");
+            panic!("expected reassembled task 0 batch");
         };
-        assert_eq!((header.partition, batch.num_rows()), (2, 7));
+        assert_eq!(header.data_stream(), stream_a);
+        assert_eq!(batch.num_rows(), 4);
         let RecvBatchOutcome::Batch { header, batch } = receiver.try_recv_batch() else {
-            panic!("expected reassembled A");
+            panic!("expected reassembled task 3 batch");
         };
-        assert_eq!((header.partition, batch.num_rows()), (1, 4));
+        assert_eq!(header.data_stream(), stream_b);
+        assert_eq!(batch.num_rows(), 7);
         assert!(matches!(receiver.try_recv_batch(), RecvBatchOutcome::Empty));
     }
 
@@ -3227,12 +3278,12 @@ mod tests {
         let sender_proc = 3;
         let mut inner = Vec::new();
         encode_frame_into(
-            MppFrameHeader::batch(5, 0, 0, sender_proc),
+            MppFrameHeader::batch(MppDataStreamKey::new(5, 0, 0), sender_proc),
             &sample_batch(4),
             &mut inner,
         )
         .expect("encode inner");
-        let chunk_header = MppFrameHeader::chunk(5, 0, 0, sender_proc);
+        let chunk_header = MppFrameHeader::chunk(MppDataStreamKey::new(5, 0, 0), sender_proc);
         let mut partial = Vec::new();
         encode_chunk_frame_into(
             chunk_header,
@@ -3242,7 +3293,8 @@ mod tests {
             &mut partial,
         );
         let mut eof = Vec::new();
-        encode_eof_frame_into(5, 0, 0, sender_proc, &mut eof).expect("encode eof");
+        encode_eof_frame_into(MppDataStreamKey::new(5, 0, 0), sender_proc, &mut eof)
+            .expect("encode eof");
         // A fresh frame for the stream after the abandonment restarts cleanly at offset 0.
         let mut whole = Vec::new();
         encode_chunk_frame_into(chunk_header, inner.len() as u64, 0, &inner, &mut whole);
@@ -3267,7 +3319,7 @@ mod tests {
     #[test]
     fn chunk_out_of_sequence_errors() {
         let sender_proc = 4;
-        let chunk_header = MppFrameHeader::chunk(1, 0, 0, sender_proc);
+        let chunk_header = MppFrameHeader::chunk(MppDataStreamKey::new(1, 0, 0), sender_proc);
         let mut orphan = Vec::new();
         encode_chunk_frame_into(chunk_header, 1000, 500, &[0u8; 16], &mut orphan);
         let receiver = MppReceiver::new(ReplayChannel::over(vec![orphan]));
@@ -3558,8 +3610,12 @@ mod tests {
         let mut enc_bytes = 0usize;
         let mut enc_buf = Vec::with_capacity(1024);
         for _ in 0..batches {
-            encode_frame_into(MppFrameHeader::batch(0, 0, 0, 0), &template, &mut enc_buf)
-                .expect("encode");
+            encode_frame_into(
+                MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0),
+                &template,
+                &mut enc_buf,
+            )
+            .expect("encode");
             enc_bytes += enc_buf.len();
         }
         let enc_elapsed = enc_start.elapsed();
@@ -3644,7 +3700,8 @@ mod tests {
     // ---------------------------------------------------------------------
     // Per-`(stage_id, task_id, partition)` channel buffer registry on the cooperative `DrainHandle`.
     //
-    // Producers stamp `MppFrameHeader::batch(stage_id, task_id, partition, sender)` on
+    // Producers stamp `MppFrameHeader::batch(MppDataStreamKey::new(stage_id, task_id,
+    // partition), sender)` on
     // every outgoing frame, and
     // the receiver-side cooperative drain demuxes by header into a channel buffer per
     // `(stage_id, task_id, partition)`. These tests use the `in_proc_channel` backend to drive
@@ -3671,8 +3728,8 @@ mod tests {
         // teardown-EOF contract.
         let (tx, rx) = in_proc_channel(8);
         let base = MppSender::new(Arc::new(tx));
-        let s00 = base.clone_with_header(MppFrameHeader::batch(0, 0, 0, 0));
-        let s01 = base.clone_with_header(MppFrameHeader::batch(0, 0, 1, 0));
+        let s00 = base.clone_with_header(MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0));
+        let s01 = base.clone_with_header(MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 1), 0));
         let receiver = MppReceiver::new(Box::new(rx));
         let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
@@ -3683,8 +3740,8 @@ mod tests {
         drop(s01);
         drop(base);
 
-        let buf00 = handle.register_channel(0, 0, 0);
-        let buf01 = handle.register_channel(0, 0, 1);
+        let buf00 = handle.register_data_channel(0, MppDataStreamKey::new(0, 0, 0));
+        let buf01 = handle.register_data_channel(0, MppDataStreamKey::new(0, 0, 1));
 
         drain_until_detached(&handle);
 
@@ -3708,19 +3765,25 @@ mod tests {
         // runs `cancel_channel_buffers`.
         let (tx, rx) = in_proc_channel(8);
         let tx_arc: Arc<dyn BatchChannelSender> = Arc::new(tx);
-        let s00 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(0, 0, 0, 0));
-        let s01 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(0, 0, 1, 0));
+        let s00 = MppSender::with_header(
+            Arc::clone(&tx_arc),
+            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0),
+        );
+        let s01 = MppSender::with_header(
+            Arc::clone(&tx_arc),
+            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 1), 0),
+        );
         let receiver = MppReceiver::new(Box::new(rx));
         let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
         s00.send_batch(&sample_batch(4)).unwrap();
         let mut eof_buf = Vec::new();
-        encode_eof_frame_into(0, 0, 0, 0, &mut eof_buf).unwrap();
+        encode_eof_frame_into(MppDataStreamKey::new(0, 0, 0), 0, &mut eof_buf).unwrap();
         tx_arc.send_bytes(&eof_buf).unwrap();
         s01.send_batch(&sample_batch(6)).unwrap();
 
-        let buf00 = handle.register_channel(0, 0, 0);
-        let buf01 = handle.register_channel(0, 0, 1);
+        let buf00 = handle.register_data_channel(0, MppDataStreamKey::new(0, 0, 0));
+        let buf01 = handle.register_data_channel(0, MppDataStreamKey::new(0, 0, 1));
 
         drop(s00);
         drop(s01);
@@ -3749,22 +3812,28 @@ mod tests {
         // 3's stream. This is the exact failure mode that task_id in the frame key prevents.
         let (tx, rx) = in_proc_channel(8);
         let tx_arc: Arc<dyn BatchChannelSender> = Arc::new(tx);
-        let task_0 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(7, 0, 0, 1));
-        let task_3 = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(7, 3, 0, 1));
+        let task_0 = MppSender::with_header(
+            Arc::clone(&tx_arc),
+            MppFrameHeader::batch(MppDataStreamKey::new(7, 0, 0), 1),
+        );
+        let task_3 = MppSender::with_header(
+            Arc::clone(&tx_arc),
+            MppFrameHeader::batch(MppDataStreamKey::new(7, 3, 0), 1),
+        );
         let receiver = MppReceiver::new(Box::new(rx));
         let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
         task_0.send_batch(&sample_batch(2)).unwrap();
         task_3.send_batch(&sample_batch(3)).unwrap();
         let mut eof = Vec::new();
-        encode_eof_frame_into(7, 0, 0, 1, &mut eof).unwrap();
+        encode_eof_frame_into(MppDataStreamKey::new(7, 0, 0), 1, &mut eof).unwrap();
         tx_arc.send_bytes(&eof).unwrap();
         task_3.send_batch(&sample_batch(5)).unwrap();
-        encode_eof_frame_into(7, 3, 0, 1, &mut eof).unwrap();
+        encode_eof_frame_into(MppDataStreamKey::new(7, 3, 0), 1, &mut eof).unwrap();
         tx_arc.send_bytes(&eof).unwrap();
 
-        let task_0_buf = handle.register_task_channel(1, 7, 0, 0);
-        let task_3_buf = handle.register_task_channel(1, 7, 3, 0);
+        let task_0_buf = handle.register_data_channel(1, MppDataStreamKey::new(7, 0, 0));
+        let task_3_buf = handle.register_data_channel(1, MppDataStreamKey::new(7, 3, 0));
         drain_until_detached(&handle);
 
         match task_0_buf.try_pop() {
@@ -3789,8 +3858,9 @@ mod tests {
         let receiver = MppReceiver::new(Box::new(rx));
         let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
-        let first = handle.register_channel(0, 2, 3);
-        let second = handle.register_channel(0, 2, 3);
+        let stream = MppDataStreamKey::new(2, 0, 3);
+        let first = handle.register_data_channel(0, stream);
+        let second = handle.register_data_channel(0, stream);
         assert!(Arc::ptr_eq(&first, &second));
     }
 
@@ -3800,10 +3870,14 @@ mod tests {
         // The registry's compound key keeps them on separate channel buffers.
         let (tx, rx) = in_proc_channel(8);
         let tx_arc: Arc<dyn BatchChannelSender> = Arc::new(tx);
-        let s_stage0 =
-            MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(0, 0, 0, 0));
-        let s_stage1 =
-            MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(1, 0, 0, 0));
+        let s_stage0 = MppSender::with_header(
+            Arc::clone(&tx_arc),
+            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0),
+        );
+        let s_stage1 = MppSender::with_header(
+            Arc::clone(&tx_arc),
+            MppFrameHeader::batch(MppDataStreamKey::new(1, 0, 0), 0),
+        );
         let receiver = MppReceiver::new(Box::new(rx));
         let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
@@ -3814,8 +3888,8 @@ mod tests {
         drop(s_stage1);
         drop(tx_arc);
 
-        let buf0 = handle.register_channel(0, 0, 0);
-        let buf1 = handle.register_channel(0, 1, 0);
+        let buf0 = handle.register_data_channel(0, MppDataStreamKey::new(0, 0, 0));
+        let buf1 = handle.register_data_channel(0, MppDataStreamKey::new(1, 0, 0));
 
         drain_until_detached(&handle);
 
@@ -3840,8 +3914,8 @@ mod tests {
         let receiver = MppReceiver::new(Box::new(rx));
         let handle = DrainHandle::cooperative(0, vec![(ReceiverScope::Inbox, receiver)]);
 
-        let buf_a = handle.register_channel(0, 0, 0);
-        let buf_b = handle.register_channel(0, 7, 3);
+        let buf_a = handle.register_data_channel(0, MppDataStreamKey::new(0, 0, 0));
+        let buf_b = handle.register_data_channel(0, MppDataStreamKey::new(7, 0, 3));
         // No data ever flows; the handle is just dropped.
         drop(handle);
 

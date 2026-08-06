@@ -54,8 +54,8 @@ use crate::{
 
 use super::AliveFlag;
 use super::transport::{
-    CooperativeDrainSet, DrainHandle, DrainItem, Interrupt, MppFrameHeader, MppSender,
-    SendBatchStats, SetPlanFrame,
+    CooperativeDrainSet, DrainHandle, DrainItem, Interrupt, MppDataStreamKey, MppFrameHeader,
+    MppSender, SendBatchStats, SetPlanFrame,
 };
 
 /// A proc's outbound senders to each peer inbox, shared between the mesh (for `Cancel` frames) and
@@ -225,14 +225,14 @@ impl MppMesh {
     ///
     /// Stream-level so any consumer can cancel its own input: every `(producer_proc, stage, task,
     /// partition)` channel has a single consumer, so one stream's drop never cuts off a sibling's.
-    pub fn cancel_stream(&self, producer_proc: u32, stage_id: u32, task_id: u32, partition: u32) {
+    pub fn cancel_stream(&self, producer_proc: u32, stream: MppDataStreamKey) {
         let guard = self.cancel_senders.lock().unwrap();
         let Some(senders) = guard.as_ref() else {
             return;
         };
         let senders = senders.lock().unwrap();
         if let Some(Some(sender)) = senders.get(producer_proc as usize) {
-            sender.try_send_cancel(stage_id, task_id, partition);
+            sender.try_send_cancel(stream);
         }
     }
 
@@ -316,9 +316,8 @@ impl CooperativeDrainSet for MppMesh {
         self.interrupt.check()
     }
 
-    fn stream_cancelled(&self, stage_id: u32, task_id: u32, partition: u32) -> bool {
-        self.inbound_receiver
-            .stream_task_cancelled(stage_id, task_id, partition)
+    fn stream_cancelled(&self, stream: MppDataStreamKey) -> bool {
+        self.inbound_receiver.stream_cancelled(stream)
     }
 }
 
@@ -505,9 +504,7 @@ impl WorkerChannel for ShmWorkerChannel {
             streams.push(pull_partition_stream(
                 Arc::clone(&self.mesh),
                 sender_proc,
-                stage_id,
-                task_number,
-                partition_u32,
+                MppDataStreamKey::new(stage_id, task_number, partition_u32),
             ));
         }
         Ok(streams)
@@ -532,9 +529,7 @@ impl WorkerChannel for ShmWorkerChannel {
 fn pull_partition_stream(
     mesh: Arc<MppMesh>,
     producer_proc: u32,
-    stage_id: u32,
-    task_id: u32,
-    partition: u32,
+    stream: MppDataStreamKey,
 ) -> BoxStream<'static, Result<RecordBatch>> {
     // One drain per process, shared across all sender_procs. The channel-buffer registry keys by
     // `(sender_proc, stage_id, task_id, partition)` so this consumer still sees only its named
@@ -542,19 +537,20 @@ fn pull_partition_stream(
     // even though the underlying inbox is shared with all peers.
     let drain = Arc::clone(mesh.inbound_receiver());
     log::debug!(
-        "shm transport execute: register channel sender_proc={producer_proc} stage_id={stage_id} \
-         task_id={task_id} partition={partition}"
+        "shm transport execute: register channel sender_proc={producer_proc} \
+         stage_id={} task_id={} partition={}",
+        stream.stage_id,
+        stream.task_id,
+        stream.partition,
     );
-    let buffer = drain.register_task_channel(producer_proc, stage_id, task_id, partition);
+    let buffer = drain.register_data_channel(producer_proc, stream);
     let stream = async_stream::stream! {
         // Any consumer cancels its own input stream when it drops early. The mesh no-ops the send
         // until the embedder wires this proc's outbound senders.
         let mut cancel_guard = StreamCancelGuard {
             mesh: Arc::clone(&mesh),
             producer_proc,
-            stage_id,
-            task_id,
-            partition,
+            stream,
             armed: true,
         };
         loop {
@@ -622,21 +618,14 @@ impl WorkerResolver for InProcessWorkerResolver {
 struct StreamCancelGuard {
     mesh: Arc<MppMesh>,
     producer_proc: u32,
-    stage_id: u32,
-    task_id: u32,
-    partition: u32,
+    stream: MppDataStreamKey,
     armed: bool,
 }
 
 impl Drop for StreamCancelGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.mesh.cancel_stream(
-                self.producer_proc,
-                self.stage_id,
-                self.task_id,
-                self.partition,
-            );
+            self.mesh.cancel_stream(self.producer_proc, self.stream);
         }
     }
 }

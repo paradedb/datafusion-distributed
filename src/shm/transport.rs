@@ -1090,8 +1090,6 @@ impl MppSender {
     /// spin, so a slot frees and the frame lands well inside the bound even when the inbox is
     /// backed up. The bound only runs out if the producer already exited or died, and a dead worker
     /// makes the leader's wait-for-workers error out rather than hang.
-    /// Send a `Cancel` frame for one task-aware stream. Used by the shared-memory runtime when
-    /// several tasks on one producer proc have distinct streams for the same output partition.
     pub fn try_send_cancel(&self, stream: MppDataStreamKey) {
         let header = MppFrameHeader::cancel(stream, self.header.sender_proc());
         let mut buf = [0u8; MPP_FRAME_HEADER_SIZE];

@@ -610,8 +610,8 @@ mod tests {
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
 
-    /// Total procs = leader (proc 0) + `N_WORKERS` producers. With round-robin `proc_for_task`,
-    /// worker proc `p` runs producer task `p - 1`.
+    /// Total procs = leader (proc 0) + `N_WORKERS` producers. `proc_for_task` maps task `i` to
+    /// proc `1 + i % N_WORKERS`, so one worker can own multiple logical tasks.
     const N_WORKERS: u32 = 3;
 
     fn table_schema() -> SchemaRef {
@@ -634,10 +634,6 @@ mod tests {
                 vec![batch]
             })
             .collect()
-    }
-
-    fn register_table(ctx: &SessionContext) {
-        register_table_with_partitions(ctx, N_WORKERS as i32);
     }
 
     fn register_table_with_partitions(ctx: &SessionContext, n_partitions: i32) {
@@ -1036,15 +1032,17 @@ mod tests {
         }
     }
 
-    /// A `GROUP BY` plans a nested `NetworkShuffleExec`, so this exercises hash-routed
-    /// worker-to-worker traffic and the self-loop sender, which the plain gather test never
-    /// touches. That routing is the main thing an upstream rebase can silently break.
+    /// A `GROUP BY` plans a nested `NetworkShuffleExec`, so this combines hash-routed
+    /// worker-to-worker traffic with five logical tasks on three worker processes. It exercises
+    /// the self-loop sender and the task-aware streams that plain gather and non-multiplexed
+    /// shuffle tests miss independently.
     #[tokio::test(flavor = "current_thread")]
-    async fn in_process_shuffle_query_matches_serial() {
+    async fn in_process_multiplexed_shuffle_query_matches_serial() {
         let query = "SELECT val, count(*) AS c FROM t GROUP BY val ORDER BY val";
+        const N_TASKS: usize = 5;
 
         let serial_ctx = SessionContext::new();
-        register_table(&serial_ctx);
+        register_table_with_partitions(&serial_ctx, N_TASKS as i32);
         let expected = serial_ctx
             .sql(query)
             .await
@@ -1055,7 +1053,13 @@ mod tests {
 
         let boot = bootstrap_mesh(N_WORKERS + 1);
         let captured = new_captured_plans();
-        let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
+        let leader_ctx = build_session_with_worker_and_partitions(
+            Arc::clone(&boot.leader_mesh),
+            Some(Arc::clone(&captured)),
+            N_TASKS,
+            N_TASKS,
+            N_TASKS as i32,
+        );
         let physical = leader_ctx
             .sql(query)
             .await
@@ -1071,11 +1075,32 @@ mod tests {
             "expected a hash-routed producer stage; got {:?}",
             entries.iter().map(|e| &e.routing).collect::<Vec<_>>()
         );
+        let multiplexed = entries
+            .iter()
+            .find(|entry| {
+                entry.task_count == N_TASKS
+                    && matches!(entry.routing, FragmentRouting::Hashed { .. })
+            })
+            .expect("five-task hash-routed producer stage");
+        assert_eq!(
+            fragments_for_proc(std::slice::from_ref(multiplexed), 1, N_WORKERS)
+                .iter()
+                .map(|fragment| fragment.task_idx)
+                .collect::<Vec<_>>(),
+            vec![0, 3],
+            "worker 1 must own two shuffled producer tasks"
+        );
 
         let mut workers = JoinSet::new();
         for (proc_idx, mesh, outbound) in boot.workers {
             let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
-            let session = build_session(Arc::clone(&mesh), None);
+            let session = build_session_with_worker_and_partitions(
+                Arc::clone(&mesh),
+                None,
+                N_WORKERS as usize,
+                N_TASKS,
+                N_WORKERS as i32,
+            );
             workers.spawn(run_worker_proc(
                 fragments,
                 outbound,

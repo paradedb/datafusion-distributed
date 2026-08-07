@@ -645,11 +645,6 @@ mod tests {
         ctx.register_table("t", Arc::new(table)).unwrap();
     }
 
-    fn replace_table_with_partitions(ctx: &SessionContext, n_partitions: i32) {
-        let _ = ctx.deregister_table("t").unwrap();
-        register_table_with_partitions(ctx, n_partitions);
-    }
-
     fn wide_table_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("val", DataType::Int32, false),
@@ -722,27 +717,21 @@ mod tests {
         mesh: Arc<MppMesh>,
         dispatch_capture: Option<CapturedPlans>,
     ) -> SessionContext {
-        build_session_with_target_partitions(mesh, dispatch_capture, N_WORKERS as usize)
-    }
-
-    fn build_session_with_target_partitions(
-        mesh: Arc<MppMesh>,
-        dispatch_capture: Option<CapturedPlans>,
-        target_partitions: usize,
-    ) -> SessionContext {
-        build_session_with_worker_and_target_partitions(
+        build_session_with_worker_and_partitions(
             mesh,
             dispatch_capture,
             N_WORKERS as usize,
-            target_partitions,
+            N_WORKERS as usize,
+            N_WORKERS as i32,
         )
     }
 
-    fn build_session_with_worker_and_target_partitions(
+    fn build_session_with_worker_and_partitions(
         mesh: Arc<MppMesh>,
         dispatch_capture: Option<CapturedPlans>,
         planner_workers: usize,
         target_partitions: usize,
+        table_partitions: i32,
     ) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(target_partitions);
         let mut builder = SessionStateBuilder::new()
@@ -769,7 +758,7 @@ mod tests {
         );
         let state = builder.build();
         let ctx = SessionContext::new_with_state(state);
-        register_table(&ctx);
+        register_table_with_partitions(&ctx, table_partitions);
         ctx
     }
 
@@ -861,13 +850,13 @@ mod tests {
 
         // Build the distributed plan once on the leader session; producers and consumer share it.
         let captured = new_captured_plans();
-        let leader_ctx = build_session_with_worker_and_target_partitions(
+        let leader_ctx = build_session_with_worker_and_partitions(
             Arc::clone(&leader_mesh),
             Some(Arc::clone(&captured)),
             N_TASKS,
             N_TASKS,
+            N_TASKS as i32,
         );
-        replace_table_with_partitions(&leader_ctx, N_TASKS as i32);
         let physical = leader_ctx
             .sql(query)
             .await
@@ -909,7 +898,13 @@ mod tests {
         let mut workers = JoinSet::new();
         for (proc_idx, mesh, outbound) in worker_setups {
             let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
-            let session = build_session_with_target_partitions(Arc::clone(&mesh), None, N_TASKS);
+            let session = build_session_with_worker_and_partitions(
+                Arc::clone(&mesh),
+                None,
+                N_WORKERS as usize,
+                N_TASKS,
+                N_WORKERS as i32,
+            );
             workers.spawn(run_worker_proc(
                 fragments,
                 outbound,

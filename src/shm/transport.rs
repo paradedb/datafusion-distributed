@@ -37,9 +37,12 @@ use datafusion::arrow::array::{
     ArrayRef, BinaryViewArray, RecordBatch, StringViewArray, UInt64Array,
 };
 use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::arrow::ipc::writer::{
+    DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions, StreamWriter,
+    write_message,
+};
 use datafusion::common::DataFusionError;
 use prost::Message;
 
@@ -58,8 +61,10 @@ const MPP_FRAME_HEADER_SIZE: usize = 20;
 
 /// Kind of payload following [`MppFrameHeader`].
 ///
-/// `Batch` is the common case. The header is followed by an Arrow IPC stream containing one
-/// `RecordBatch`. `Eof` carries no payload. It signals the receiver that the named
+/// `Batch` is the common case: after an initial [`MppFrameKind::Schema`] frame on the stream,
+/// batch payloads are Arrow IPC record-batch messages only (no repeated schema). A legacy
+/// sender may still embed a full IPC stream in every batch; receivers accept that when no schema
+/// state exists yet. `Eof` carries no payload.
 /// `(stage_id, task_id, partition)` channel is done, even though the underlying shm_mq queue may still
 /// carry frames for other channels.
 ///
@@ -97,6 +102,10 @@ pub(super) enum MppFrameKind {
     /// to the consumer, so it sees the actual crash reason instead of a
     /// detached channel.
     TaskError = 9,
+    /// Arrow IPC stream schema message for `(stage_id, task_id, partition)`. Sent once per
+    /// logical shuffle stream; following [`MppFrameKind::Batch`] frames carry record-batch
+    /// bodies only (no repeated schema).
+    Schema = 10,
 }
 
 /// Payload of a `SetPlan` frame: the plan-delivery message a worker needs to run one task,
@@ -326,6 +335,17 @@ impl MppFrameHeader {
         }
     }
 
+    /// Build a `Schema` header for one data stream stamped with `sender_proc`.
+    pub fn schema(stream: MppDataStreamKey, sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::Schema, sender_proc),
+            stage_id: stream.stage_id,
+            task_id: stream.task_id,
+            partition: stream.partition,
+        }
+    }
+
     /// Build an `Eof` header for the given data stream stamped with `sender_proc`.
     /// Carries no payload; receivers route it to the channel buffer's source-done counter.
     pub fn eof(stream: MppDataStreamKey, sender_proc: u32) -> Self {
@@ -466,6 +486,7 @@ impl MppFrameHeader {
             7 => Ok(MppFrameKind::Chunk),
             8 => Ok(MppFrameKind::ExecuteTask),
             9 => Ok(MppFrameKind::TaskError),
+            10 => Ok(MppFrameKind::Schema),
             other => Err(DataFusionError::Internal(format!(
                 "mpp: unknown frame kind {other:#x}"
             ))),
@@ -530,6 +551,7 @@ impl MppFrameHeader {
 ///
 /// Caller is expected to hold `buf` alive across many encodes so the peak-sized
 /// allocation amortizes (~500 KB/batch on the 25M GROUP BY bench).
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_frame_into(
     header: MppFrameHeader,
     batch: &RecordBatch,
@@ -542,6 +564,138 @@ fn encode_frame_into(
     writer.write(batch)?;
     writer.finish()?;
     Ok(())
+}
+
+/// Per-[`MppSender`] Arrow IPC stream encoder state. After the first [`MppFrameKind::Schema`]
+/// frame on a stream, batch frames omit the schema message and reuse dictionary tracker state.
+struct IpcStreamEncodeState {
+    schema_sent: bool,
+    schema: Option<SchemaRef>,
+    dictionary_tracker: DictionaryTracker,
+    data_gen: IpcDataGenerator,
+    write_options: IpcWriteOptions,
+    ipc_write_context: IpcWriteContext,
+}
+
+impl Default for IpcStreamEncodeState {
+    fn default() -> Self {
+        Self {
+            schema_sent: false,
+            schema: None,
+            dictionary_tracker: DictionaryTracker::new(false),
+            data_gen: IpcDataGenerator::default(),
+            write_options: IpcWriteOptions::default(),
+            ipc_write_context: IpcWriteContext::default(),
+        }
+    }
+}
+
+impl IpcStreamEncodeState {
+    fn reset_if_schema_changed(&mut self, batch_schema: SchemaRef) {
+        if self.schema_sent && self.schema.as_ref() != Some(&batch_schema) {
+            *self = Self::default();
+        }
+    }
+}
+
+fn encode_schema_frame_into(
+    stream: MppDataStreamKey,
+    sender_proc: u32,
+    schema: SchemaRef,
+    state: &mut IpcStreamEncodeState,
+    buf: &mut Vec<u8>,
+) -> Result<(), DataFusionError> {
+    buf.clear();
+    buf.resize(MPP_FRAME_HEADER_SIZE, 0);
+    MppFrameHeader::schema(stream, sender_proc).write_to(&mut buf[..MPP_FRAME_HEADER_SIZE]);
+    let encoded = state.data_gen.schema_to_bytes_with_dictionary_tracker(
+        schema.as_ref(),
+        &mut state.dictionary_tracker,
+        &state.write_options,
+    );
+    write_message(&mut *buf, encoded, &state.write_options)?;
+    state.schema_sent = true;
+    state.schema = Some(schema);
+    Ok(())
+}
+
+fn encode_batch_body_frame_into(
+    header: MppFrameHeader,
+    batch: &RecordBatch,
+    state: &mut IpcStreamEncodeState,
+    buf: &mut Vec<u8>,
+) -> Result<(), DataFusionError> {
+    buf.clear();
+    buf.resize(MPP_FRAME_HEADER_SIZE, 0);
+    header.write_to(&mut buf[..MPP_FRAME_HEADER_SIZE]);
+    let (dict_messages, batch_message) = state.data_gen.encode(
+        batch,
+        &mut state.dictionary_tracker,
+        &state.write_options,
+        &mut state.ipc_write_context,
+    )?;
+    for dict in dict_messages {
+        write_message(&mut *buf, dict, &state.write_options)?;
+    }
+    write_message(&mut *buf, batch_message, &state.write_options)?;
+    Ok(())
+}
+
+/// Arrow IPC stream prefix (schema message) retained after [`MppFrameKind::Schema`].
+struct StreamIpcDecodeState {
+    schema_stream_prefix: Vec<u8>,
+}
+
+fn ingest_schema_stream(
+    header: &MppFrameHeader,
+    payload: &[u8],
+    decoders: &mut HashMap<PhysicalStreamKey, StreamIpcDecodeState>,
+) -> Result<(), DataFusionError> {
+    let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
+    let reader = StreamReader::try_new(payload, None)?;
+    if reader.schema().fields().is_empty() {
+        return Err(DataFusionError::Execution(
+            "mpp: schema frame carried no Arrow IPC schema".into(),
+        ));
+    }
+    decoders.insert(
+        key,
+        StreamIpcDecodeState {
+            schema_stream_prefix: payload.to_vec(),
+        },
+    );
+    Ok(())
+}
+
+fn decode_batch_payload(
+    header: &MppFrameHeader,
+    payload: &[u8],
+    stream_decoders: Option<&mut HashMap<PhysicalStreamKey, StreamIpcDecodeState>>,
+) -> Result<RecordBatch, DataFusionError> {
+    if let Some(decoders) = stream_decoders {
+        let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
+        if let Some(state) = decoders.get(&key) {
+            let mut combined = Vec::with_capacity(state.schema_stream_prefix.len() + payload.len());
+            combined.extend_from_slice(&state.schema_stream_prefix);
+            combined.extend_from_slice(payload);
+            let mut reader = StreamReader::try_new(combined.as_slice(), None)?;
+            return reader
+                .next()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "mpp: batch frame carried no decodable Arrow IPC record batch".into(),
+                    )
+                })?
+                .map_err(DataFusionError::from);
+        }
+    }
+    let mut reader = StreamReader::try_new(payload, None)?;
+    reader
+        .next()
+        .ok_or_else(|| {
+            DataFusionError::Execution("mpp: empty arrow-ipc stream in decode_frame".into())
+        })?
+        .map_err(DataFusionError::from)
 }
 
 /// Copy `len` rows starting at `offset` into fresh, tightly-packed arrays. A plain
@@ -667,6 +821,7 @@ fn encode_prost_frame_into(
 #[derive(Debug)]
 enum FrameBody {
     Batch(RecordBatch),
+    Schema,
     Eof,
     WorkUnit(pb::WorkUnit),
     FeedEof,
@@ -679,7 +834,15 @@ enum FrameBody {
 
 /// Inverse of the frame encoders. Parses the 20-byte header and decodes the payload according
 /// to the kind. Receivers branch on the body to decide routing.
+#[cfg_attr(not(test), allow(dead_code))]
 fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionError> {
+    decode_frame_with_decoders(bytes, None)
+}
+
+fn decode_frame_with_decoders(
+    bytes: &[u8],
+    stream_decoders: Option<&mut HashMap<PhysicalStreamKey, StreamIpcDecodeState>>,
+) -> Result<(MppFrameHeader, FrameBody), DataFusionError> {
     let header = MppFrameHeader::parse(bytes)?;
     let payload = &bytes[MPP_FRAME_HEADER_SIZE..];
     match header.kind()? {
@@ -718,11 +881,16 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
             Ok((header, FrameBody::ExecuteTask(frame)))
         }
         MppFrameKind::Batch => {
-            let mut reader = StreamReader::try_new(payload, None)?;
-            let batch = reader.next().ok_or_else(|| {
-                DataFusionError::Execution("mpp: empty arrow-ipc stream in decode_frame".into())
-            })??;
+            let batch = decode_batch_payload(&header, payload, stream_decoders)?;
             Ok((header, FrameBody::Batch(batch)))
+        }
+        MppFrameKind::Schema => {
+            if payload.is_empty() {
+                return Err(DataFusionError::Internal(
+                    "mpp: schema frame carries no Arrow IPC payload".into(),
+                ));
+            }
+            Ok((header, FrameBody::Schema))
         }
         MppFrameKind::Chunk => Err(DataFusionError::Internal(
             "mpp: chunk frame reached decode_frame; chunks reassemble in MppReceiver first"
@@ -995,6 +1163,8 @@ pub struct MppSender {
     /// its `MppSender` clones behind shared borrows for the duration of
     /// `worker::run_worker_fragment`).
     scratch: std::cell::RefCell<Vec<u8>>,
+    /// Stateful Arrow IPC encoder for cross-process batch frames (schema once per stream).
+    ipc_encode: std::cell::RefCell<IpcStreamEncodeState>,
 }
 
 // SAFETY: only `scratch: RefCell<Vec<u8>>` and the trait-object `Arc`s are `!Sync`. Callers
@@ -1015,6 +1185,7 @@ impl MppSender {
             cooperative_drain: None,
             header,
             scratch: std::cell::RefCell::new(Vec::new()),
+            ipc_encode: std::cell::RefCell::new(IpcStreamEncodeState::default()),
         }
     }
 
@@ -1028,6 +1199,7 @@ impl MppSender {
             cooperative_drain: self.cooperative_drain.as_ref().map(Arc::clone),
             header,
             scratch: std::cell::RefCell::new(Vec::new()),
+            ipc_encode: std::cell::RefCell::new(IpcStreamEncodeState::default()),
         }
     }
 
@@ -1164,9 +1336,31 @@ impl MppSender {
         scratch: &mut Vec<u8>,
         stats: &mut SendBatchStats,
     ) -> Result<(), DataFusionError> {
-        let t_enc = Instant::now();
-        encode_frame_into(self.header, batch, scratch)?;
-        stats.encode += t_enc.elapsed();
+        let stream = self.header.data_stream();
+        let sender_proc = self.header.sender_proc();
+
+        let sent_schema = {
+            let mut ipc = self.ipc_encode.borrow_mut();
+            ipc.reset_if_schema_changed(batch.schema());
+            if !ipc.schema_sent {
+                let t_enc = Instant::now();
+                encode_schema_frame_into(stream, sender_proc, batch.schema(), &mut ipc, scratch)?;
+                stats.encode += t_enc.elapsed();
+                true
+            } else {
+                false
+            }
+        };
+        if sent_schema {
+            self.spin_send_scratch(scratch, stats).await?;
+        }
+
+        {
+            let mut ipc = self.ipc_encode.borrow_mut();
+            let t_enc = Instant::now();
+            encode_batch_body_frame_into(self.header, batch, &mut ipc, scratch)?;
+            stats.encode += t_enc.elapsed();
+        }
         if self
             .channel
             .max_frame_bytes()
@@ -1174,16 +1368,13 @@ impl MppSender {
         {
             return self.spin_send_scratch(scratch, stats).await;
         }
-        // An over-cap frame usually means the batch carries offset slices of an upstream
-        // operator's accumulated state: arrow-ipc writes a sliced variable-length array's
-        // whole values buffer, so the frame balloons to the state's size no matter the row
-        // count. Compacting into fresh arrays drops the shared buffers. It's an
-        // optimization, not a bound: whatever stays over the cap streams through the ring
-        // in chunks.
         let compacted = compact_rows(batch, 0, batch.num_rows())?;
-        let t_enc = Instant::now();
-        encode_frame_into(self.header, &compacted, scratch)?;
-        stats.encode += t_enc.elapsed();
+        {
+            let mut ipc = self.ipc_encode.borrow_mut();
+            let t_enc = Instant::now();
+            encode_batch_body_frame_into(self.header, &compacted, &mut ipc, scratch)?;
+            stats.encode += t_enc.elapsed();
+        }
         self.spin_send_scratch(scratch, stats).await
     }
 
@@ -1554,6 +1745,8 @@ pub(super) struct MppReceiver {
     /// stream's cancel) sits here until the stream's `Eof` clears it or a fresh frame for
     /// the stream restarts at offset 0.
     assemblies: Mutex<HashMap<PhysicalStreamKey, FrameAssembly>>,
+    /// Per-stream Arrow IPC decoders after a [`MppFrameKind::Schema`] frame.
+    stream_decoders: Mutex<HashMap<PhysicalStreamKey, StreamIpcDecodeState>>,
 }
 
 /// One stream's partially reassembled oversized frame.
@@ -1567,6 +1760,7 @@ impl MppReceiver {
         Self {
             channel,
             assemblies: Mutex::new(HashMap::default()),
+            stream_decoders: Mutex::new(HashMap::default()),
         }
     }
 
@@ -1580,30 +1774,48 @@ impl MppReceiver {
                         Ok(None) => continue,
                         Err(e) => return RecvBatchOutcome::TransportError(e),
                     };
-                    return match decode_frame(&complete) {
-                        Ok((header, FrameBody::Batch(batch))) => {
-                            RecvBatchOutcome::Batch { header, batch }
+                    let outcome = {
+                        let mut decoders = self.stream_decoders.lock().unwrap();
+                        match decode_frame_with_decoders(&complete, Some(&mut decoders)) {
+                            Ok((header, FrameBody::Schema)) => {
+                                let payload = &complete[MPP_FRAME_HEADER_SIZE..];
+                                match ingest_schema_stream(&header, payload, &mut decoders) {
+                                    Ok(()) => None,
+                                    Err(e) => Some(RecvBatchOutcome::TransportError(e)),
+                                }
+                            }
+                            Ok((header, FrameBody::Batch(batch))) => {
+                                Some(RecvBatchOutcome::Batch { header, batch })
+                            }
+                            Ok((header, FrameBody::Eof)) => Some(RecvBatchOutcome::Eof { header }),
+                            Ok((header, FrameBody::WorkUnit(unit))) => {
+                                Some(RecvBatchOutcome::WorkUnit { header, unit })
+                            }
+                            Ok((header, FrameBody::FeedEof)) => {
+                                Some(RecvBatchOutcome::FeedEof { header })
+                            }
+                            Ok((header, FrameBody::TaskMetrics(metrics))) => {
+                                Some(RecvBatchOutcome::TaskMetrics { header, metrics })
+                            }
+                            Ok((header, FrameBody::SetPlan(frame))) => {
+                                Some(RecvBatchOutcome::SetPlan { header, frame })
+                            }
+                            Ok((header, FrameBody::ExecuteTask(frame))) => {
+                                Some(RecvBatchOutcome::ExecuteTask { header, frame })
+                            }
+                            Ok((header, FrameBody::Cancel)) => {
+                                Some(RecvBatchOutcome::Cancel { header })
+                            }
+                            Ok((header, FrameBody::TaskError(msg))) => {
+                                Some(RecvBatchOutcome::TaskError { header, msg })
+                            }
+                            Err(e) => Some(RecvBatchOutcome::TransportError(e)),
                         }
-                        Ok((header, FrameBody::Eof)) => RecvBatchOutcome::Eof { header },
-                        Ok((header, FrameBody::WorkUnit(unit))) => {
-                            RecvBatchOutcome::WorkUnit { header, unit }
-                        }
-                        Ok((header, FrameBody::FeedEof)) => RecvBatchOutcome::FeedEof { header },
-                        Ok((header, FrameBody::TaskMetrics(metrics))) => {
-                            RecvBatchOutcome::TaskMetrics { header, metrics }
-                        }
-                        Ok((header, FrameBody::SetPlan(frame))) => {
-                            RecvBatchOutcome::SetPlan { header, frame }
-                        }
-                        Ok((header, FrameBody::ExecuteTask(frame))) => {
-                            RecvBatchOutcome::ExecuteTask { header, frame }
-                        }
-                        Ok((header, FrameBody::Cancel)) => RecvBatchOutcome::Cancel { header },
-                        Ok((header, FrameBody::TaskError(msg))) => {
-                            RecvBatchOutcome::TaskError { header, msg }
-                        }
-                        Err(e) => RecvBatchOutcome::TransportError(e),
                     };
+                    match outcome {
+                        None => continue,
+                        Some(result) => return result,
+                    }
                 }
                 RecvOutcome::Empty => return RecvBatchOutcome::Empty,
                 RecvOutcome::Detached => return RecvBatchOutcome::Detached,
@@ -1620,13 +1832,9 @@ impl MppReceiver {
         if kind != MppFrameKind::Chunk {
             if kind == MppFrameKind::Eof {
                 // The stream is over; drop any prefix its producer abandoned mid-frame.
-                self.assemblies
-                    .lock()
-                    .unwrap()
-                    .remove(&PhysicalStreamKey::new(
-                        header.sender_proc(),
-                        header.data_stream(),
-                    ));
+                let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
+                self.assemblies.lock().unwrap().remove(&key);
+                self.stream_decoders.lock().unwrap().remove(&key);
             }
             return Ok(Some(bytes));
         }
@@ -2672,6 +2880,44 @@ mod tests {
     }
 
     #[test]
+    fn schema_once_multibatch_round_trips() {
+        let stream = MppDataStreamKey::new(3, 0, 1);
+        let batch_header = MppFrameHeader::batch(stream, 0);
+        let mut enc = IpcStreamEncodeState::default();
+        let mut schema_buf = Vec::new();
+        let mut batch_buf = Vec::new();
+        let b1 = sample_batch(8);
+        let b2 = sample_batch(16);
+        encode_schema_frame_into(stream, 0, b1.schema(), &mut enc, &mut schema_buf).unwrap();
+        encode_batch_body_frame_into(batch_header, &b1, &mut enc, &mut batch_buf).unwrap();
+        let mut batch_buf2 = Vec::new();
+        encode_batch_body_frame_into(batch_header, &b2, &mut enc, &mut batch_buf2).unwrap();
+
+        let full_single = {
+            let mut legacy = Vec::new();
+            encode_frame_into(batch_header, &b2, &mut legacy).unwrap();
+            legacy.len()
+        };
+        assert!(
+            batch_buf2.len() < full_single,
+            "batch body frame should omit the repeated schema ({} >= {})",
+            batch_buf2.len(),
+            full_single
+        );
+
+        let receiver =
+            MppReceiver::new(ReplayChannel::over(vec![schema_buf, batch_buf, batch_buf2]));
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::Batch { batch, .. } => assert_eq!(batch.num_rows(), 8),
+            other => panic!("expected first batch, got {other:?}"),
+        }
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::Batch { batch, .. } => assert_eq!(batch.num_rows(), 16),
+            other => panic!("expected second batch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn frame_round_trips_eof() {
         let mut buf = Vec::new();
         encode_eof_frame_into(MppDataStreamKey::new(2, 0, 5), 0, &mut buf).expect("encode_eof");
@@ -3381,12 +3627,22 @@ mod tests {
                 "frame of {} bytes over cap",
                 frame.len()
             );
-            let header = MppFrameHeader::parse(frame).expect("chunk header");
-            assert_eq!(header.kind().expect("kind"), MppFrameKind::Chunk);
-            assert_eq!((header.stage_id, header.partition), (3, 7));
+            let header = MppFrameHeader::parse(frame).expect("frame header");
+            let kind = header.kind().expect("kind");
+            if kind == MppFrameKind::Schema {
+                continue;
+            }
+            assert_eq!(kind, MppFrameKind::Chunk);
+            assert_eq!(
+                (header.stage_id, header.task_id, header.partition),
+                (3, 0, 7)
+            );
         }
         let (header, got) = reassemble_single_batch(frames);
-        assert_eq!((header.stage_id, header.partition), (3, 7));
+        assert_eq!(
+            (header.stage_id, header.task_id, header.partition),
+            (3, 0, 7)
+        );
         // Row order and content must survive; compare against a compacted copy (`take` of
         // every row) since the decoded side never sees the original buffers.
         let want = compact_rows(&sliced, 0, sliced.num_rows()).expect("compact reference");

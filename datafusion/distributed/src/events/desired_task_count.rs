@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 /// Annotation attached to a single [ExecutionPlan] that determines how many distributed tasks
 /// it should run on.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct TaskCountAnnotation {
     /// The node's soft task-count estimate. The distributed planner combines this estimate with
     /// estimates from other nodes in the same stage before choosing a task count. Fractional

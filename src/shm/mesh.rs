@@ -333,6 +333,9 @@ mod tests {
                     assert!(!already, "dup ({producer_id}, {idx})");
                     got += 1;
                 }
+                RecvOutcome::DirectBatch { .. } => {
+                    panic!("DSM inbox receiver does not use direct batches")
+                }
                 RecvOutcome::Empty => std::thread::yield_now(),
                 RecvOutcome::Detached => panic!("unexpected detach"),
             }

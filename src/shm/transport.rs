@@ -849,6 +849,11 @@ impl DrainBuffer {
 pub(super) enum RecvOutcome {
     /// One serialized Arrow IPC message ready to decode.
     Bytes(Vec<u8>),
+    /// In-proc self-loop batch moved without Arrow IPC (see [`InProcMessage::DirectBatch`]).
+    DirectBatch {
+        header: MppFrameHeader,
+        batch: Arc<RecordBatch>,
+    },
     /// No data currently available but the peer is still attached.
     Empty,
     /// The peer has detached; no more bytes will ever arrive on this channel.
@@ -875,6 +880,37 @@ pub(crate) trait BatchChannelSender: Send + Sync {
     /// for in-proc channels used by tests where "full" doesn't arise.
     fn try_send_bytes(&self, bytes: &[u8]) -> Result<bool, DataFusionError> {
         self.send_bytes(bytes).map(|()| true)
+    }
+
+    /// When `true`, [`Self::try_send_direct_batch`] may hand off an [`Arc<RecordBatch>`] without
+    /// Arrow IPC. Only the in-proc self-loop channel sets this; cross-process DSM inboxes always
+    /// encode.
+    fn supports_direct_batch(&self) -> bool {
+        false
+    }
+
+    /// Non-blocking handoff of a batch that already lives in this process. Returns `Ok(true)` on
+    /// success, `Ok(false)` when the channel is full, `Err` on detach. Default: not supported
+    /// (`Ok(false)`); callers fall back to [`Self::send_bytes`].
+    fn try_send_direct_batch(
+        &self,
+        _header: MppFrameHeader,
+        _batch: Arc<RecordBatch>,
+    ) -> Result<bool, DataFusionError> {
+        Ok(false)
+    }
+
+    /// Blocking handoff of an in-proc batch. Only implemented for the self-loop channel; the
+    /// direct send path uses this when no cooperative drain is attached (unit tests, bounded
+    /// in-proc channels that rely on `sync_channel` backpressure).
+    fn send_direct_batch(
+        &self,
+        _header: MppFrameHeader,
+        _batch: Arc<RecordBatch>,
+    ) -> Result<(), DataFusionError> {
+        Err(DataFusionError::Internal(
+            "mpp: send_direct_batch on a channel that does not support it".into(),
+        ))
     }
 
     /// Async lock the send paths hold across the cooperative-drain spin so two tasks can't
@@ -1135,6 +1171,10 @@ impl MppSender {
         scratch: &mut Vec<u8>,
         stats: &mut SendBatchStats,
     ) -> Result<(), DataFusionError> {
+        if self.channel.supports_direct_batch() {
+            let batch = Arc::new(batch.clone());
+            return self.spin_send_direct_batch(batch, stats).await;
+        }
         let t_enc = Instant::now();
         encode_frame_into(self.header, batch, scratch)?;
         stats.encode += t_enc.elapsed();
@@ -1268,6 +1308,41 @@ impl MppSender {
             // sends to us unblock; without this, symmetric full-queue sends deadlock. Errors
             // propagate so a peer detaching mid-spin doesn't leave us spinning on a closed
             // mesh.
+            let t_drain = Instant::now();
+            self.spin_try_drain_pass(drain).await?;
+            stats.coop_drain_in_spin += t_drain.elapsed();
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Like [`Self::spin_send_frame`] but moves an in-proc [`Arc<RecordBatch>`] without encoding.
+    async fn spin_send_direct_batch(
+        &self,
+        batch: Arc<RecordBatch>,
+        stats: &mut SendBatchStats,
+    ) -> Result<(), DataFusionError> {
+        let Some(drain) = self.cooperative_drain.as_ref() else {
+            return self.channel.send_direct_batch(self.header, batch);
+        };
+        let _send_guard = self.channel.send_lock().lock().await;
+        let mut first_try = true;
+        let t_wait_start = Instant::now();
+        loop {
+            drain.check_interrupt()?;
+            if self.stream_cancelled() {
+                return Ok(());
+            }
+            if self
+                .channel
+                .try_send_direct_batch(self.header, Arc::clone(&batch))?
+            {
+                if !first_try {
+                    stats.send_wait += t_wait_start.elapsed();
+                }
+                return Ok(());
+            }
+            first_try = false;
+            stats.spin_iters += 1;
             let t_drain = Instant::now();
             self.spin_try_drain_pass(drain).await?;
             stats.coop_drain_in_spin += t_drain.elapsed();
@@ -1473,6 +1548,12 @@ impl MppReceiver {
     pub(super) fn try_recv_batch(&self) -> RecvBatchOutcome {
         loop {
             match self.channel.try_recv() {
+                RecvOutcome::DirectBatch { header, batch } => {
+                    return RecvBatchOutcome::Batch {
+                        header,
+                        batch: Arc::unwrap_or_clone(batch),
+                    };
+                }
                 RecvOutcome::Bytes(bytes) => {
                     let complete = match self.ingest(bytes) {
                         Ok(Some(frame)) => frame,
@@ -2258,8 +2339,16 @@ impl Drop for DrainHandle {
 /// steady state. The current-thread Tokio runtime interleaves producer and consumer fragments
 /// via `yield_now().await`, so backpressure would be benign anyway, but unbounded rules out any
 /// chance of self-deadlock if the producer never yields.
+pub(super) enum InProcMessage {
+    Bytes(Vec<u8>),
+    DirectBatch {
+        header: MppFrameHeader,
+        batch: Arc<RecordBatch>,
+    },
+}
+
 pub(super) fn in_proc_channel(capacity: usize) -> (InProcSender, InProcReceiver) {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(capacity);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<InProcMessage>(capacity);
     (
         InProcSender {
             tx,
@@ -2270,7 +2359,7 @@ pub(super) fn in_proc_channel(capacity: usize) -> (InProcSender, InProcReceiver)
 }
 
 pub(super) struct InProcSender {
-    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    tx: std::sync::mpsc::SyncSender<InProcMessage>,
     /// Per-instance lock so the [`BatchChannelSender::send_lock`] contract holds even when an
     /// in-proc channel ends up in a code path that would otherwise need serialization. In-proc
     /// `send_bytes` is already atomic (each call pushes a complete `Vec<u8>`), so the lock is
@@ -2285,24 +2374,61 @@ pub(super) struct InProcReceiver {
     // `Send + Sync`-relaxed by design, but we only need Send for the thread
     // hand-off). Tests only ever access from one thread so the Mutex is
     // uncontended.
-    rx: Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+    rx: Mutex<std::sync::mpsc::Receiver<InProcMessage>>,
 }
 
 impl BatchChannelSender for InProcSender {
+    fn supports_direct_batch(&self) -> bool {
+        true
+    }
+
     fn send_bytes(&self, bytes: &[u8]) -> Result<(), DataFusionError> {
-        self.tx.send(bytes.to_vec()).map_err(|_| {
-            DataFusionError::Execution("mpp: in-proc channel detached during send".into())
-        })
+        self.tx
+            .send(InProcMessage::Bytes(bytes.to_vec()))
+            .map_err(|_| {
+                DataFusionError::Execution("mpp: in-proc channel detached during send".into())
+            })
     }
 
     fn try_send_bytes(&self, bytes: &[u8]) -> Result<bool, DataFusionError> {
-        match self.tx.try_send(bytes.to_vec()) {
+        match self.tx.try_send(InProcMessage::Bytes(bytes.to_vec())) {
             Ok(()) => Ok(true),
             Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(DataFusionError::Execution(
                 "mpp: in-proc channel detached during try_send".into(),
             )),
         }
+    }
+
+    fn try_send_direct_batch(
+        &self,
+        header: MppFrameHeader,
+        batch: Arc<RecordBatch>,
+    ) -> Result<bool, DataFusionError> {
+        match self
+            .tx
+            .try_send(InProcMessage::DirectBatch { header, batch })
+        {
+            Ok(()) => Ok(true),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(DataFusionError::Execution(
+                "mpp: in-proc channel detached during direct batch try_send".into(),
+            )),
+        }
+    }
+
+    fn send_direct_batch(
+        &self,
+        header: MppFrameHeader,
+        batch: Arc<RecordBatch>,
+    ) -> Result<(), DataFusionError> {
+        self.tx
+            .send(InProcMessage::DirectBatch { header, batch })
+            .map_err(|_| {
+                DataFusionError::Execution(
+                    "mpp: in-proc channel detached during direct batch send".into(),
+                )
+            })
     }
 
     fn send_lock(&self) -> &tokio::sync::Mutex<()> {
@@ -2314,7 +2440,10 @@ impl BatchChannelReceiver for InProcReceiver {
     fn try_recv(&self) -> RecvOutcome {
         let rx = self.rx.lock().expect("InProcReceiver mutex poisoned");
         match rx.try_recv() {
-            Ok(bytes) => RecvOutcome::Bytes(bytes),
+            Ok(InProcMessage::Bytes(bytes)) => RecvOutcome::Bytes(bytes),
+            Ok(InProcMessage::DirectBatch { header, batch }) => {
+                RecvOutcome::DirectBatch { header, batch }
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => RecvOutcome::Empty,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => RecvOutcome::Detached,
         }
@@ -3444,6 +3573,24 @@ mod tests {
             receiver.try_recv_batch(),
             RecvBatchOutcome::Detached
         ));
+    }
+
+    #[test]
+    fn in_proc_direct_batch_skips_ipc_encode() {
+        let (tx, rx) = in_proc_channel(8);
+        let sender = MppSender::new(Arc::new(tx));
+        let receiver = MppReceiver::new(Box::new(rx));
+        let mut stats = SendBatchStats::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test tokio runtime build");
+        rt.block_on(sender.send_batch_traced(&sample_batch(4), &mut stats))
+            .unwrap();
+        assert_eq!(stats.encode, Duration::ZERO);
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::Batch { batch, .. } => assert_eq!(batch.num_rows(), 4),
+            other => panic!("expected batch, got {other:?}"),
+        }
     }
 
     #[test]

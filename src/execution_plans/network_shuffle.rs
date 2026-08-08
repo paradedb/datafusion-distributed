@@ -1,6 +1,6 @@
 use crate::common::require_one_child;
 use crate::distributed_planner::ProducerHead;
-use crate::execution_plans::common::{salted_partitioning, scale_partitioning};
+use crate::execution_plans::common::{salted_partitioning, scale_shuffle_partitioning};
 use crate::stage::{LocalStage, Stage};
 use crate::worker::WorkerConnectionPool;
 use crate::{DistributedTaskContext, MaybeEncoded, NetworkBoundary};
@@ -143,12 +143,20 @@ impl NetworkShuffleExec {
         input_properties: &Arc<PlanProperties>,
         input_task_count: usize,
     ) -> Arc<PlanProperties> {
-        if input_task_count > 1 {
+        let is_range = matches!(input_properties.partitioning, Partitioning::Range(_));
+        if input_task_count > 1 || is_range {
+            let partitioning = if is_range {
+                Partitioning::UnknownPartitioning(1)
+            } else {
+                input_properties.partitioning.clone()
+            };
             let mut eq_properties = input_properties.eq_properties.clone();
-            eq_properties.clear_per_partition_constants();
+            if input_task_count > 1 {
+                eq_properties.clear_per_partition_constants();
+            }
             Arc::new(PlanProperties::new(
                 eq_properties,
-                input_properties.partitioning.clone(),
+                partitioning,
                 input_properties.emission_type,
                 input_properties.boundedness,
             ))
@@ -159,12 +167,7 @@ impl NetworkShuffleExec {
 
     pub(crate) fn from_stage(input_stage: Stage, input_properties: Arc<PlanProperties>) -> Self {
         let producer_partitioning = input_properties.partitioning.clone();
-        let properties = Arc::new(PlanProperties::new(
-            input_properties.equivalence_properties().clone(),
-            producer_partitioning.clone(),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
+        let properties = Self::compute_properties(&input_properties, input_stage.task_count());
         Self {
             properties,
             producer_partitioning,
@@ -202,8 +205,13 @@ impl NetworkShuffleExec {
         let Some(r_exec) = input.downcast_ref::<RepartitionExec>() else {
             return plan_err!("The input of a NetworkShuffleExec can only be a RepartitionExec");
         };
-        if !matches!(r_exec.partitioning(), Partitioning::Hash(_, _)) {
-            return plan_err!("The input of a NetworkShuffleExec must be hash partitioned");
+        if !matches!(
+            r_exec.partitioning(),
+            Partitioning::Hash(_, _) | Partitioning::Range(_)
+        ) {
+            return plan_err!(
+                "The input of a NetworkShuffleExec must be hash or range partitioned"
+            );
         }
 
         let input_properties = Arc::clone(input.properties());
@@ -240,7 +248,7 @@ impl NetworkBoundary for NetworkShuffleExec {
     fn producer_head(&self, consumer_task_count: usize) -> Result<ProducerHead> {
         let partitioning = match &self.mode {
             ShuffleMode::Direct => {
-                scale_partitioning(&self.producer_partitioning, |n| n * consumer_task_count)?
+                scale_shuffle_partitioning(&self.producer_partitioning, consumer_task_count)?
             }
             ShuffleMode::TwoPhase { salt } => {
                 salted_partitioning(&self.producer_partitioning, *salt, consumer_task_count)?
@@ -415,5 +423,152 @@ impl ExecutionPlan for NetworkShuffleExec {
             self.properties.partitioning.partition_count(),
             self.schema(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::ScalarValue;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, RangePartitioning, SplitPoint};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    fn sample_range_partitioning() -> RangePartitioning {
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Default::default(),
+        )])
+        .unwrap();
+        let splits = vec![
+            SplitPoint::new(vec![ScalarValue::Int64(Some(10))]),
+            SplitPoint::new(vec![ScalarValue::Int64(Some(20))]),
+        ];
+        RangePartitioning::try_new(ordering, splits).unwrap()
+    }
+
+    #[test]
+    fn producer_head_preserves_range_when_task_count_matches() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let range = sample_range_partitioning();
+        let empty = Arc::new(EmptyExec::new(schema));
+        let repart = Arc::new(RepartitionExec::try_new(empty, Partitioning::Range(range)).unwrap());
+        let shuffle = NetworkShuffleExec::try_new(repart, 3).unwrap();
+
+        let head = shuffle.producer_head(3).unwrap();
+        match head {
+            ProducerHead::RepartitionExec { partitioning } => {
+                let decoded = partitioning.try_decoded().unwrap();
+                assert!(matches!(decoded, Partitioning::Range(_)));
+                assert_eq!(decoded.partition_count(), 3);
+            }
+            _ => panic!("expected RepartitionExec producer head"),
+        }
+    }
+
+    #[test]
+    fn producer_head_scales_range_when_task_count_smaller() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let range = sample_range_partitioning();
+        let empty = Arc::new(EmptyExec::new(schema));
+        let repart = Arc::new(RepartitionExec::try_new(empty, Partitioning::Range(range)).unwrap());
+        let shuffle = NetworkShuffleExec::try_new(repart, 3).unwrap();
+
+        let head = shuffle.producer_head(2).unwrap();
+        match head {
+            ProducerHead::RepartitionExec { partitioning } => {
+                let decoded = partitioning.try_decoded().unwrap();
+                assert!(matches!(decoded, Partitioning::Range(_)));
+                assert_eq!(decoded.partition_count(), 2);
+            }
+            _ => panic!("expected RepartitionExec producer head"),
+        }
+    }
+
+    #[test]
+    fn producer_head_errors_when_task_count_exceeds_max_range() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let range = sample_range_partitioning();
+        let empty = Arc::new(EmptyExec::new(schema));
+        let repart = Arc::new(RepartitionExec::try_new(empty, Partitioning::Range(range)).unwrap());
+        let shuffle = NetworkShuffleExec::try_new(repart, 3).unwrap();
+
+        let err = shuffle.producer_head(4).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Range partitioning partition count 4 exceeds maximum 3")
+        );
+    }
+
+    fn sample_hash_repart(sorted: bool) -> Arc<RepartitionExec> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let empty = Arc::new(EmptyExec::new(schema));
+        let input: Arc<dyn ExecutionPlan> = if sorted {
+            let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+                Arc::new(Column::new("a", 0)),
+                Default::default(),
+            )])
+            .unwrap();
+            Arc::new(SortExec::new(ordering, empty))
+        } else {
+            empty
+        };
+        Arc::new(
+            RepartitionExec::try_new(
+                input,
+                Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 2),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn preserves_output_ordering_when_multiple_input_tasks() {
+        let repart = sample_hash_repart(true);
+        assert!(repart.properties().output_ordering().is_some());
+
+        // Multiple producer tasks: ordering is preserved via streaming merge,
+        // while per-partition constants are cleared.
+        let shuffle = NetworkShuffleExec::try_new(repart.clone(), 3).unwrap();
+        assert_eq!(
+            shuffle.properties().output_ordering(),
+            repart.properties().output_ordering()
+        );
+    }
+
+    #[test]
+    fn preserves_output_ordering_when_single_input_task() {
+        let repart = sample_hash_repart(true);
+        assert!(repart.properties().output_ordering().is_some());
+
+        // Single producer task: ordering should be preserved
+        let shuffle = NetworkShuffleExec::try_new(repart.clone(), 1).unwrap();
+        assert_eq!(
+            shuffle.properties().output_ordering(),
+            repart.properties().output_ordering()
+        );
+    }
+
+    #[test]
+    fn with_input_stage_preserves_ordering_when_scaling_task_count() {
+        let repart = sample_hash_repart(true);
+        let shuffle = NetworkShuffleExec::try_new(repart.clone(), 1).unwrap();
+        assert!(shuffle.properties().output_ordering().is_some());
+
+        let scaled = shuffle
+            .with_input_stage(Stage::Local(LocalStage {
+                query_id: Uuid::nil(),
+                num: 1,
+                plan: repart.clone(),
+                tasks: 3,
+                metrics_set: Default::default(),
+            }))
+            .unwrap();
+        assert_eq!(
+            scaled.properties().output_ordering(),
+            repart.properties().output_ordering()
+        );
     }
 }

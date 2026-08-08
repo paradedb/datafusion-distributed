@@ -321,10 +321,14 @@ async fn _inject_network_boundaries(
     // Cap the reconciled task count by the configured max-per-stage budget.
     let task_count = task_count.limit(nb_ctx.max_tasks()?);
 
-    // Upon reaching a hash repartition, we need to introduce a network shuffle right above it.
+    // Upon reaching a hash or range repartition, we need to introduce a network shuffle right above it.
     if let Some(r_exec) = plan.downcast_ref::<RepartitionExec>()
-        && matches!(r_exec.partitioning(), Partitioning::Hash(_, _))
+        && matches!(
+            r_exec.partitioning(),
+            Partitioning::Hash(_, _) | Partitioning::Range(_)
+        )
     {
+        let original_partitioning = r_exec.partitioning().clone();
         let input_stage = LocalStage {
             query_id: nb_ctx.query_id,
             num: nb_ctx.fetch_add_stage_id(),
@@ -336,9 +340,13 @@ async fn _inject_network_boundaries(
             .nb_builder
             .build(input_stage, TypeId::of::<NetworkShuffleExec>(), nb_ctx)
             .await?;
+        let input_properties = Arc::new(
+            PlanProperties::clone(&result.input_properties)
+                .with_partitioning(original_partitioning),
+        );
         let shuffle = Arc::new(NetworkShuffleExec::from_stage(
             result.input_stage,
-            result.input_properties,
+            input_properties,
         ));
         Ok(nb_ctx.plan_with_task_count(shuffle, result.consumer_task_count))
     }
@@ -466,6 +474,7 @@ impl InjectNetworkBoundaryContext<'_> {
         } else if plan.is_network_boundary() {
             if let Some(shuffle) = plan.downcast_ref::<NetworkShuffleExec>()
                 && matches!(shuffle.mode, ShuffleMode::Direct)
+                && matches!(shuffle.producer_partitioning, Partitioning::Hash(_, _))
             {
                 let consumer_partitions = shuffle.producer_partitioning.partition_count();
                 // now that task_count is the final reconciled consumer count,
@@ -1516,5 +1525,51 @@ mod tests {
             result += &debug_annotated(child, indent + 1, ctx);
         }
         result
+    }
+
+    #[tokio::test]
+    async fn test_range_repartition_injects_network_shuffle() {
+        use crate::DistributedExt;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_expr::{
+            LexOrdering, PhysicalSortExpr, RangePartitioning, SplitPoint,
+        };
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Default::default(),
+        )])
+        .unwrap();
+        let splits = vec![
+            SplitPoint::new(vec![ScalarValue::Int64(Some(10))]),
+            SplitPoint::new(vec![ScalarValue::Int64(Some(20))]),
+        ];
+        let range = RangePartitioning::try_new(ordering, splits).unwrap();
+        let empty = Arc::new(EmptyExec::new(schema));
+        let repart = Arc::new(RepartitionExec::try_new(empty, Partitioning::Range(range)).unwrap());
+
+        let d_cfg = DistributedConfig {
+            max_tasks_per_stage: 4,
+            ..Default::default()
+        };
+        let session_config = SessionConfig::new().with_distributed_option_extension(d_cfg.clone());
+        let network_boundaries_ctx = InjectNetworkBoundaryContext {
+            cfg: &session_config,
+            d_cfg: &d_cfg,
+            worker_resolver: WorkerResolverExtension::from_session_config(&session_config),
+            task_counts: &Mutex::new(HashMap::new()),
+            query_id: Uuid::new_v4(),
+            stage_id: &AtomicUsize::new(1),
+            nb_builder: &CardinalityBasedNetworkBoundaryBuilder,
+        };
+
+        let result = _inject_network_boundaries(repart, None, &network_boundaries_ctx)
+            .await
+            .unwrap();
+        assert!(result.is::<NetworkShuffleExec>());
     }
 }

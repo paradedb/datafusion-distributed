@@ -27,6 +27,7 @@ url = "2"
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 
 [build-dependencies]
 built = { version = "0.8", features = ["git2", "chrono"] }

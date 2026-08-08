@@ -9,8 +9,9 @@ members = [
 ]
 
 [workspace.dependencies]
-datafusion = { version = "55", default-features = false }
-datafusion-proto = { version = "55", default-features = false }
+datafusion = { git = "https://github.com/paradedb/datafusion.git", branch = "paradedb.branch-55", default-features = false }
+datafusion-proto = { git = "https://github.com/paradedb/datafusion.git", branch = "paradedb.branch-55", default-features = false }
+datafusion-cli = { git = "https://github.com/paradedb/datafusion.git", branch = "paradedb.branch-55", default-features = false }
 
 [package]
 name = "datafusion-distributed"
@@ -158,3 +159,9 @@ required-features = ["grpc"]
 [workspace.lints.clippy]
 disallowed_types = "deny"
 disallowed-methods = "deny"
+
+# `datafusion-iceberg` depends on crates.io `datafusion`. Without this patch it pulls a second
+# copy of DataFusion next to the paradedb fork pinned in `[workspace.dependencies]`, and the
+# iceberg crate fails to compile with mismatched `Expr` types from the two copies.
+[patch.crates-io]
+datafusion = { git = "https://github.com/paradedb/datafusion.git", branch = "paradedb.branch-55" }

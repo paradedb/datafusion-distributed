@@ -176,6 +176,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 partitioning,
                 input_stage,
                 equivalence_classes,
+                consumer_tasks,
             }) => {
                 let schema: Schema = schema
                     .as_ref()
@@ -206,10 +207,17 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     proto_converter,
                 )?;
 
+                let consumer_tasks = if consumer_tasks == 0 {
+                    1
+                } else {
+                    consumer_tasks as usize
+                };
+
                 Ok(Arc::new(new_network_coalesce_tasks_exec(
                     partitioning,
                     equivalence_properties,
                     parse_stage_proto(input_stage, inputs, dynamic_filter_anchors)?,
+                    consumer_tasks,
                 )))
             }
             DistributedExecNode::NetworkBroadcast(NetworkBroadcastExecProto {
@@ -418,6 +426,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     self,
                     proto_converter,
                 )?,
+                consumer_tasks: node.consumer_tasks as u64,
             };
 
             let wrapper = DistributedExecProto {
@@ -699,7 +708,10 @@ fn new_network_hash_shuffle_exec(
 ) -> NetworkShuffleExec {
     let producer_tasks = input_stage.task_count();
     let advertised_partitioning = match &mode {
-        ShuffleMode::Direct => partitioning.clone(),
+        ShuffleMode::Direct => match &partitioning {
+            Partitioning::Range(_) => Partitioning::UnknownPartitioning(1),
+            _ => partitioning.clone(),
+        },
         ShuffleMode::TwoPhase { .. } => Partitioning::UnknownPartitioning(producer_tasks),
     };
     let properties = Arc::new(PlanProperties::new(
@@ -717,8 +729,8 @@ fn new_network_hash_shuffle_exec(
     }
 }
 
-/// Protobuf representation of the [NetworkShuffleExec] physical node. It serves as
-/// an intermediate format for serializing/deserializing [NetworkShuffleExec] nodes
+/// Protobuf representation of the [NetworkCoalesceExec] physical node. It serves as
+/// an intermediate format for serializing/deserializing [NetworkCoalesceExec] nodes
 /// to send them over the wire.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkCoalesceExecProto {
@@ -730,12 +742,15 @@ pub struct NetworkCoalesceExecProto {
     input_stage: Option<StageProto>,
     #[prost(message, repeated, tag = "4")]
     equivalence_classes: Vec<EquivalenceClassProto>,
+    #[prost(uint64, tag = "5")]
+    consumer_tasks: u64,
 }
 
 fn new_network_coalesce_tasks_exec(
     partitioning: Partitioning,
     equivalence_properties: EquivalenceProperties,
     input_stage: Stage,
+    consumer_tasks: usize,
 ) -> NetworkCoalesceExec {
     NetworkCoalesceExec {
         properties: Arc::new(PlanProperties::new(
@@ -746,6 +761,7 @@ fn new_network_coalesce_tasks_exec(
         )),
         worker_connections: WorkerConnectionPool::new(input_stage.task_count()),
         input_stage,
+        consumer_tasks,
     }
 }
 
@@ -1011,6 +1027,7 @@ mod tests {
             Partitioning::RoundRobinBatch(3),
             EquivalenceProperties::new(schema),
             dummy_stage(),
+            4,
         ));
 
         let mut buf = Vec::new();
@@ -1018,6 +1035,13 @@ mod tests {
 
         let decoded = codec.try_decode(&buf, &[], &ctx, &default_proto_converter())?;
         assert_eq!(repr(&plan), repr(&decoded));
+        assert_eq!(
+            decoded
+                .downcast_ref::<NetworkCoalesceExec>()
+                .unwrap()
+                .consumer_tasks,
+            4
+        );
 
         Ok(())
     }
@@ -1055,6 +1079,7 @@ mod tests {
             Partitioning::RoundRobinBatch(3),
             EquivalenceProperties::new(schema),
             dummy_stage_with_plan(),
+            1,
         ));
 
         let mut buf = Vec::new();
@@ -1076,6 +1101,7 @@ mod tests {
             Partitioning::UnknownPartitioning(1),
             EquivalenceProperties::new(schema),
             dummy_stage(),
+            1,
         ));
 
         let plan: Arc<dyn ExecutionPlan> =
@@ -1100,11 +1126,13 @@ mod tests {
             Partitioning::RoundRobinBatch(2),
             EquivalenceProperties::new(schema.clone()),
             dummy_stage(),
+            1,
         ));
         let right = Arc::new(new_network_coalesce_tasks_exec(
             Partitioning::RoundRobinBatch(2),
             EquivalenceProperties::new(schema.clone()),
             dummy_stage(),
+            1,
         ));
 
         let union = UnionExec::try_new(vec![left.clone(), right.clone()])?;
@@ -1208,6 +1236,7 @@ mod tests {
                     Partitioning::UnknownPartitioning(1),
                     equivalence_properties.clone(),
                     dummy_stage(),
+                    1,
                 )),
             ),
             (

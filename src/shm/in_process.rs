@@ -561,11 +561,8 @@ fn mem_shard_desired_task_count(
     ev: crate::events::DesiredTaskCountEvent,
 ) -> Option<Result<crate::events::DesiredTaskCountEventResponse>> {
     let n_tasks = ev.session_config.target_partitions();
-    MemShardConfig::mem_source(ev.plan).map(|_| {
-        Ok(crate::events::DesiredTaskCountEventResponse::desired(
-            n_tasks,
-        ))
-    })
+    MemShardConfig::mem_source(ev.plan)
+        .map(|_| Ok(crate::events::DesiredTaskCountEventResponse::soft(n_tasks)))
 }
 
 fn mem_shard_scale_up_leaf_node(

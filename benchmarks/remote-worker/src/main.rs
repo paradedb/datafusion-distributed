@@ -38,11 +38,9 @@ use url::Url;
 fn configure_session(builder: SessionStateBuilder) -> SessionStateBuilder {
     // Comment the code below in case this crate needs to stop depending on iceberg.
     use datafusion_distributed_iceberg::{IcebergExt, IcebergIntegrationOptions};
-    let builder = builder
-        .with_iceberg_integration(IcebergIntegrationOptions::default())
-        .with_iceberg_column_stats_enabled(true);
-
     builder
+        .with_iceberg_integration(IcebergIntegrationOptions::default())
+        .with_iceberg_column_stats_enabled(true)
 }
 
 #[global_allocator]

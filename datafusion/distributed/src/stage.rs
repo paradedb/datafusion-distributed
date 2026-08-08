@@ -587,11 +587,14 @@ fn format_tasks_for_stage(n_tasks: usize, head: &Arc<dyn ExecutionPlan>) -> Stri
 pub(crate) fn stage_partition_count(n_tasks: usize, head: &Arc<dyn ExecutionPlan>) -> usize {
     let partitioning = head.properties().output_partitioning();
     let input_partitions = partitioning.partition_count();
-    let hash_shuffle = matches!(partitioning, Partitioning::Hash(_, _));
-    // In a hash shuffle every task reads the same partition range, so the stage spans
+    let is_shuffle = matches!(
+        partitioning,
+        Partitioning::Hash(_, _) | Partitioning::Range(_)
+    );
+    // In a hash or range shuffle every task reads the same partition range, so the stage spans
     // `input_partitions` distinct partitions. Otherwise each task owns its own slice, for a total
     // of `n_tasks * input_partitions`.
-    match hash_shuffle {
+    match is_shuffle {
         true => input_partitions,
         false => n_tasks * input_partitions,
     }

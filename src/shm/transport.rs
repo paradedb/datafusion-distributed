@@ -1845,8 +1845,14 @@ enum SetPlanSlot {
     Waiting(tokio::sync::oneshot::Sender<Result<SetPlanFrame, DataFusionError>>),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncomingExecuteTaskRequest {
+    pub sender_proc: u32,
+    pub frame: ExecuteTaskFrame,
+}
+
 pub type ExecuteTaskRx =
-    tokio::sync::mpsc::UnboundedReceiver<Result<ExecuteTaskFrame, DataFusionError>>;
+    tokio::sync::mpsc::UnboundedReceiver<Result<IncomingExecuteTaskRequest, DataFusionError>>;
 
 #[derive(Default)]
 struct ExecuteTaskRegistry {
@@ -1855,8 +1861,8 @@ struct ExecuteTaskRegistry {
 }
 
 enum ExecuteTaskSlot {
-    Pending(Vec<Result<ExecuteTaskFrame, DataFusionError>>),
-    Active(tokio::sync::mpsc::UnboundedSender<Result<ExecuteTaskFrame, DataFusionError>>),
+    Pending(Vec<Result<IncomingExecuteTaskRequest, DataFusionError>>),
+    Active(tokio::sync::mpsc::UnboundedSender<Result<IncomingExecuteTaskRequest, DataFusionError>>),
 }
 
 impl DrainHandle {
@@ -2113,6 +2119,7 @@ impl DrainHandle {
         &self,
         stage_id: u32,
         task_number: u32,
+        sender_proc: u32,
         frame: ExecuteTaskFrame,
     ) {
         let mut guard = self.execute_task_registry.lock().unwrap();
@@ -2123,10 +2130,11 @@ impl DrainHandle {
             .map
             .entry((stage_id, task_number))
             .or_insert_with(|| ExecuteTaskSlot::Pending(Vec::new()));
+        let item = Ok(IncomingExecuteTaskRequest { sender_proc, frame });
         match slot {
-            ExecuteTaskSlot::Pending(queue) => queue.push(Ok(frame)),
+            ExecuteTaskSlot::Pending(queue) => queue.push(item),
             ExecuteTaskSlot::Active(tx) => {
-                let _ = tx.send(Ok(frame));
+                let _ = tx.send(item);
             }
         }
     }
@@ -2290,7 +2298,12 @@ impl DrainHandle {
                         self.route_set_plan(header.stage_id, header.partition, frame);
                     }
                     RecvBatchOutcome::ExecuteTask { header, frame } => {
-                        self.route_execute_task(header.stage_id, header.partition, frame);
+                        self.route_execute_task(
+                            header.stage_id,
+                            header.partition,
+                            header.sender_proc(),
+                            frame,
+                        );
                     }
                     RecvBatchOutcome::Cancel { header } => {
                         self.note_cancel(header.data_stream());
@@ -3144,7 +3157,7 @@ mod tests {
             .try_recv()
             .expect("request frame must be delivered")
             .expect("delivery must not be a failure");
-        let (decoded, _headers) = got.into_parts().expect("into_parts");
+        let (decoded, _headers) = got.frame.into_parts().expect("into_parts");
         assert_eq!(decoded.task_key.unwrap().task_number, 1);
     }
 

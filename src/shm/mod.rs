@@ -56,7 +56,7 @@ mod runtime;
 // the `in_process` test, so it stays gated out until reimplemented on `coordinator_channel`.
 #[cfg(any())]
 mod self_hosted;
-pub mod setup;
+mod setup;
 mod sink;
 mod transport;
 

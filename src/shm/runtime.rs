@@ -236,23 +236,29 @@ impl MppMesh {
         }
     }
 
-    /// Obtains an outbound sender pre-configured to route a `TaskError` frame to the leader
-    /// for the given `(stage_id, task_number)`.
+    /// Obtains an outbound sender pre-configured to route a `TaskError` frame back to `dest_proc`
+    /// (the process that requested task execution for `(stage_id, task_number)`).
+    ///
+    /// Returning `TaskError` to `dest_proc` matches standard RPC response routing: the node
+    /// that requested execution is directly notified of task failure or fragment panic so its
+    /// drain handle can fail dependent stream waiters.
     pub(crate) fn error_sender(
         &self,
+        dest_proc: u32,
         stage_id: u32,
         task_number: u32,
     ) -> Option<crate::shm::transport::MppSender> {
         let guard = self.cancel_senders.lock().unwrap();
         let senders = guard.as_ref()?;
         let senders = senders.lock().unwrap();
-        senders.first().and_then(|s| s.as_ref()).map(|base| {
+        let base = senders.get(dest_proc as usize)?.as_ref()?;
+        Some(
             base.clone_with_header(crate::shm::transport::MppFrameHeader::task_error(
                 stage_id,
                 task_number,
                 self.this_proc,
-            ))
-        })
+            )),
+        )
     }
 
     /// The single cooperative inbound handle that pulls frames from every peer (and the

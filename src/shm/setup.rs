@@ -134,11 +134,47 @@ pub struct LeaderSession {
     _outbound_senders: Vec<Option<MppSender>>,
 }
 
+/// Initialize the shared region as the leader (`proc 0`) with an unbounded drain buffer.
+///
+/// Embedders that need a safety cap should call [`leader_setup_with_drain_budget`].
+///
+/// # Safety
+/// The safety requirements are identical to [`leader_setup_with_drain_budget`].
+#[allow(clippy::too_many_arguments)] // public compatibility wrapper
+pub unsafe fn leader_setup(
+    base: *mut c_void,
+    n_procs: u32,
+    queue_bytes: usize,
+    plan_bytes: &[u8],
+    wakeup: Arc<dyn Wakeup>,
+    receiver_token: u64,
+    interrupt: Arc<dyn Interrupt>,
+    attach_senders: bool,
+) -> Result<LeaderSession> {
+    unsafe {
+        leader_setup_with_drain_budget(
+            base,
+            n_procs,
+            queue_bytes,
+            plan_bytes,
+            None,
+            wakeup,
+            receiver_token,
+            interrupt,
+            attach_senders,
+        )
+    }
+}
+
 /// Initialize the shared region as the leader (`proc 0`) and return its session handle.
 ///
 /// Writes the region header, copies `plan_bytes` in, initializes the `n_procs` inboxes, and
 /// attaches the leader as receiver to its own inbox. `receiver_token` is registered so producers
 /// resolve this proc's [`Wakeup`]; `interrupt` is consulted at the transport's block points.
+///
+/// `drain_buffer_budget_bytes` caps bytes held in this proc's demuxed drain buffers
+/// (`None` = unbounded). Over the limit, the affected channel's consumer receives
+/// [`DataFusionError::ResourcesExhausted`] without blocking cooperative drain.
 ///
 /// # Safety
 /// - `base` must point at an uninitialized region of at least `dsm_region_bytes(n_procs,
@@ -146,11 +182,12 @@ pub struct LeaderSession {
 /// - `base` must be at least 8-byte (MAXALIGN) aligned; the ring headers hold atomics.
 /// - The region must not be concurrently accessed until this returns.
 #[allow(clippy::too_many_arguments)] // mirrors worker_setup; the args are the embedder's knobs
-pub unsafe fn leader_setup(
+pub unsafe fn leader_setup_with_drain_budget(
     base: *mut c_void,
     n_procs: u32,
     queue_bytes: usize,
     plan_bytes: &[u8],
+    drain_buffer_budget_bytes: Option<usize>,
     wakeup: Arc<dyn Wakeup>,
     receiver_token: u64,
     interrupt: Arc<dyn Interrupt>,
@@ -178,9 +215,10 @@ pub unsafe fn leader_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative(
+    let inbound = Arc::new(DrainHandle::cooperative_with_budget(
         0,
         vec![(ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox)))],
+        drain_buffer_budget_bytes,
     ));
     // The leader hosts no producer fragments, but its senders carry the control plane:
     // work-unit frames (and later dynamic filters) flow leader -> worker through them. Empty
@@ -270,15 +308,47 @@ impl WorkerSession {
     }
 }
 
-/// Attach to the leader-initialized region as worker `proc_idx` (`>= 1`).
+/// Attach to the leader-initialized region as worker `proc_idx` (`>= 1`) with an unbounded
+/// drain buffer.
+///
+/// Embedders that need a safety cap should call [`worker_setup_with_drain_budget`].
 ///
 /// # Safety
-/// - `base`/`region_total` must match the region the leader initialized via [`leader_setup`].
-/// - `base` must be at least 8-byte (MAXALIGN) aligned; the ring headers hold atomics.
+/// The safety requirements are identical to [`worker_setup_with_drain_budget`].
 pub unsafe fn worker_setup(
     base: *mut c_void,
     region_total: usize,
     proc_idx: u32,
+    wakeup: Arc<dyn Wakeup>,
+    receiver_token: u64,
+    interrupt: Arc<dyn Interrupt>,
+) -> Result<WorkerSession> {
+    unsafe {
+        worker_setup_with_drain_budget(
+            base,
+            region_total,
+            proc_idx,
+            None,
+            wakeup,
+            receiver_token,
+            interrupt,
+        )
+    }
+}
+
+/// Attach to the leader-initialized region as worker `proc_idx` (`>= 1`).
+///
+/// `drain_buffer_budget_bytes` is the same per-proc drain-buffer cap as [`leader_setup`]
+/// (`None` = unbounded).
+///
+/// # Safety
+/// - `base`/`region_total` must match the region the leader initialized via [`leader_setup`].
+/// - `base` must be at least 8-byte (MAXALIGN) aligned; the ring headers hold atomics.
+pub unsafe fn worker_setup_with_drain_budget(
+    base: *mut c_void,
+    region_total: usize,
+    proc_idx: u32,
+    drain_buffer_budget_bytes: Option<usize>,
     wakeup: Arc<dyn Wakeup>,
     receiver_token: u64,
     interrupt: Arc<dyn Interrupt>,
@@ -314,12 +384,13 @@ pub unsafe fn worker_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative(
+    let inbound = Arc::new(DrainHandle::cooperative_with_budget(
         proc_idx,
         vec![
             (ReceiverScope::Inbox, MppReceiver::new(Box::new(inbox))),
             (ReceiverScope::SelfLoop, MppReceiver::new(Box::new(self_rx))),
         ],
+        drain_buffer_budget_bytes,
     ));
     let mesh = Arc::new(MppMesh::new(
         proc_idx,

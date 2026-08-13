@@ -1352,4 +1352,131 @@ mod tests {
 
         let _ = worker_handle.join().await;
     }
+
+    /// A drain-budget overflow is latched on the affected input buffer instead of escaping the
+    /// request pump as `(Err, None)`. The fragment consumer then returns that error through the
+    /// normal task path, which still knows the requester proc and sends it a `TaskError`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_drain_budget_overflow_propagates_task_error() {
+        use crate::proto as pb;
+        use crate::shm::run_execute_task_loop;
+        use crate::shm::setup::worker_setup_with_drain_budget;
+        use crate::shm::transport::{DrainItem, ExecuteTaskFrame, SendBatchStats};
+        use tokio_util::sync::CancellationToken;
+
+        let n_procs = 2;
+        let region_total = dsm_region_bytes(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
+        let region = HeapRegion::new(region_total);
+        let base = SharedBase(region.base());
+        let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
+
+        let leader_attach = unsafe {
+            leader_setup(
+                base.0,
+                n_procs,
+                IN_PROCESS_QUEUE_BYTES,
+                &[],
+                Arc::clone(&wakeup),
+                receiver_token(0),
+                Arc::new(NoInterrupt),
+                /* attach_senders */ true,
+            )
+        }
+        .unwrap();
+        let leader_mesh = Arc::clone(&leader_attach.mesh);
+
+        let worker_attach = unsafe {
+            worker_setup_with_drain_budget(
+                base.0,
+                region_total,
+                1,
+                Some(1),
+                Arc::clone(&wakeup),
+                receiver_token(1),
+                Arc::new(NoInterrupt),
+            )
+        }
+        .unwrap();
+        let worker_mesh = Arc::clone(&worker_attach.mesh);
+
+        let input_stream = MppDataStreamKey::new(9, 0, 0);
+        let input = worker_mesh
+            .inbound_receiver()
+            .register_data_channel(0, input_stream);
+
+        use datafusion::common::runtime::SpawnedTask;
+        let loop_mesh = Arc::clone(&worker_mesh);
+        let worker_handle = SpawnedTask::spawn(async move {
+            run_execute_task_loop(
+                &loop_mesh,
+                1,
+                0,
+                1,
+                CancellationToken::new(),
+                move |_req, _hdr, _range| {
+                    let input = Arc::clone(&input);
+                    async move {
+                        loop {
+                            match input.try_pop() {
+                                Some(DrainItem::Failed(msg)) => {
+                                    return Err(DataFusionError::Execution(msg));
+                                }
+                                Some(DrainItem::Batch(_)) => {}
+                                Some(DrainItem::Eof) => return Ok(()),
+                                None => tokio::task::yield_now().await,
+                            }
+                        }
+                    }
+                },
+            )
+            .await
+        });
+
+        let output = leader_mesh
+            .inbound_receiver()
+            .register_data_channel(1, MppDataStreamKey::new(1, 0, 0));
+        let request = ExecuteTaskFrame::from_parts(
+            pb::ExecuteTaskRequest {
+                task_key: Some(pb::TaskKey {
+                    query_id: vec![2; 16],
+                    stage_id: 1,
+                    task_number: 0,
+                }),
+                target_partition_start: 0,
+                target_partition_end: 1,
+                producer_head: None,
+            },
+            &http::HeaderMap::new(),
+        )
+        .unwrap();
+        leader_mesh.send_execute_task(1, 0, request).await.unwrap();
+
+        let input_sender = leader_attach.outbound_senders()[1]
+            .as_ref()
+            .expect("leader sender to worker")
+            .clone_with_header(MppFrameHeader::batch(input_stream, 0));
+        input_sender
+            .send_batch_traced(&table_partitions(1)[0][0], &mut SendBatchStats::default())
+            .await
+            .unwrap();
+
+        let mut item = None;
+        for _ in 0..100 {
+            worker_mesh.inbound_receiver().try_drain_pass().unwrap();
+            leader_mesh.inbound_receiver().try_drain_pass().unwrap();
+            item = output.try_pop();
+            if item.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let item = item.expect("drain overflow must reach requester as TaskError");
+        assert!(
+            matches!(item, DrainItem::Failed(ref msg) if msg.contains("MPP drain buffer exceeded")),
+            "expected drain-budget TaskError, got: {item:?}"
+        );
+        let worker_result = worker_handle.join().await.expect("worker task join");
+        assert!(worker_result.is_err());
+    }
 }

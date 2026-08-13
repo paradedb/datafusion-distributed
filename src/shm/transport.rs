@@ -25,6 +25,10 @@
 //!   reads from. Decouples consumer-side from producer-side backpressure: the drain
 //!   always makes forward progress on the inbound rings, so a stalled consumer can't
 //!   propagate backpressure to remote producers and cause a peer-mesh stall.
+//! - [`DrainMemory`]: dedicated per-proc cap on bytes held in those drain buffers. Over
+//!   the limit, the affected channel is failed with [`DataFusionError::ResourcesExhausted`]
+//!   rather than blocking (a blocking bound would reintroduce the symmetric-send deadlock
+//!   the drain exists to break). Independent of the fragment operator `MemoryPool`.
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -41,6 +45,9 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::DataFusionError;
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool,
+};
 use prost::Message;
 
 use crate::common::deserialize_uuid;
@@ -735,6 +742,52 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
     }
 }
 
+/// Dedicated memory budget for all [`DrainBuffer`]s owned by one [`DrainHandle`].
+///
+/// Sized independently of the fragment operator pool: transport staging is mesh-scoped and
+/// must not share a per-fragment `TaskContext` reservation. `None` is unbounded (unit tests and
+/// harnesses that have not opted into a cap).
+struct DrainMemory {
+    pool: Arc<dyn MemoryPool>,
+    limit: Option<usize>,
+}
+
+impl std::fmt::Debug for DrainMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DrainMemory")
+            .field("limit", &self.limit)
+            .field("reserved", &self.pool.reserved())
+            .finish()
+    }
+}
+
+impl DrainMemory {
+    fn new(limit: Option<usize>) -> Self {
+        let pool: Arc<dyn MemoryPool> = match limit {
+            Some(limit) => Arc::new(GreedyMemoryPool::new(limit)),
+            None => Arc::new(UnboundedMemoryPool::default()),
+        };
+        Self { pool, limit }
+    }
+
+    fn register(&self) -> MemoryReservation {
+        MemoryConsumer::new("mpp_drain_channel").register(&self.pool)
+    }
+
+    fn exhausted(&self) -> DataFusionError {
+        let limit = self.limit.unwrap_or(0);
+        DataFusionError::ResourcesExhausted(format!(
+            "MPP drain buffer exceeded the limit of {limit} bytes; raise work_mem \
+             or reduce parallelism / broadcast fan-out"
+        ))
+    }
+
+    #[cfg(test)]
+    fn reserved(&self) -> usize {
+        self.pool.reserved()
+    }
+}
+
 /// Local queue between a drain (either the cooperative `try_drain_pass` or the test-only thread
 /// variant) and the consumer that pops batches.
 ///
@@ -744,21 +797,27 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
 /// for any channel routed through it. The test-only thread path uses a single shared buffer with
 /// `num_sources = N` over an N-sender setup.
 ///
-/// Push side: callers append deserialized batches; on source detach (or per-channel `Eof` frame)
+/// Push side: callers append deserialized batches after reserving their bytes against the
+/// handle's [`DrainMemory`]; on source detach (or per-channel `Eof` frame)
 /// [`DrainBuffer::notify_source_done`] is called. Once `sources_done >= num_sources` AND the
 /// queue is empty, `try_pop` returns [`DrainItem::Eof`].
 ///
 /// Pop side: cooperative consumers loop on `try_pop` + `yield_now`. The test-only `pop_front`
-/// blocks on the condvar.
+/// blocks on the condvar. Both paths release the batch's reservation on pop (or on `Drop`).
 #[derive(Debug)]
 pub(super) struct DrainBuffer {
     inner: Mutex<DrainBufferInner>,
     cond: Condvar,
+    /// Shared pool/limit used to create this buffer's reservation and format overflow errors.
+    memory: Arc<DrainMemory>,
 }
 
 #[derive(Debug)]
 struct DrainBufferInner {
     queue: VecDeque<RecordBatch>,
+    /// Per-channel reservation against the handle-wide pool. Shrunk on pop; dropping the
+    /// buffer releases all bytes still queued without a separate teardown path.
+    reservation: MemoryReservation,
     num_sources: u32,
     sources_done: u32,
     /// Consumer-side cancel flag. When set (e.g., query cancelled or `DrainHandle` dropped),
@@ -786,24 +845,58 @@ impl DrainBuffer {
     /// Create a drain buffer expecting `num_sources` inbound queues. For a
     /// proc in an N-proc mesh, `num_sources == N - 1` (all peers
     /// excluding self — the self-partition bypasses the buffer).
+    ///
+    /// Uses an unbounded [`DrainMemory`] budget; production handles pass a shared
+    /// budget via [`Self::with_memory`].
+    #[cfg(test)]
     pub fn new(num_sources: u32) -> Arc<Self> {
+        Self::with_memory(num_sources, Arc::new(DrainMemory::new(None)))
+    }
+
+    fn with_memory(num_sources: u32, memory: Arc<DrainMemory>) -> Arc<Self> {
+        let reservation = memory.register();
         Arc::new(Self {
             inner: Mutex::new(DrainBufferInner {
                 queue: VecDeque::new(),
+                reservation,
                 num_sources,
                 sources_done: 0,
                 cancelled: false,
                 failed: None,
             }),
             cond: Condvar::new(),
+            memory,
         })
     }
 
-    /// Push a freshly-received batch into the local queue.
-    pub fn push_batch(&self, batch: RecordBatch) {
+    /// Push a freshly-received batch into the local queue after reserving its footprint.
+    /// Returns [`DataFusionError::ResourcesExhausted`] when the handle's drain budget is full —
+    /// never blocks waiting for the consumer to free space.
+    pub fn try_push_batch(&self, batch: RecordBatch) -> Result<(), DataFusionError> {
+        let bytes = batch.get_array_memory_size();
         let mut guard = self.inner.lock().expect("DrainBuffer mutex poisoned");
+        // Once a channel has failed/cancelled, keep emptying its shm ring but discard the
+        // decoded batches. Its consumer is already unwinding and will cancel the producer.
+        if guard.failed.is_some() || guard.cancelled {
+            return Ok(());
+        }
+        // The IPC frame has already been decoded into `batch` before admission, so the cap
+        // bounds queued bytes but transient process memory may exceed it by one decoded batch.
+        guard
+            .reservation
+            .try_grow(bytes)
+            .map_err(|_| self.memory.exhausted())?;
         guard.queue.push_back(batch);
         self.cond.notify_one();
+        Ok(())
+    }
+
+    /// Push without fallibility. Panics if the shared budget rejects the reservation
+    /// (production code must use [`Self::try_push_batch`]).
+    #[cfg(test)]
+    pub fn push_batch(&self, batch: RecordBatch) {
+        self.try_push_batch(batch)
+            .expect("DrainBuffer::push_batch: drain memory reservation failed");
     }
 
     /// Mark one source queue as detached. Safe to call from the drain thread
@@ -842,7 +935,11 @@ impl DrainBuffer {
     /// iterations.
     pub fn try_pop(&self) -> Option<DrainItem> {
         let mut guard = self.inner.lock().expect("DrainBuffer mutex poisoned");
-        Self::try_pop_locked(&mut guard)
+        let item = Self::try_pop_locked(&mut guard);
+        if let Some(DrainItem::Batch(ref batch)) = item {
+            guard.reservation.shrink(batch.get_array_memory_size());
+        }
+        item
     }
 
     /// Shared body of [`try_pop`] and the test-only [`Self::pop_front`].
@@ -1781,6 +1878,9 @@ pub struct DrainHandle {
     /// that stream cleanly, so a consumer that stopped reading early doesn't leave it spinning to
     /// the statement timeout.
     cancelled_streams: Mutex<HashSet<MppDataStreamKey>>,
+    /// Cap on bytes held across every channel buffer owned by this handle. Shared with each
+    /// [`DrainBuffer`] so push/pop/drop account against one per-proc budget.
+    memory: Arc<DrainMemory>,
 }
 
 #[derive(Default)]
@@ -1866,12 +1966,29 @@ enum ExecuteTaskSlot {
 }
 
 impl DrainHandle {
-    /// Construct a cooperative drain handle. Channel buffers are populated lazily by
-    /// [`Self::try_drain_pass`] when a frame arrives, or up-front by [`Self::register_channel`]
-    /// when a consumer needs a buffer to wait on before any frame has come in.
+    /// Construct a cooperative drain handle with an unbounded drain-buffer budget.
+    /// Channel buffers are populated lazily by [`Self::try_drain_pass`] when a frame arrives, or
+    /// up-front by [`Self::register_channel`] when a consumer needs a buffer to wait on before any
+    /// frame has come in.
+    #[cfg(test)]
     pub(super) fn cooperative(
         this_proc: u32,
         receivers: Vec<(ReceiverScope, MppReceiver)>,
+    ) -> Self {
+        Self::cooperative_with_budget(this_proc, receivers, None)
+    }
+
+    /// Construct a cooperative drain handle.
+    ///
+    /// `drain_buffer_budget_bytes`:
+    /// - `None` — unbounded (tests / harnesses).
+    /// - `Some(limit)` — dedicated per-proc cap on buffered `RecordBatch` bytes across all demuxed
+    ///   channels. Exceeding it latches [`DataFusionError::ResourcesExhausted`] on the affected
+    ///   channel without blocking [`Self::try_drain_pass`].
+    pub(super) fn cooperative_with_budget(
+        this_proc: u32,
+        receivers: Vec<(ReceiverScope, MppReceiver)>,
+        drain_buffer_budget_bytes: Option<usize>,
     ) -> Self {
         let wrapped = receivers.into_iter().map(Some).collect();
         let (task_metrics_tx, task_metrics_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1885,6 +2002,7 @@ impl DrainHandle {
             set_plan_registry: Mutex::new(SetPlanRegistry::default()),
             execute_task_registry: Mutex::new(ExecuteTaskRegistry::default()),
             cancelled_streams: Mutex::new(HashSet::default()),
+            memory: Arc::new(DrainMemory::new(drain_buffer_budget_bytes)),
         }
     }
 
@@ -2195,7 +2313,7 @@ impl DrainHandle {
                 // num_sources stays 1: each (sender_proc, stage, task, partition) tuple has
                 // exactly one upstream (the named sender), even though the underlying
                 // inbox is shared across all senders.
-                DrainBuffer::new(1)
+                DrainBuffer::with_memory(1, Arc::clone(&self.memory))
             })
             .clone();
         drop(guard);
@@ -2272,7 +2390,17 @@ impl DrainHandle {
                     RecvBatchOutcome::Batch { header, batch } => {
                         let buf =
                             self.register_data_channel(header.sender_proc(), header.data_stream());
-                        buf.push_batch(batch);
+                        if let Err(e) = buf.try_push_batch(batch) {
+                            // Latch a data-channel failure and keep draining. The consumer
+                            // observes DrainItem::Failed, so its fragment returns the error
+                            // through the normal task path with the requester proc still known
+                            // and publishes TaskError. Returning the overflow here would make
+                            // the request pump return `(Err, None)` and skip that notification.
+                            //
+                            // Never wait for budget: blocking cooperative drain would recreate
+                            // the symmetric-send deadlock it exists to break.
+                            buf.fail_pending(&e.to_string());
+                        }
                     }
                     RecvBatchOutcome::Eof { header } => {
                         let buf =
@@ -2507,6 +2635,8 @@ mod tests {
             let mut guard = self.inner.lock().expect("DrainBuffer mutex poisoned");
             loop {
                 if let Some(batch) = guard.queue.pop_front() {
+                    let bytes = batch.get_array_memory_size();
+                    guard.reservation.shrink(bytes);
                     return DrainItem::Batch(batch);
                 }
                 if let Some(msg) = &guard.failed {
@@ -4244,5 +4374,97 @@ mod tests {
 
         assert!(matches!(buf_a.try_pop(), Some(DrainItem::Eof)));
         assert!(matches!(buf_b.try_pop(), Some(DrainItem::Eof)));
+    }
+
+    #[test]
+    fn drain_buffer_budget_errors_without_blocking_and_frees_on_pop() {
+        let memory = Arc::new(DrainMemory::new(Some(1)));
+        let buf = DrainBuffer::with_memory(1, Arc::clone(&memory));
+        let batch = sample_batch(8);
+        let bytes = batch.get_array_memory_size();
+        assert!(bytes > 1, "sample batch must exceed the tiny budget");
+
+        let err = buf
+            .try_push_batch(batch)
+            .expect_err("over-budget push must fail");
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "expected ResourcesExhausted, got {err}"
+        );
+        assert!(
+            err.to_string().contains("MPP drain buffer exceeded"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(memory.reserved(), 0);
+
+        // A budget large enough for one batch admits, then pop frees the reservation
+        // so another push can succeed.
+        let memory = Arc::new(DrainMemory::new(Some(bytes)));
+        let buf = DrainBuffer::with_memory(1, Arc::clone(&memory));
+        buf.try_push_batch(sample_batch(8)).unwrap();
+        assert_eq!(memory.reserved(), bytes);
+        match buf.try_pop() {
+            Some(DrainItem::Batch(b)) => assert_eq!(b.num_rows(), 8),
+            other => panic!("expected batch, got {other:?}"),
+        }
+        assert_eq!(memory.reserved(), 0);
+        buf.try_push_batch(sample_batch(8)).unwrap();
+        assert_eq!(memory.reserved(), bytes);
+        buf.cancel();
+        drop(buf);
+        assert_eq!(
+            memory.reserved(),
+            0,
+            "dropping a cancelled buffer must release queued reservations"
+        );
+
+        // Reservations are per buffer but compete against one handle-wide pool.
+        let memory = Arc::new(DrainMemory::new(Some(bytes)));
+        let first = DrainBuffer::with_memory(1, Arc::clone(&memory));
+        let second = DrainBuffer::with_memory(1, Arc::clone(&memory));
+        first.try_push_batch(sample_batch(8)).unwrap();
+        assert!(
+            matches!(
+                second.try_push_batch(sample_batch(8)),
+                Err(DataFusionError::ResourcesExhausted(_))
+            ),
+            "the second channel must observe the shared cap"
+        );
+        drop(first);
+        assert_eq!(memory.reserved(), 0);
+        second.try_push_batch(sample_batch(8)).unwrap();
+    }
+
+    #[test]
+    fn try_drain_pass_latches_drain_budget_failure_on_consumer() {
+        let (tx, rx) = in_proc_channel(8);
+        let tx_arc: Arc<dyn BatchChannelSender> = Arc::new(tx);
+        let stream = MppDataStreamKey::new(0, 0, 0);
+        let sender = MppSender::with_header(Arc::clone(&tx_arc), MppFrameHeader::batch(stream, 0));
+        let receiver = MppReceiver::new(Box::new(rx));
+        let handle = DrainHandle::cooperative_with_budget(
+            0,
+            vec![(ReceiverScope::Inbox, receiver)],
+            Some(1),
+        );
+
+        sender.send_batch(&sample_batch(8)).unwrap();
+        // Once the first batch latches failure, this second batch must be discarded while
+        // the ring continues draining rather than allocating or returning an error.
+        sender.send_batch(&sample_batch(8)).unwrap();
+        drop(sender);
+        drop(tx_arc);
+
+        handle
+            .try_drain_pass()
+            .expect("budget overflow must be reported by the consumer, not the pump");
+        let buffer = handle.register_data_channel(0, stream);
+        match buffer.try_pop() {
+            Some(DrainItem::Failed(msg)) => {
+                assert!(msg.contains("MPP drain buffer exceeded"), "{msg}");
+            }
+            other => panic!("expected latched drain-buffer failure, got {other:?}"),
+        }
+        assert_eq!(handle.memory.reserved(), 0);
     }
 }

@@ -550,7 +550,7 @@ impl MppFrameHeader {
 ///
 /// Caller is expected to hold `buf` alive across many encodes so the peak-sized
 /// allocation amortizes (~500 KB/batch on the 25M GROUP BY bench).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn encode_frame_into(
     header: MppFrameHeader,
     batch: &RecordBatch,

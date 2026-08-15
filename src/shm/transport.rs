@@ -2875,19 +2875,34 @@ mod tests {
         RecordBatch::try_new(schema, vec![StdArc::new(ids), StdArc::new(names)]).unwrap()
     }
 
+    fn round_trip_schema_once_batch(
+        header: MppFrameHeader,
+        batch: &RecordBatch,
+    ) -> Result<(MppFrameHeader, RecordBatch), DataFusionError> {
+        let stream = header.data_stream();
+        let sender_proc = header.sender_proc();
+        let mut enc = IpcStreamEncodeState::default();
+        let mut schema_buf = Vec::new();
+        let mut batch_buf = Vec::new();
+        encode_schema_frame_into(stream, sender_proc, batch.schema(), &mut enc, &mut schema_buf)?;
+        encode_batch_body_frame_into(header, batch, &mut enc, &mut batch_buf)?;
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![schema_buf, batch_buf]));
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::Batch { header, batch } => Ok((header, batch)),
+            other => Err(DataFusionError::Execution(format!(
+                "unexpected recv outcome: {other:?}"
+            ))),
+        }
+    }
+
     #[test]
     fn frame_round_trips_a_batch_with_header() {
         let orig = sample_batch(64);
         let header = MppFrameHeader::batch(MppDataStreamKey::new(7, 0, 3), 0);
-        let mut buf = Vec::with_capacity(1024);
-        encode_frame_into(header, &orig, &mut buf).expect("encode_frame");
-
-        let (parsed, body) = decode_frame(&buf).expect("decode_frame");
+        let (parsed, decoded) =
+            round_trip_schema_once_batch(header, &orig).expect("schema-once round trip");
         assert_eq!(parsed, header);
         assert_eq!(parsed.kind().unwrap(), MppFrameKind::Batch);
-        let FrameBody::Batch(decoded) = body else {
-            panic!("Batch frame must carry a batch payload");
-        };
         assert_eq!(decoded.num_rows(), 64);
         assert_eq!(decoded.schema(), orig.schema());
         assert_eq!(decoded.num_columns(), orig.num_columns());
@@ -2954,6 +2969,84 @@ mod tests {
             }
             other => panic!("expected zero-column batch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn schema_once_dictionary_multibatch_round_trips() {
+        let stream = MppDataStreamKey::new(9, 0, 0);
+        let batch_header = MppFrameHeader::batch(stream, 0);
+        let schema = StdArc::new(Schema::new(vec![Field::new("tag", DataType::Utf8, false)]));
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![StdArc::new(StringArray::from_iter_values(["alpha"; 8]))],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema,
+            vec![StdArc::new(StringArray::from_iter_values(["beta"; 16]))],
+        )
+        .unwrap();
+        let mut enc = IpcStreamEncodeState::default();
+        let mut schema_buf = Vec::new();
+        let mut batch_buf = Vec::new();
+        encode_schema_frame_into(stream, 0, b1.schema(), &mut enc, &mut schema_buf).unwrap();
+        encode_batch_body_frame_into(batch_header, &b1, &mut enc, &mut batch_buf).unwrap();
+        let mut batch_buf2 = Vec::new();
+        encode_batch_body_frame_into(batch_header, &b2, &mut enc, &mut batch_buf2).unwrap();
+
+        let receiver =
+            MppReceiver::new(ReplayChannel::over(vec![schema_buf, batch_buf, batch_buf2]));
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::Batch { batch, .. } => assert_eq!(batch.num_rows(), 8),
+            other => panic!("expected first dictionary batch, got {other:?}"),
+        }
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::Batch { batch, .. } => assert_eq!(batch.num_rows(), 16),
+            other => panic!("expected second dictionary batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_before_schema_frame_errors() {
+        let stream = MppDataStreamKey::new(1, 0, 0);
+        let batch_header = MppFrameHeader::batch(stream, 0);
+        let batch = sample_batch(4);
+        let mut enc = IpcStreamEncodeState::default();
+        let mut batch_buf = Vec::new();
+        encode_batch_body_frame_into(batch_header, &batch, &mut enc, &mut batch_buf).unwrap();
+
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![batch_buf]));
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::TransportError(err) => {
+                assert!(format!("{err}").contains("before schema frame"));
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_change_on_send_errors() {
+        let sink = BoundedSink::new(1024 * 1024);
+        let sender = MppSender::with_header(
+            Arc::clone(&sink) as Arc<dyn BatchChannelSender>,
+            MppFrameHeader::batch(MppDataStreamKey::new(2, 0, 1), 0),
+        );
+        sender.send_batch(&sample_batch(4)).expect("first batch");
+
+        let other_schema = StdArc::new(Schema::new(vec![Field::new(
+            "other",
+            DataType::Int32,
+            false,
+        )]));
+        let other_batch = RecordBatch::try_new(
+            other_schema,
+            vec![StdArc::new(Int32Array::from_iter_values(0..4))],
+        )
+        .unwrap();
+        let err = sender
+            .send_batch(&other_batch)
+            .expect_err("schema change must fail");
+        assert!(format!("{err}").contains("schema changed"));
     }
 
     #[test]
@@ -3494,8 +3587,8 @@ mod tests {
             let mut buf = Vec::with_capacity(MPP_FRAME_HEADER_SIZE);
             let payload = sample_batch(8);
             encode_frame_into(header, &payload, &mut buf).expect("encode batch");
-            let (parsed, _) = decode_frame(&buf).expect("decode batch");
-            assert_eq!(parsed.sender_proc(), sp, "decoded batch sender_proc");
+            let parsed = MppFrameHeader::parse(&buf).expect("parse batch header");
+            assert_eq!(parsed.sender_proc(), sp, "batch round-trip sp={sp}");
 
             let mut eof_buf = Vec::new();
             encode_eof_frame_into(stream, sp, &mut eof_buf).expect("encode eof");
@@ -3516,19 +3609,11 @@ mod tests {
 
     #[test]
     fn codec_round_trips_many_batch_sizes() {
-        let mut buf = Vec::with_capacity(1024);
         for rows in [0, 1, 7, 64, 1024] {
             let orig = sample_batch(rows);
-            encode_frame_into(
-                MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0),
-                &orig,
-                &mut buf,
-            )
-            .expect("encode");
-            let (_header, body) = decode_frame(&buf).expect("decode");
-            let FrameBody::Batch(decoded) = body else {
-                panic!("Batch frame must carry a batch payload");
-            };
+            let header = MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), 0);
+            let (_header, decoded) =
+                round_trip_schema_once_batch(header, &orig).expect("schema-once round trip");
             assert_eq!(orig.num_rows(), decoded.num_rows());
         }
     }

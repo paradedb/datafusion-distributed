@@ -570,7 +570,6 @@ fn encode_frame_into(
 /// Per-[`MppSender`] Arrow IPC stream encoder state. After the first [`MppFrameKind::Schema`]
 /// frame on a stream, batch frames omit the schema message and reuse dictionary tracker state.
 struct IpcStreamEncodeState {
-    schema_sent: bool,
     schema: Option<SchemaRef>,
     dictionary_tracker: DictionaryTracker,
     data_gen: IpcDataGenerator,
@@ -581,7 +580,6 @@ struct IpcStreamEncodeState {
 impl Default for IpcStreamEncodeState {
     fn default() -> Self {
         Self {
-            schema_sent: false,
             schema: None,
             dictionary_tracker: DictionaryTracker::new(false),
             data_gen: IpcDataGenerator::default(),
@@ -592,10 +590,15 @@ impl Default for IpcStreamEncodeState {
 }
 
 impl IpcStreamEncodeState {
-    fn reset_if_schema_changed(&mut self, batch_schema: SchemaRef) {
-        if self.schema_sent && self.schema.as_ref() != Some(&batch_schema) {
-            *self = Self::default();
+    fn ensure_schema_unchanged(&self, batch_schema: SchemaRef) -> Result<(), DataFusionError> {
+        if let Some(expected) = &self.schema {
+            if expected.as_ref() != batch_schema.as_ref() {
+                return Err(DataFusionError::Execution(
+                    "mpp: batch schema changed mid shuffle stream".into(),
+                ));
+            }
         }
+        Ok(())
     }
 
     fn reset_batch_encode_state(&mut self) {
@@ -1353,8 +1356,8 @@ impl MppSender {
 
         let pending_schema = {
             let mut ipc = self.ipc_encode.borrow_mut();
-            ipc.reset_if_schema_changed(batch.schema());
-            if !ipc.schema_sent {
+            ipc.ensure_schema_unchanged(batch.schema())?;
+            if ipc.schema.is_none() {
                 let t_enc = Instant::now();
                 encode_schema_frame_into(stream, sender_proc, batch.schema(), &mut ipc, scratch)?;
                 stats.encode += t_enc.elapsed();
@@ -1366,7 +1369,6 @@ impl MppSender {
         if let Some(schema) = pending_schema {
             self.spin_send_scratch(scratch, stats).await?;
             let mut ipc = self.ipc_encode.borrow_mut();
-            ipc.schema_sent = true;
             ipc.schema = Some(schema);
         }
 

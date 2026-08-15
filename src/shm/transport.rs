@@ -615,8 +615,6 @@ fn encode_schema_frame_into(
         &state.write_options,
     );
     write_message(&mut *buf, encoded, &state.write_options)?;
-    state.schema_sent = true;
-    state.schema = Some(schema);
     Ok(())
 }
 
@@ -1348,20 +1346,23 @@ impl MppSender {
         let stream = self.header.data_stream();
         let sender_proc = self.header.sender_proc();
 
-        let sent_schema = {
+        let pending_schema = {
             let mut ipc = self.ipc_encode.borrow_mut();
             ipc.reset_if_schema_changed(batch.schema());
             if !ipc.schema_sent {
                 let t_enc = Instant::now();
                 encode_schema_frame_into(stream, sender_proc, batch.schema(), &mut ipc, scratch)?;
                 stats.encode += t_enc.elapsed();
-                true
+                Some(batch.schema())
             } else {
-                false
+                None
             }
         };
-        if sent_schema {
+        if let Some(schema) = pending_schema {
             self.spin_send_scratch(scratch, stats).await?;
+            let mut ipc = self.ipc_encode.borrow_mut();
+            ipc.schema_sent = true;
+            ipc.schema = Some(schema);
         }
 
         {

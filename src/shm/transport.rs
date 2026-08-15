@@ -36,13 +36,14 @@ use std::time::{Duration, Instant};
 use datafusion::arrow::array::{
     ArrayRef, BinaryViewArray, RecordBatch, StringViewArray, UInt64Array,
 };
+use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
-use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::ipc::reader::{StreamDecoder, StreamReader};
+#[cfg(test)]
+use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::ipc::writer::{
-    DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions, StreamWriter,
-    write_message,
+    DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions, write_message,
 };
 use datafusion::common::DataFusionError;
 use prost::Message;
@@ -589,12 +590,12 @@ impl Default for IpcStreamEncodeState {
 
 impl IpcStreamEncodeState {
     fn ensure_schema_unchanged(&self, batch_schema: SchemaRef) -> Result<(), DataFusionError> {
-        if let Some(expected) = &self.schema {
-            if expected.as_ref() != batch_schema.as_ref() {
-                return Err(DataFusionError::Execution(
-                    "mpp: batch schema changed mid shuffle stream".into(),
-                ));
-            }
+        if let Some(expected) = &self.schema
+            && expected.as_ref() != batch_schema.as_ref()
+        {
+            return Err(DataFusionError::Execution(
+                "mpp: batch schema changed mid shuffle stream".into(),
+            ));
         }
         Ok(())
     }
@@ -646,9 +647,11 @@ fn encode_batch_body_frame_into(
     Ok(())
 }
 
-/// Per-stream Arrow IPC decoder primed by one [`MppFrameKind::Schema`] frame.
+/// Per-stream Arrow IPC decoder primed on the first batch frame.
 struct StreamIpcDecodeState {
-    decoder: StreamDecoder,
+    decoder: Option<StreamDecoder>,
+    /// Schema frame bytes held until the first batch primes the decoder.
+    schema_payload: Option<Vec<u8>>,
 }
 
 fn ingest_schema_stream(
@@ -657,26 +660,15 @@ fn ingest_schema_stream(
     decoders: &mut HashMap<PhysicalStreamKey, StreamIpcDecodeState>,
 ) -> Result<(), DataFusionError> {
     let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
-    let mut decoder = StreamDecoder::new();
-    let mut buf = Buffer::from(payload);
-    while !buf.is_empty() {
-        if decoder
-            .decode(&mut buf)
-            .map_err(DataFusionError::from)?
-            .is_some()
-        {
-            return Err(DataFusionError::Execution(
-                "mpp: schema frame carried a record batch".into(),
-            ));
-        }
-    }
-    if decoder.schema().is_none() {
-        return Err(DataFusionError::Execution(
-            "mpp: schema frame carried no Arrow IPC schema".into(),
-        ));
-    }
+    StreamReader::try_new(payload, None).map_err(DataFusionError::from)?;
     // Zero-column schemas are valid; do not reject empty field lists.
-    decoders.insert(key, StreamIpcDecodeState { decoder });
+    decoders.insert(
+        key,
+        StreamIpcDecodeState {
+            decoder: None,
+            schema_payload: Some(payload.to_vec()),
+        },
+    );
     Ok(())
 }
 
@@ -696,13 +688,53 @@ fn decode_batch_payload(
             "mpp: batch frame on stream {key:?} before schema frame"
         ))
     })?;
+
+    if state.decoder.is_none() {
+        let schema_payload = state.schema_payload.as_ref().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "mpp: batch frame on stream {key:?} missing schema payload"
+            ))
+        })?;
+        let mut combined = Vec::with_capacity(schema_payload.len() + payload.len());
+        combined.extend_from_slice(schema_payload);
+        combined.extend_from_slice(payload);
+        let mut decoder = StreamDecoder::new();
+        let mut buf = Buffer::from(combined);
+        let mut batch = None;
+        while !buf.is_empty() {
+            if let Some(decoded) = decoder.decode(&mut buf).map_err(DataFusionError::from)? {
+                if batch.is_some() {
+                    return Err(DataFusionError::Execution(format!(
+                        "mpp: first batch frame on stream {key:?} carried multiple record batches"
+                    )));
+                }
+                batch = Some(decoded);
+            }
+        }
+        if decoder.schema().is_none() {
+            return Err(DataFusionError::Execution(format!(
+                "mpp: first batch frame on stream {key:?} carried no Arrow IPC schema"
+            )));
+        }
+        state.decoder = Some(decoder);
+        state.schema_payload = None;
+        return match batch {
+            Some(batch) => Ok(batch),
+            None => {
+                let schema = state.decoder.as_ref().unwrap().schema().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "mpp: first batch frame on stream {key:?} missing schema after priming"
+                    ))
+                })?;
+                Ok(RecordBatch::new_empty(schema))
+            }
+        };
+    }
+
+    let decoder = state.decoder.as_mut().expect("decoder primed");
     let mut buf = Buffer::from(payload);
     while !buf.is_empty() {
-        if let Some(batch) = state
-            .decoder
-            .decode(&mut buf)
-            .map_err(DataFusionError::from)?
-        {
+        if let Some(batch) = decoder.decode(&mut buf).map_err(DataFusionError::from)? {
             return Ok(batch);
         }
     }
@@ -2884,7 +2916,13 @@ mod tests {
         let mut enc = IpcStreamEncodeState::default();
         let mut schema_buf = Vec::new();
         let mut batch_buf = Vec::new();
-        encode_schema_frame_into(stream, sender_proc, batch.schema(), &mut enc, &mut schema_buf)?;
+        encode_schema_frame_into(
+            stream,
+            sender_proc,
+            batch.schema(),
+            &mut enc,
+            &mut schema_buf,
+        )?;
         encode_batch_body_frame_into(header, batch, &mut enc, &mut batch_buf)?;
         let receiver = MppReceiver::new(ReplayChannel::over(vec![schema_buf, batch_buf]));
         match receiver.try_recv_batch() {
@@ -3854,25 +3892,49 @@ mod tests {
         let sender_proc = 2;
         let stream_a = MppDataStreamKey::new(1, 0, 1);
         let stream_b = MppDataStreamKey::new(1, 3, 1);
-        let inner_a = {
-            let mut buf = Vec::new();
-            encode_frame_into(
+        let batch_a = sample_batch(4);
+        let batch_b = sample_batch(7);
+        let (schema_a, inner_a) = {
+            let mut enc = IpcStreamEncodeState::default();
+            let mut schema = Vec::new();
+            encode_schema_frame_into(
+                stream_a,
+                sender_proc,
+                batch_a.schema(),
+                &mut enc,
+                &mut schema,
+            )
+            .expect("encode schema A");
+            let mut body = Vec::new();
+            encode_batch_body_frame_into(
                 MppFrameHeader::batch(stream_a, sender_proc),
-                &sample_batch(4),
-                &mut buf,
+                &batch_a,
+                &mut enc,
+                &mut body,
             )
             .expect("encode inner A");
-            buf
+            (schema, body)
         };
-        let inner_b = {
-            let mut buf = Vec::new();
-            encode_frame_into(
+        let (schema_b, inner_b) = {
+            let mut enc = IpcStreamEncodeState::default();
+            let mut schema = Vec::new();
+            encode_schema_frame_into(
+                stream_b,
+                sender_proc,
+                batch_b.schema(),
+                &mut enc,
+                &mut schema,
+            )
+            .expect("encode schema B");
+            let mut body = Vec::new();
+            encode_batch_body_frame_into(
                 MppFrameHeader::batch(stream_b, sender_proc),
-                &sample_batch(7),
-                &mut buf,
+                &batch_b,
+                &mut enc,
+                &mut body,
             )
             .expect("encode inner B");
-            buf
+            (schema, body)
         };
         let a_split = inner_a.len() / 2;
         let b_split = inner_b.len() / 2;
@@ -3909,7 +3971,9 @@ mod tests {
             &mut b1,
         );
 
-        let receiver = MppReceiver::new(ReplayChannel::over(vec![a0, b0, a1, b1]));
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![
+            schema_a, schema_b, a0, b0, a1, b1,
+        ]));
         let RecvBatchOutcome::Batch { header, batch } = receiver.try_recv_batch() else {
             panic!("expected reassembled task 0 batch");
         };
@@ -3928,14 +3992,21 @@ mod tests {
     #[test]
     fn eof_clears_abandoned_chunk_prefix() {
         let sender_proc = 3;
+        let stream = MppDataStreamKey::new(5, 0, 0);
+        let batch = sample_batch(4);
+        let mut enc = IpcStreamEncodeState::default();
+        let mut schema = Vec::new();
+        encode_schema_frame_into(stream, sender_proc, batch.schema(), &mut enc, &mut schema)
+            .expect("encode schema");
         let mut inner = Vec::new();
-        encode_frame_into(
-            MppFrameHeader::batch(MppDataStreamKey::new(5, 0, 0), sender_proc),
-            &sample_batch(4),
+        encode_batch_body_frame_into(
+            MppFrameHeader::batch(stream, sender_proc),
+            &batch,
+            &mut enc,
             &mut inner,
         )
         .expect("encode inner");
-        let chunk_header = MppFrameHeader::chunk(MppDataStreamKey::new(5, 0, 0), sender_proc);
+        let chunk_header = MppFrameHeader::chunk(stream, sender_proc);
         let mut partial = Vec::new();
         encode_chunk_frame_into(
             chunk_header,
@@ -3945,13 +4016,17 @@ mod tests {
             &mut partial,
         );
         let mut eof = Vec::new();
-        encode_eof_frame_into(MppDataStreamKey::new(5, 0, 0), sender_proc, &mut eof)
-            .expect("encode eof");
+        encode_eof_frame_into(stream, sender_proc, &mut eof).expect("encode eof");
         // A fresh frame for the stream after the abandonment restarts cleanly at offset 0.
+        let mut schema2 = Vec::new();
+        encode_schema_frame_into(stream, sender_proc, batch.schema(), &mut enc, &mut schema2)
+            .expect("encode schema after eof");
         let mut whole = Vec::new();
         encode_chunk_frame_into(chunk_header, inner.len() as u64, 0, &inner, &mut whole);
 
-        let receiver = MppReceiver::new(ReplayChannel::over(vec![partial, eof, whole]));
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![
+            schema, partial, eof, schema2, whole,
+        ]));
         let RecvBatchOutcome::Eof { header } = receiver.try_recv_batch() else {
             panic!("expected the Eof to pass through");
         };
@@ -3960,10 +4035,11 @@ mod tests {
             receiver.assemblies.lock().unwrap().is_empty(),
             "the Eof must clear the abandoned prefix"
         );
-        assert!(matches!(
-            receiver.try_recv_batch(),
-            RecvBatchOutcome::Batch { .. }
-        ));
+        let outcome = receiver.try_recv_batch();
+        assert!(
+            matches!(outcome, RecvBatchOutcome::Batch { .. }),
+            "expected reassembled batch after eof, got {outcome:?}"
+        );
     }
 
     /// Reassembly rejects a continuation with no first chunk and an offset that doesn't

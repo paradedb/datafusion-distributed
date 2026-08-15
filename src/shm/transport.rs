@@ -3745,7 +3745,12 @@ mod tests {
             "expected the oversized frame to chunk, got {} frame(s)",
             frames.len()
         );
-        for frame in &frames {
+        let first_kind = MppFrameHeader::parse(&frames[0])
+            .expect("first frame header")
+            .kind()
+            .expect("first frame kind");
+        assert_eq!(first_kind, MppFrameKind::Schema);
+        for frame in &frames[1..] {
             assert!(
                 frame.len() <= cap,
                 "frame of {} bytes over cap",
@@ -3753,9 +3758,6 @@ mod tests {
             );
             let header = MppFrameHeader::parse(frame).expect("frame header");
             let kind = header.kind().expect("kind");
-            if kind == MppFrameKind::Schema {
-                continue;
-            }
             assert_eq!(kind, MppFrameKind::Chunk);
             assert_eq!(
                 (header.stage_id, header.task_id, header.partition),

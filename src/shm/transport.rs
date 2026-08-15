@@ -671,6 +671,7 @@ fn ingest_schema_stream(
             "mpp: schema frame carried no Arrow IPC schema".into(),
         ));
     }
+    // Zero-column schemas are valid; do not reject empty field lists.
     decoders.insert(key, StreamIpcDecodeState { decoder });
     Ok(())
 }
@@ -2922,6 +2923,28 @@ mod tests {
         match receiver.try_recv_batch() {
             RecvBatchOutcome::Batch { batch, .. } => assert_eq!(batch.num_rows(), 16),
             other => panic!("expected second batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_once_accepts_zero_column_schema() {
+        let stream = MppDataStreamKey::new(5, 0, 2);
+        let batch_header = MppFrameHeader::batch(stream, 0);
+        let schema = StdArc::new(Schema::empty());
+        let batch = RecordBatch::new_empty(schema.clone());
+        let mut enc = IpcStreamEncodeState::default();
+        let mut schema_buf = Vec::new();
+        let mut batch_buf = Vec::new();
+        encode_schema_frame_into(stream, 0, schema, &mut enc, &mut schema_buf).unwrap();
+        encode_batch_body_frame_into(batch_header, &batch, &mut enc, &mut batch_buf).unwrap();
+
+        let receiver = MppReceiver::new(ReplayChannel::over(vec![schema_buf, batch_buf]));
+        match receiver.try_recv_batch() {
+            RecvBatchOutcome::Batch { batch, .. } => {
+                assert_eq!(batch.num_columns(), 0);
+                assert_eq!(batch.num_rows(), 0);
+            }
+            other => panic!("expected zero-column batch, got {other:?}"),
         }
     }
 

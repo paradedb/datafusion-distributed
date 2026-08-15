@@ -680,34 +680,30 @@ fn decode_batch_payload(
     payload: &[u8],
     stream_decoders: Option<&mut HashMap<PhysicalStreamKey, StreamIpcDecodeState>>,
 ) -> Result<RecordBatch, DataFusionError> {
-    if let Some(decoders) = stream_decoders {
-        let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
-        if let Some(state) = decoders.get_mut(&key) {
-            let mut buf = Buffer::from(payload);
-            while !buf.is_empty() {
-                if let Some(batch) = state
-                    .decoder
-                    .decode(&mut buf)
-                    .map_err(DataFusionError::from)?
-                {
-                    return Ok(batch);
-                }
-            }
-            return Err(DataFusionError::Execution(format!(
-                "mpp: batch frame on stream {key:?} carried no decodable record batch"
-            )));
+    let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
+    let Some(decoders) = stream_decoders else {
+        return Err(DataFusionError::Execution(format!(
+            "mpp: batch frame on stream {key:?} without stream decoder state"
+        )));
+    };
+    let state = decoders.get_mut(&key).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "mpp: batch frame on stream {key:?} before schema frame"
+        ))
+    })?;
+    let mut buf = Buffer::from(payload);
+    while !buf.is_empty() {
+        if let Some(batch) = state
+            .decoder
+            .decode(&mut buf)
+            .map_err(DataFusionError::from)?
+        {
+            return Ok(batch);
         }
     }
-    let mut combined = {
-        let mut reader = StreamReader::try_new(payload, None)?;
-        reader
-            .next()
-            .ok_or_else(|| {
-                DataFusionError::Execution("mpp: empty arrow-ipc stream in decode_frame".into())
-            })?
-            .map_err(DataFusionError::from)?
-    };
-    Ok(combined)
+    Err(DataFusionError::Execution(format!(
+        "mpp: batch frame on stream {key:?} carried no decodable record batch"
+    )))
 }
 
 /// Copy `len` rows starting at `offset` into fresh, tightly-packed arrays. A plain

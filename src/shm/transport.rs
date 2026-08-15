@@ -63,11 +63,9 @@ const MPP_FRAME_HEADER_SIZE: usize = 20;
 /// Kind of payload following [`MppFrameHeader`].
 ///
 /// `Batch` is the common case: after an initial [`MppFrameKind::Schema`] frame on the stream,
-/// batch payloads are Arrow IPC record-batch messages only (no repeated schema). A legacy
-/// sender may still embed a full IPC stream in every batch; receivers accept that when no schema
-/// state exists yet. `Eof` carries no payload.
-/// `(stage_id, task_id, partition)` channel is done, even though the underlying shm_mq queue may still
-/// carry frames for other channels.
+/// batch payloads are Arrow IPC record-batch messages only (no repeated schema). `Eof` marks
+/// that the logical `(stage_id, task_id, partition)` channel is done, even though the
+/// underlying shm_mq queue may still carry frames for other channels.
 ///
 /// The remaining kinds are the control plane riding the same rings. For them the header's
 /// `partition` field carries the task number instead: a work unit already names its

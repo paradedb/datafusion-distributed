@@ -597,6 +597,11 @@ impl IpcStreamEncodeState {
             *self = Self::default();
         }
     }
+
+    fn reset_batch_encode_state(&mut self) {
+        self.dictionary_tracker = DictionaryTracker::new(false);
+        self.ipc_write_context = IpcWriteContext::default();
+    }
 }
 
 fn encode_schema_frame_into(
@@ -1381,6 +1386,7 @@ impl MppSender {
         let compacted = compact_rows(batch, 0, batch.num_rows())?;
         {
             let mut ipc = self.ipc_encode.borrow_mut();
+            ipc.reset_batch_encode_state();
             let t_enc = Instant::now();
             encode_batch_body_frame_into(self.header, &compacted, &mut ipc, scratch)?;
             stats.encode += t_enc.elapsed();

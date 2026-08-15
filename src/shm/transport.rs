@@ -38,7 +38,8 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
-use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::buffer::Buffer;
+use datafusion::arrow::ipc::reader::{StreamDecoder, StreamReader};
 use datafusion::arrow::ipc::writer::{
     DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions, StreamWriter,
     write_message,
@@ -641,9 +642,9 @@ fn encode_batch_body_frame_into(
     Ok(())
 }
 
-/// Arrow IPC stream prefix (schema message) retained after [`MppFrameKind::Schema`].
+/// Per-stream Arrow IPC decoder primed by one [`MppFrameKind::Schema`] frame.
 struct StreamIpcDecodeState {
-    schema_stream_prefix: Vec<u8>,
+    decoder: StreamDecoder,
 }
 
 fn ingest_schema_stream(
@@ -652,18 +653,25 @@ fn ingest_schema_stream(
     decoders: &mut HashMap<PhysicalStreamKey, StreamIpcDecodeState>,
 ) -> Result<(), DataFusionError> {
     let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
-    let reader = StreamReader::try_new(payload, None)?;
-    if reader.schema().fields().is_empty() {
+    let mut decoder = StreamDecoder::new();
+    let mut buf = Buffer::from(payload);
+    while !buf.is_empty() {
+        if decoder
+            .decode(&mut buf)
+            .map_err(DataFusionError::from)?
+            .is_some()
+        {
+            return Err(DataFusionError::Execution(
+                "mpp: schema frame carried a record batch".into(),
+            ));
+        }
+    }
+    if decoder.schema().is_none() {
         return Err(DataFusionError::Execution(
             "mpp: schema frame carried no Arrow IPC schema".into(),
         ));
     }
-    decoders.insert(
-        key,
-        StreamIpcDecodeState {
-            schema_stream_prefix: payload.to_vec(),
-        },
-    );
+    decoders.insert(key, StreamIpcDecodeState { decoder });
     Ok(())
 }
 
@@ -674,28 +682,32 @@ fn decode_batch_payload(
 ) -> Result<RecordBatch, DataFusionError> {
     if let Some(decoders) = stream_decoders {
         let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
-        if let Some(state) = decoders.get(&key) {
-            let mut combined = Vec::with_capacity(state.schema_stream_prefix.len() + payload.len());
-            combined.extend_from_slice(&state.schema_stream_prefix);
-            combined.extend_from_slice(payload);
-            let mut reader = StreamReader::try_new(combined.as_slice(), None)?;
-            return reader
-                .next()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "mpp: batch frame carried no decodable Arrow IPC record batch".into(),
-                    )
-                })?
-                .map_err(DataFusionError::from);
+        if let Some(state) = decoders.get_mut(&key) {
+            let mut buf = Buffer::from(payload);
+            while !buf.is_empty() {
+                if let Some(batch) = state
+                    .decoder
+                    .decode(&mut buf)
+                    .map_err(DataFusionError::from)?
+                {
+                    return Ok(batch);
+                }
+            }
+            return Err(DataFusionError::Execution(format!(
+                "mpp: batch frame on stream {key:?} carried no decodable record batch"
+            )));
         }
     }
-    let mut reader = StreamReader::try_new(payload, None)?;
-    reader
-        .next()
-        .ok_or_else(|| {
-            DataFusionError::Execution("mpp: empty arrow-ipc stream in decode_frame".into())
-        })?
-        .map_err(DataFusionError::from)
+    let mut combined = {
+        let mut reader = StreamReader::try_new(payload, None)?;
+        reader
+            .next()
+            .ok_or_else(|| {
+                DataFusionError::Execution("mpp: empty arrow-ipc stream in decode_frame".into())
+            })?
+            .map_err(DataFusionError::from)?
+    };
+    Ok(combined)
 }
 
 /// Copy `len` rows starting at `offset` into fresh, tightly-packed arrays. A plain

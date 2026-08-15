@@ -1182,12 +1182,13 @@ pub struct MppSender {
     ipc_encode: std::cell::RefCell<IpcStreamEncodeState>,
 }
 
-// SAFETY: only `scratch: RefCell<Vec<u8>>` and the trait-object `Arc`s are `!Sync`. Callers
-// compose `send_*_traced` futures via `tokio::spawn` / `join_all`, which makes the compiler
-// require `&Self: Send` and therefore `Self: Sync`. The shared-memory model runs those futures on
-// a current-thread runtime (see the module docs), so the cell is never observed from two
-// threads; a multi-thread embedder would additionally be serialized by `send_lock` across
-// every send path that touches `scratch`.
+// SAFETY: only `scratch: RefCell<Vec<u8>>`, `ipc_encode: RefCell<IpcStreamEncodeState>`,
+// and the trait-object `Arc`s are `!Sync`. Callers compose `send_*_traced` futures via
+// `tokio::spawn` / `join_all`, which makes the compiler require `&Self: Send` and therefore
+// `Self: Sync`. The shared-memory model runs those futures on a current-thread runtime (see
+// the module docs), so the cells are never observed from two threads; a multi-thread embedder
+// would additionally be serialized by `send_lock` across every send path that touches
+// `scratch` or `ipc_encode`.
 unsafe impl Sync for MppSender {}
 
 impl MppSender {

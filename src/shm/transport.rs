@@ -661,7 +661,6 @@ fn ingest_schema_stream(
 ) -> Result<(), DataFusionError> {
     let key = PhysicalStreamKey::new(header.sender_proc(), header.data_stream());
     StreamReader::try_new(payload, None).map_err(DataFusionError::from)?;
-    // Zero-column schemas are valid; do not reject empty field lists.
     decoders.insert(
         key,
         StreamIpcDecodeState {

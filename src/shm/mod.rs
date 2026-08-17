@@ -66,8 +66,8 @@ pub use mpsc_ring::{NO_RECEIVER_TOKEN, Wakeup};
 pub use runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
 pub use setup::{
     LeaderSession, WorkerSession, collect_task_metrics, dsm_region_bytes,
-    install_work_unit_channels, leader_setup, region_total, run_execute_task_loop,
-    run_worker_fragment, worker_setup,
+    install_work_unit_channels, leader_setup, leader_setup_with_drain_budget, region_total,
+    run_execute_task_loop, run_worker_fragment, worker_setup, worker_setup_with_drain_budget,
 };
 pub use sink::{PartitionSink, WorkerSink};
 pub use transport::{

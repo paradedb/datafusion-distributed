@@ -46,8 +46,8 @@ use super::mpsc_ring::{DsmMpscSender, NO_RECEIVER_TOKEN, Wakeup};
 use super::runtime::MppMesh;
 use super::transport::{
     BatchChannelSender, DrainHandle, ExecuteTaskRx, IncomingExecuteTaskRequest, Interrupt,
-    MppDataStreamKey, MppFrameHeader, MppReceiver, MppSender, ReceiverScope, SELF_LOOP_CAPACITY,
-    in_proc_channel,
+    MppDataStreamKey, MppFrameHeader, MppReceiver, MppSender, ReceiverScope,
+    in_proc_channel_unbounded,
 };
 use crate::proto as pb;
 use crate::work_unit_feed::RemoteWorkUnitFeedRegistry;
@@ -301,7 +301,7 @@ pub unsafe fn worker_setup(
     // Self-loop in-proc channel: peer-mesh routing can land a producer and its consumer on the same
     // proc, and an MPSC inbox has no slot for a proc sending to itself. The unified drain pulls from
     // both the inbox and this channel.
-    let (self_tx, self_rx) = in_proc_channel(SELF_LOOP_CAPACITY);
+    let (self_tx, self_rx) = in_proc_channel_unbounded();
     let self_tx_arc: Arc<dyn BatchChannelSender> = Arc::new(self_tx);
     outbound[proc_idx as usize] = Some(MppSender::with_header(
         Arc::clone(&self_tx_arc),

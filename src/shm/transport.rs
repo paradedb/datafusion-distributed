@@ -2365,33 +2365,51 @@ impl Drop for DrainHandle {
         self.cancel_channel_buffers();
     }
 }
-/// SPSC channel pair for two use cases:
-/// - Unit tests (bounded capacity, exercising backpressure).
-/// - Production self-loop slots: when a worker's fragment emits a partition destined for
-///   its OWN proc (e.g. peer-mesh hash routing where consumer task t lands on the same
-///   worker as producer task t), the DSM layout has no self-pair inbox: a process is
-///   not its own peer. The dispatcher routes those self-loops through this in-proc
-///   channel, which exposes the same `BatchChannelSender` / `BatchChannelReceiver`
-///   surface as the DSM ring so the drain and channel-buffer registry don't need a
-///   special case.
-///
-/// Production callers pass a very large `capacity` so the channel is effectively unbounded under
-/// steady state. The current-thread Tokio runtime interleaves producer and consumer fragments
-/// via `yield_now().await`, so backpressure would be benign anyway, but unbounded rules out any
-/// chance of self-deadlock if the producer never yields.
+/// Bounded SPSC channel pair for unit tests that exercise backpressure. Production self-loop
+/// slots use [`in_proc_channel_unbounded`].
+#[cfg(test)]
 pub(super) fn in_proc_channel(capacity: usize) -> (InProcSender, InProcReceiver) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(capacity);
     (
         InProcSender {
-            tx,
+            tx: InProcTx::Bounded(tx),
             send_lock: tokio::sync::Mutex::new(()),
         },
         InProcReceiver { rx: Mutex::new(rx) },
     )
 }
 
+/// Unbounded SPSC channel pair for production self-loop slots: when a worker's fragment emits a
+/// partition destined for its OWN proc (e.g. peer-mesh hash routing where consumer task t lands
+/// on the same worker as producer task t), the DSM layout has no self-pair inbox: a process is
+/// not its own peer. The dispatcher routes those self-loops through this in-proc channel, which
+/// exposes the same `BatchChannelSender` / `BatchChannelReceiver` surface as the DSM ring so the
+/// drain and channel-buffer registry don't need a special case.
+///
+/// Unbounded on purpose. The bounded flavor allocates and stamps every slot up front, so a
+/// large capacity costs each fresh worker a page-fault storm once per query, and that dominates
+/// the launch floor of small queries. Backpressure is not needed here: the current-thread Tokio
+/// runtime interleaves producer and consumer fragments via `yield_now().await`, and unbounded
+/// rules out self-deadlock if the producer never yields.
+pub(super) fn in_proc_channel_unbounded() -> (InProcSender, InProcReceiver) {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    (
+        InProcSender {
+            tx: InProcTx::Unbounded(tx),
+            send_lock: tokio::sync::Mutex::new(()),
+        },
+        InProcReceiver { rx: Mutex::new(rx) },
+    )
+}
+
+enum InProcTx {
+    #[cfg(test)]
+    Bounded(std::sync::mpsc::SyncSender<Vec<u8>>),
+    Unbounded(std::sync::mpsc::Sender<Vec<u8>>),
+}
+
 pub(super) struct InProcSender {
-    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    tx: InProcTx,
     /// Per-instance lock so the [`BatchChannelSender::send_lock`] contract holds even when an
     /// in-proc channel ends up in a code path that would otherwise need serialization. In-proc
     /// `send_bytes` is already atomic (each call pushes a complete `Vec<u8>`), so the lock is
@@ -2411,18 +2429,35 @@ pub(super) struct InProcReceiver {
 
 impl BatchChannelSender for InProcSender {
     fn send_bytes(&self, bytes: &[u8]) -> Result<(), DataFusionError> {
-        self.tx.send(bytes.to_vec()).map_err(|_| {
-            DataFusionError::Execution("mpp: in-proc channel detached during send".into())
-        })
+        let sent = match &self.tx {
+            #[cfg(test)]
+            InProcTx::Bounded(tx) => tx.send(bytes.to_vec()).is_ok(),
+            InProcTx::Unbounded(tx) => tx.send(bytes.to_vec()).is_ok(),
+        };
+        if sent {
+            Ok(())
+        } else {
+            Err(DataFusionError::Execution(
+                "mpp: in-proc channel detached during send".into(),
+            ))
+        }
     }
 
     fn try_send_bytes(&self, bytes: &[u8]) -> Result<bool, DataFusionError> {
-        match self.tx.try_send(bytes.to_vec()) {
-            Ok(()) => Ok(true),
-            Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(DataFusionError::Execution(
-                "mpp: in-proc channel detached during try_send".into(),
-            )),
+        let detached =
+            || DataFusionError::Execution("mpp: in-proc channel detached during try_send".into());
+        match &self.tx {
+            #[cfg(test)]
+            InProcTx::Bounded(tx) => match tx.try_send(bytes.to_vec()) {
+                Ok(()) => Ok(true),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(detached()),
+            },
+            // Unbounded never reports full; a send only fails once the receiver is gone.
+            InProcTx::Unbounded(tx) => tx
+                .send(bytes.to_vec())
+                .map(|()| true)
+                .map_err(|_| detached()),
         }
     }
 
@@ -2441,12 +2476,6 @@ impl BatchChannelReceiver for InProcReceiver {
         }
     }
 }
-
-/// Effectively unbounded capacity for self-loop in-proc channels. The
-/// `std::sync::mpsc::sync_channel` API requires a numeric capacity; this constant picks one large
-/// enough that production workloads won't reach it but small enough that a runaway producer
-/// (e.g. infinite-loop bug) won't allocate billions of `Vec<u8>` before OOM.
-pub(super) const SELF_LOOP_CAPACITY: usize = 1 << 20;
 
 #[cfg(test)]
 mod tests {
@@ -3732,6 +3761,24 @@ mod tests {
             receiver.try_recv_batch(),
             RecvBatchOutcome::Detached
         ));
+    }
+
+    #[test]
+    fn unbounded_in_proc_channel_never_reports_full_and_detaches_on_drop() {
+        let (tx, rx) = in_proc_channel_unbounded();
+        // Well past any bounded capacity a test would pick, with nothing draining.
+        for i in 0..4096u32 {
+            assert!(tx.try_send_bytes(&i.to_le_bytes()).unwrap());
+        }
+        std::mem::drop(tx);
+
+        for i in 0..4096u32 {
+            match rx.try_recv() {
+                RecvOutcome::Bytes(bytes) => assert_eq!(bytes, i.to_le_bytes()),
+                other => panic!("expected bytes, got {other:?}"),
+            }
+        }
+        assert!(matches!(rx.try_recv(), RecvOutcome::Detached));
     }
 
     #[test]

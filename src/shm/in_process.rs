@@ -66,7 +66,9 @@ use crate::{
 
 use super::mpsc_ring::Wakeup;
 use super::runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
-use super::setup::{collect_task_metrics, dsm_region_bytes, leader_setup, worker_setup};
+use super::setup::{
+    LeaderSession, collect_task_metrics, dsm_region_bytes, leader_setup, worker_setup,
+};
 use super::transport::{
     CooperativeDrainSet, MppDataStreamKey, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
 };
@@ -812,7 +814,7 @@ mod tests {
 
         // Leader first (it initializes the rings), then each worker attaches. No plan bytes travel
         // through the region here; all roles share the producer subplans as Arcs.
-        let leader_mesh = unsafe {
+        let _leader_session = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -824,8 +826,8 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
+        .unwrap();
+        let leader_mesh = Arc::clone(&_leader_session.mesh);
         let mut worker_setups = Vec::new();
         for proc_idx in 1..n_procs {
             let attach = unsafe {
@@ -978,6 +980,7 @@ mod tests {
     /// Mesh bootstrap shared by the tests: leader first (it initializes the rings), then each
     /// worker attaches.
     struct Bootstrap {
+        _leader_session: LeaderSession,
         leader_mesh: Arc<MppMesh>,
         workers: Vec<(u32, Arc<MppMesh>, Vec<Option<MppSender>>)>,
         // Last field on purpose: struct fields drop in declaration order, so the region
@@ -994,7 +997,7 @@ mod tests {
         let region = HeapRegion::new(region_total);
         let base = SharedBase(region.base());
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
-        let leader_mesh = unsafe {
+        let leader_session = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -1006,8 +1009,8 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
+        .unwrap();
+        let leader_mesh = Arc::clone(&leader_session.mesh);
         let mut workers = Vec::new();
         for proc_idx in 1..n_procs {
             let attach = unsafe {
@@ -1028,6 +1031,7 @@ mod tests {
             ));
         }
         Bootstrap {
+            _leader_session: leader_session,
             leader_mesh,
             workers,
             _region: region,
@@ -1268,7 +1272,7 @@ mod tests {
         let base = SharedBase(region.base());
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
 
-        let leader_mesh = unsafe {
+        let _leader_session = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -1280,8 +1284,8 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
+        .unwrap();
+        let leader_mesh = Arc::clone(&_leader_session.mesh);
 
         let worker_attach = unsafe {
             worker_setup(
@@ -1358,5 +1362,94 @@ mod tests {
         );
 
         let _ = worker_handle.join().await;
+    }
+
+    /// When a leader completes a query early (e.g. LIMIT) or drops its session, un-pulled workers
+    /// parked in `run_execute_task_loop` must be notified via `SessionEnd` and exit cleanly
+    /// with `Ok(())`, rather than hanging forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_leader_drop_unblocks_idle_workers_cleanly() {
+        use crate::shm::run_execute_task_loop;
+        use datafusion::common::runtime::SpawnedTask;
+        use tokio_util::sync::CancellationToken;
+
+        let n_procs = 3; // Proc 0: leader, Proc 1: active worker, Proc 2: idle worker
+        let region_total = dsm_region_bytes(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
+        let region = HeapRegion::new(region_total);
+        let base = SharedBase(region.base());
+        let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
+
+        let leader_session = unsafe {
+            leader_setup(
+                base.0,
+                n_procs,
+                IN_PROCESS_QUEUE_BYTES,
+                &[],
+                Arc::clone(&wakeup),
+                receiver_token(0),
+                Arc::new(NoInterrupt),
+                /* attach_senders */ true,
+            )
+        }
+        .unwrap();
+
+        let _worker1_attach = unsafe {
+            worker_setup(
+                base.0,
+                region_total,
+                1,
+                Arc::clone(&wakeup),
+                receiver_token(1),
+                Arc::new(NoInterrupt),
+            )
+        }
+        .unwrap();
+
+        let worker2_attach = unsafe {
+            worker_setup(
+                base.0,
+                region_total,
+                2,
+                Arc::clone(&wakeup),
+                receiver_token(2),
+                Arc::new(NoInterrupt),
+            )
+        }
+        .unwrap();
+
+        let token = CancellationToken::new();
+
+        // Worker 2 (idle worker) runs execute task loop for (stage 1, task 1).
+        let worker2_mesh = Arc::clone(&worker2_attach.mesh);
+        let loop_mesh2 = Arc::clone(&worker2_mesh);
+        let worker2_handle = SpawnedTask::spawn(async move {
+            run_execute_task_loop(
+                &loop_mesh2,
+                1, // stage_id 1
+                1, // task_number 1
+                1, // 1 partition
+                token,
+                |_req, _hdr, _range| async move { Ok(()) },
+            )
+            .await
+        });
+
+        // Drop the leader session. Its Drop impl will broadcast SessionEnd to all worker inboxes.
+        drop(leader_session);
+
+        // Drive drain passes on worker 2 so SessionEnd is ingested and processed.
+        for _ in 0..20 {
+            let _ = worker2_mesh.inbound_receiver().try_drain_pass();
+            tokio::task::yield_now().await;
+        }
+
+        let res = worker2_handle
+            .join()
+            .await
+            .expect("worker 2 task loop must join cleanly");
+        assert!(
+            res.is_ok(),
+            "worker loop should exit with Ok(()), got error: {res:?}"
+        );
     }
 }

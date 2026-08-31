@@ -260,6 +260,14 @@ impl LeaderSession {
     }
 }
 
+impl Drop for LeaderSession {
+    fn drop(&mut self) {
+        for sender in self._outbound_senders.iter().flatten() {
+            sender.try_send_session_end();
+        }
+    }
+}
+
 impl WorkerSession {
     pub fn outbound_senders(&self) -> &[Option<MppSender>] {
         &self._outbound_senders

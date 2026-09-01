@@ -120,9 +120,9 @@ fn build_outbound_senders(
 
 /// What [`leader_setup`] hands back to the embedder: the active leader session on the mesh.
 ///
-/// Dropping this handle drops `_outbound_senders`, notifying peer worker inboxes that the leader
-/// has detached. Fields `mesh` and `plan_bytes` are accessible, while `_outbound_senders` is private
-/// to prevent premature destructuring.
+/// Dropping this handle broadcasts a `SessionEnd` frame across all worker inboxes to cleanly
+/// unblock parked workers, and drops `_outbound_senders`. Fields `mesh` and `plan_bytes` are accessible,
+/// while `_outbound_senders` is private to prevent premature destructuring.
 pub struct LeaderSession {
     /// The leader's mesh, installed on its DataFusion session.
     pub mesh: Arc<MppMesh>,
@@ -260,6 +260,14 @@ impl LeaderSession {
     }
 }
 
+impl Drop for LeaderSession {
+    fn drop(&mut self) {
+        for sender in self._outbound_senders.iter().flatten() {
+            sender.try_send_session_end();
+        }
+    }
+}
+
 impl WorkerSession {
     pub fn outbound_senders(&self) -> &[Option<MppSender>] {
         &self._outbound_senders
@@ -380,28 +388,25 @@ pub async fn run_worker_fragment(
 /// # Lifecycle & Guarantees
 /// - **On-Demand Range Execution:** Listens on the mesh for incoming [`ExecuteTaskFrame`] messages,
 ///   extracting the requested partition range (`start..end`) and headers.
-/// - **Partition Validation & Single-Claim Accounting:** Ensures that `start <= end` and `end <= n_partitions`,
-///   and verifies that no partition within `start..end` has been claimed by a previous frame. Returns an
-///   [`DataFusionError::Execution`] error if bounds are exceeded or duplicate partition claims occur.
+/// - **Partition Validation:** Ensures that `start <= end`. Returns an [`DataFusionError::Execution`]
+///   error if bounds are inverted.
 /// - **Cancellation & Early Termination Unwinding:** Selects on `token.cancelled()`. If the query is
 ///   cancelled or terminates early (e.g. satisfied by a `LIMIT` clause downstream), the request loop
 ///   breaks out immediately and drops active sub-futures.
+/// - **Clean Teardown on SessionEnd:** When the leader ends the query session, the execute task
+///   channel is closed (`rx.recv()` yields `None`), breaking out of the loop and returning `Ok(())`.
 /// - **Cooperative Inbound Ring Flushing:** Periodically invokes the mesh's inbound receiver's drain pass
 ///   while awaiting frame arrivals or stream completions.
-/// - **Completion:** Exits cleanly once all `n_partitions` have been requested (or the channel closes) AND all
-///   spawned stream futures in `spawn_range` have completed to EOF.
 ///
 /// * `mesh`: The MPP mesh used to coordinate routing, draining, and error handling.
 /// * `stage_id`: The stage ID this task belongs to.
 /// * `task_number`: The task index within the stage.
-/// * `n_partitions`: Total number of output partitions expected across all request frames for this task.
 /// * `token`: Cancellation token used to unwind the request loop on query cancellation or early teardown.
-/// * `spawn_range`: Closure invoked for each valid, unclaimed partition range `start..end`. Must return a future executing the partition streams for that range.
+/// * `spawn_range`: Closure invoked for each valid partition range `start..end`. Must return a future executing the partition streams for that range.
 pub async fn run_execute_task_loop<F, Fut>(
     mesh: &Arc<MppMesh>,
     stage_id: u32,
     task_number: u32,
-    n_partitions: usize,
     token: CancellationToken,
     spawn_range: F,
 ) -> Result<()>
@@ -415,7 +420,7 @@ where
         move || inbound.try_drain_pass()
     };
     let (res, failed_sender_proc) =
-        run_execute_task_loop_inner(rx, n_partitions, token, drain_pass, spawn_range).await;
+        run_execute_task_loop_inner(rx, token, drain_pass, spawn_range).await;
     // Only send TaskError if the loop returned an actual execution error or fragment panic.
     // Healthy early termination (such as downstream LIMIT queries or cancellation token unwinding)
     // completes cleanly and returns Ok(()), so no TaskError is published.
@@ -429,8 +434,7 @@ where
 }
 
 async fn run_execute_task_loop_inner<F, Fut>(
-    rx: ExecuteTaskRx,
-    n_partitions: usize,
+    mut rx: ExecuteTaskRx,
     token: CancellationToken,
     mut drain_pass: impl FnMut() -> Result<()>,
     mut spawn_range: F,
@@ -439,27 +443,14 @@ where
     F: FnMut(pb::ExecuteTaskRequest, http::HeaderMap, std::ops::Range<usize>) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    if n_partitions == 0 {
-        return (Ok(()), None);
-    }
-
     let mut sub_futures = futures::stream::FuturesUnordered::new();
-    let mut partitions_requested = 0;
-    let mut rx_opt = Some(rx);
-    let mut claimed = vec![false; n_partitions];
 
     loop {
-        // Stop when frame receiving has finished (all partitions requested or channel closed)
-        // and all active partition stream futures have completed.
-        if rx_opt.is_none() && sub_futures.is_empty() {
-            break;
-        }
-
         tokio::select! {
             // Unwind immediately on early query cancellation or completion.
             _ = token.cancelled() => break,
 
-            frame_res = async { rx_opt.as_mut().unwrap().recv().await }, if rx_opt.is_some() => {
+            frame_res = rx.recv() => {
                 match frame_res {
                     Some(Ok(IncomingExecuteTaskRequest { sender_proc, frame })) => {
                         let (request, headers) = match frame.into_parts() {
@@ -469,20 +460,10 @@ where
                         let start = request.target_partition_start as usize;
                         let end = request.target_partition_end as usize;
 
-                        if start > end || end > n_partitions {
+                        if start > end {
                             return (Err(DataFusionError::Execution(format!(
-                                "shm transport: invalid partition range {start}..{end} for total partitions {n_partitions}"
+                                "shm transport: invalid partition range {start}..{end}"
                             ))), Some(sender_proc));
-                        }
-
-                        for (i, claimed_slot) in claimed[start..end].iter_mut().enumerate() {
-                            if *claimed_slot {
-                                let q = start + i;
-                                return (Err(DataFusionError::Execution(format!(
-                                    "shm transport: requested partition range {start}..{end} includes already claimed partition {q}"
-                                ))), Some(sender_proc));
-                            }
-                            *claimed_slot = true;
                         }
 
                         let range_fut = spawn_range(request, headers, start..end);
@@ -506,16 +487,11 @@ where
                                 }
                             }
                         });
-
-                        let len = end - start;
-                        partitions_requested += len;
-                        if partitions_requested >= n_partitions {
-                            rx_opt = None;
-                        }
                     }
                     Some(Err(e)) => return (Err(e), None),
                     None => {
-                        rx_opt = None;
+                        // Channel closed (SessionEnd received or leader detached). Unwind immediately.
+                        break;
                     }
                 }
             }
@@ -546,7 +522,6 @@ mod tests {
     async fn run_execute_task_loop_multi_frame_sub_ranges() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let token = CancellationToken::new();
-        let total_partitions = 4;
         let ranges_processed = Arc::new(AtomicUsize::new(0));
         let total_partition_len_processed = Arc::new(AtomicUsize::new(0));
 
@@ -582,6 +557,28 @@ mod tests {
         )
         .unwrap();
 
+        let ranges_counter = Arc::clone(&ranges_processed);
+        let len_counter = Arc::clone(&total_partition_len_processed);
+
+        let handle = datafusion::common::runtime::SpawnedTask::spawn(async move {
+            run_execute_task_loop_inner(
+                rx,
+                token,
+                || Ok(()),
+                move |_request, _headers, range| {
+                    let r_counter = Arc::clone(&ranges_counter);
+                    let l_counter = Arc::clone(&len_counter);
+                    let len = range.len();
+                    async move {
+                        r_counter.fetch_add(1, Ordering::SeqCst);
+                        l_counter.fetch_add(len, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        });
+
         tx.send(Ok(IncomingExecuteTaskRequest {
             sender_proc: 0,
             frame: frame1,
@@ -593,27 +590,18 @@ mod tests {
         }))
         .unwrap();
 
-        let ranges_counter = Arc::clone(&ranges_processed);
-        let len_counter = Arc::clone(&total_partition_len_processed);
+        // Wait for both sub-ranges to finish processing.
+        for _ in 0..100 {
+            if ranges_processed.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
 
-        let (res, _) = run_execute_task_loop_inner(
-            rx,
-            total_partitions,
-            token,
-            || Ok(()),
-            move |_request, _headers, range| {
-                let r_counter = Arc::clone(&ranges_counter);
-                let l_counter = Arc::clone(&len_counter);
-                let len = range.len();
-                async move {
-                    r_counter.fetch_add(1, Ordering::SeqCst);
-                    l_counter.fetch_add(len, Ordering::SeqCst);
-                    Ok(())
-                }
-            },
-        )
-        .await;
+        // Close channel (simulating SessionEnd from leader).
+        drop(tx);
 
+        let (res, _) = handle.join().await.unwrap();
         assert!(res.is_ok());
         assert_eq!(ranges_processed.load(Ordering::SeqCst), 2);
         assert_eq!(total_partition_len_processed.load(Ordering::SeqCst), 4);
@@ -627,7 +615,6 @@ mod tests {
 
         let (res, _) = run_execute_task_loop_inner(
             rx,
-            4,
             token,
             || Ok(()),
             |_request, _headers, _range| async { Ok(()) },
@@ -638,5 +625,22 @@ mod tests {
             res.is_ok(),
             "cancellation token unwinding must return Ok(()) to avoid false TaskError dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn run_execute_task_loop_channel_close_returns_ok() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        drop(tx); // Channel immediately closed (SessionEnd).
+
+        let (res, _) = run_execute_task_loop_inner(
+            rx,
+            token,
+            || Ok(()),
+            |_request, _headers, _range| async { Ok(()) },
+        )
+        .await;
+
+        assert!(res.is_ok());
     }
 }

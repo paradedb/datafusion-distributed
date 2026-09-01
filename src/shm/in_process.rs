@@ -52,9 +52,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, HashMap, Result};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::{SessionStateBuilder, TaskContext};
-use datafusion::physical_plan::{
-    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, ReplaceChildrenOptions,
-};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::{
@@ -66,9 +64,12 @@ use crate::{
 
 use super::mpsc_ring::Wakeup;
 use super::runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
-use super::setup::{collect_task_metrics, dsm_region_bytes, leader_setup, worker_setup};
+use super::setup::{
+    LeaderSession, collect_task_metrics, dsm_region_bytes, leader_setup, worker_setup,
+};
 use super::transport::{
-    CooperativeDrainSet, MppDataStreamKey, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
+    CooperativeDrainSet, Interrupt, MppDataStreamKey, MppFrameHeader, MppPartitionSink, MppSender,
+    NoInterrupt,
 };
 
 /// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
@@ -406,8 +407,7 @@ async fn run_worker_proc(
         // Production decodes a fresh plan per fragment; the captured Arc is shared, so copy it.
         let plan =
             reinstantiate(&captured_plan(&captured, fragment.stage_id, fragment.task_idx).await);
-        let n_out = plan.output_partitioning().partition_count();
-        prepared.push((fragment, plan, n_out, task_ctx));
+        prepared.push((fragment, plan, task_ctx));
     }
 
     struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -433,7 +433,7 @@ async fn run_worker_proc(
 
     let mut futures = Vec::with_capacity(prepared.len());
     let mut executed = Vec::with_capacity(prepared.len());
-    for (fragment, plan, n_out, task_ctx) in prepared {
+    for (fragment, plan, task_ctx) in prepared {
         executed.push((
             fragment.stage_id,
             fragment.task_idx,
@@ -450,7 +450,6 @@ async fn run_worker_proc(
                 &mesh,
                 stage_id,
                 task_idx,
-                n_out,
                 tokio_util::sync::CancellationToken::new(),
                 |_request, _headers, range| {
                     let plan = Arc::clone(&plan);
@@ -812,7 +811,7 @@ mod tests {
 
         // Leader first (it initializes the rings), then each worker attaches. No plan bytes travel
         // through the region here; all roles share the producer subplans as Arcs.
-        let leader_mesh = unsafe {
+        let _leader_session = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -824,8 +823,8 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
+        .unwrap();
+        let leader_mesh = Arc::clone(&_leader_session.mesh);
         let mut worker_setups = Vec::new();
         for proc_idx in 1..n_procs {
             let attach = unsafe {
@@ -919,6 +918,9 @@ mod tests {
         let stream = physical.execute(0, leader_task_ctx).unwrap();
         let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
+        // Drop leader session to broadcast SessionEnd so workers unblock and exit.
+        drop(_leader_session);
+
         while let Some(res) = workers.join_next().await {
             res.expect("worker task panicked").expect("worker proc");
         }
@@ -978,6 +980,7 @@ mod tests {
     /// Mesh bootstrap shared by the tests: leader first (it initializes the rings), then each
     /// worker attaches.
     struct Bootstrap {
+        leader_session: LeaderSession,
         leader_mesh: Arc<MppMesh>,
         workers: Vec<(u32, Arc<MppMesh>, Vec<Option<MppSender>>)>,
         // Last field on purpose: struct fields drop in declaration order, so the region
@@ -986,15 +989,23 @@ mod tests {
     }
 
     fn bootstrap_mesh(n_procs: u32) -> Bootstrap {
-        bootstrap_mesh_with_queue(n_procs, IN_PROCESS_QUEUE_BYTES)
+        bootstrap_mesh_with_options(n_procs, IN_PROCESS_QUEUE_BYTES, Arc::new(NoInterrupt))
     }
 
     fn bootstrap_mesh_with_queue(n_procs: u32, queue_bytes: usize) -> Bootstrap {
+        bootstrap_mesh_with_options(n_procs, queue_bytes, Arc::new(NoInterrupt))
+    }
+
+    fn bootstrap_mesh_with_options(
+        n_procs: u32,
+        queue_bytes: usize,
+        interrupt: Arc<dyn Interrupt>,
+    ) -> Bootstrap {
         let region_total = dsm_region_bytes(n_procs, queue_bytes, 0).unwrap();
         let region = HeapRegion::new(region_total);
         let base = SharedBase(region.base());
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
-        let leader_mesh = unsafe {
+        let leader_session = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -1002,12 +1013,12 @@ mod tests {
                 &[],
                 Arc::clone(&wakeup),
                 receiver_token(0),
-                Arc::new(NoInterrupt),
+                interrupt,
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
+        .unwrap();
+        let leader_mesh = Arc::clone(&leader_session.mesh);
         let mut workers = Vec::new();
         for proc_idx in 1..n_procs {
             let attach = unsafe {
@@ -1028,6 +1039,7 @@ mod tests {
             ));
         }
         Bootstrap {
+            leader_session,
             leader_mesh,
             workers,
             _region: region,
@@ -1053,10 +1065,15 @@ mod tests {
             .await
             .unwrap();
 
-        let boot = bootstrap_mesh(N_WORKERS + 1);
+        let Bootstrap {
+            leader_session,
+            leader_mesh,
+            workers: worker_setups,
+            _region,
+        } = bootstrap_mesh(N_WORKERS + 1);
         let captured = new_captured_plans();
         let leader_ctx = build_session_with_worker_and_partitions(
-            Arc::clone(&boot.leader_mesh),
+            Arc::clone(&leader_mesh),
             Some(Arc::clone(&captured)),
             N_TASKS,
             N_TASKS,
@@ -1094,7 +1111,7 @@ mod tests {
         );
 
         let mut workers = JoinSet::new();
-        for (proc_idx, mesh, outbound) in boot.workers {
+        for (proc_idx, mesh, outbound) in worker_setups {
             let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
             let session = build_session_with_worker_and_partitions(
                 Arc::clone(&mesh),
@@ -1116,6 +1133,9 @@ mod tests {
         let leader_task_ctx = leader_ctx.task_ctx();
         let stream = physical.execute(0, leader_task_ctx).unwrap();
         let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        // End the leader session to broadcast SessionEnd to workers.
+        drop(leader_session);
 
         while let Some(res) = workers.join_next().await {
             res.expect("worker task panicked").expect("worker proc");
@@ -1149,9 +1169,14 @@ mod tests {
             .unwrap();
 
         // 64 KiB rings against ~700 KiB of per-worker aggregate state.
-        let boot = bootstrap_mesh_with_queue(N_WORKERS + 1, 64 * 1024);
+        let Bootstrap {
+            leader_session,
+            leader_mesh,
+            workers: worker_setups,
+            _region,
+        } = bootstrap_mesh_with_queue(N_WORKERS + 1, 64 * 1024);
         let captured = new_captured_plans();
-        let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
+        let leader_ctx = build_session(Arc::clone(&leader_mesh), Some(Arc::clone(&captured)));
         register_wide_table(&leader_ctx);
         let physical = leader_ctx
             .sql(query)
@@ -1163,7 +1188,7 @@ mod tests {
         let entries = collect_dispatched_stages(&physical, N_WORKERS);
 
         let mut workers = JoinSet::new();
-        for (proc_idx, mesh, outbound) in boot.workers {
+        for (proc_idx, mesh, outbound) in worker_setups {
             let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
             let session = build_session(Arc::clone(&mesh), None);
             register_wide_table(&session);
@@ -1181,6 +1206,9 @@ mod tests {
         let stream = physical.execute(0, leader_task_ctx).unwrap();
         let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
+        // End the leader session to broadcast SessionEnd to workers.
+        drop(leader_session);
+
         while let Some(res) = workers.join_next().await {
             res.expect("worker task panicked").expect("worker proc");
         }
@@ -1193,16 +1221,40 @@ mod tests {
         );
     }
 
-    /// A producer that attaches and then goes away without sending its EOFs must fail the
-    /// gather, not hang it: the drain fails the channels the dead receiver fed once the ring
-    /// detaches.
+    /// A producer that crashes fatally (e.g. SIGKILL / segfault) without sending EOF is detected
+    /// by Postgres postmaster which interrupts the leader backend, failing the gather cleanly.
     #[tokio::test(flavor = "current_thread")]
     async fn producer_loss_fails_the_gather_instead_of_hanging() {
-        let query = "SELECT id, val FROM t ORDER BY id";
+        use tokio_util::sync::CancellationToken;
 
-        let boot = bootstrap_mesh(N_WORKERS + 1);
+        struct TestInterrupt(CancellationToken);
+        impl Interrupt for TestInterrupt {
+            fn check(&self) -> Result<(), DataFusionError> {
+                if self.0.is_cancelled() {
+                    Err(DataFusionError::Execution(
+                        "Postgres postmaster detected worker death (interrupt pending)".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let query = "SELECT id, val FROM t ORDER BY id";
+        let interrupt_token = CancellationToken::new();
+
+        let Bootstrap {
+            leader_session,
+            leader_mesh,
+            workers: worker_setups,
+            _region,
+        } = bootstrap_mesh_with_options(
+            N_WORKERS + 1,
+            IN_PROCESS_QUEUE_BYTES,
+            Arc::new(TestInterrupt(interrupt_token.clone())),
+        );
         let captured = new_captured_plans();
-        let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
+        let leader_ctx = build_session(Arc::clone(&leader_mesh), Some(Arc::clone(&captured)));
         let physical = leader_ctx
             .sql(query)
             .await
@@ -1213,13 +1265,15 @@ mod tests {
         let entries = collect_dispatched_stages(&physical, N_WORKERS);
 
         let mut workers = JoinSet::new();
-        for (proc_idx, mesh, outbound) in boot.workers {
+        for (proc_idx, mesh, outbound) in worker_setups {
             if proc_idx == 1 {
                 // Simulated crash: the proc attached (its senders exist), then dies without
                 // running its fragments or sending EOF. Dropping the senders is what process
                 // exit does.
                 drop(outbound);
                 drop(mesh);
+                // Simulate Postgres postmaster detecting worker 1 exit and interrupting leader.
+                interrupt_token.cancel();
                 continue;
             }
             let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
@@ -1238,6 +1292,9 @@ mod tests {
         let stream = physical.execute(0, leader_task_ctx).unwrap();
         let res: Result<Vec<RecordBatch>, _> = stream.try_collect().await;
 
+        // End the leader session to broadcast SessionEnd to workers.
+        drop(leader_session);
+
         while let Some(r) = workers.join_next().await {
             r.expect("worker task panicked").expect("worker proc");
         }
@@ -1246,7 +1303,7 @@ mod tests {
             .expect_err("gather must fail when a producer goes away")
             .to_string();
         assert!(
-            err.contains("detached before this channel's EOF"),
+            err.contains("Postgres postmaster detected worker death"),
             "unexpected error: {err}"
         );
     }
@@ -1268,7 +1325,7 @@ mod tests {
         let base = SharedBase(region.base());
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
 
-        let leader_mesh = unsafe {
+        let _leader_session = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -1280,8 +1337,8 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
+        .unwrap();
+        let leader_mesh = Arc::clone(&_leader_session.mesh);
 
         let worker_attach = unsafe {
             worker_setup(
@@ -1308,7 +1365,6 @@ mod tests {
                 &loop_mesh,
                 1, // stage_id 1
                 0, // task_number 0
-                1, // 1 partition
                 worker_token,
                 |_req, _hdr, _range| async move {
                     panic!("simulated worker fragment crash");
@@ -1358,5 +1414,93 @@ mod tests {
         );
 
         let _ = worker_handle.join().await;
+    }
+
+    /// When a leader completes a query early (e.g. LIMIT) or drops its session, un-pulled workers
+    /// parked in `run_execute_task_loop` must be notified via `SessionEnd` and exit cleanly
+    /// with `Ok(())`, rather than hanging forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_leader_drop_unblocks_idle_workers_cleanly() {
+        use crate::shm::run_execute_task_loop;
+        use datafusion::common::runtime::SpawnedTask;
+        use tokio_util::sync::CancellationToken;
+
+        let n_procs = 3; // Proc 0: leader, Proc 1: active worker, Proc 2: idle worker
+        let region_total = dsm_region_bytes(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
+        let region = HeapRegion::new(region_total);
+        let base = SharedBase(region.base());
+        let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
+
+        let leader_session = unsafe {
+            leader_setup(
+                base.0,
+                n_procs,
+                IN_PROCESS_QUEUE_BYTES,
+                &[],
+                Arc::clone(&wakeup),
+                receiver_token(0),
+                Arc::new(NoInterrupt),
+                /* attach_senders */ true,
+            )
+        }
+        .unwrap();
+
+        let _worker1_attach = unsafe {
+            worker_setup(
+                base.0,
+                region_total,
+                1,
+                Arc::clone(&wakeup),
+                receiver_token(1),
+                Arc::new(NoInterrupt),
+            )
+        }
+        .unwrap();
+
+        let worker2_attach = unsafe {
+            worker_setup(
+                base.0,
+                region_total,
+                2,
+                Arc::clone(&wakeup),
+                receiver_token(2),
+                Arc::new(NoInterrupt),
+            )
+        }
+        .unwrap();
+
+        let token = CancellationToken::new();
+
+        // Worker 2 (idle worker) runs execute task loop for (stage 1, task 1).
+        let worker2_mesh = Arc::clone(&worker2_attach.mesh);
+        let loop_mesh2 = Arc::clone(&worker2_mesh);
+        let worker2_handle = SpawnedTask::spawn(async move {
+            run_execute_task_loop(
+                &loop_mesh2,
+                1, // stage_id 1
+                1, // task_number 1
+                token,
+                |_req, _hdr, _range| async move { Ok(()) },
+            )
+            .await
+        });
+
+        // Drop the leader session. Its Drop impl will broadcast SessionEnd to all worker inboxes.
+        drop(leader_session);
+
+        // Drive drain passes on worker 2 so SessionEnd is ingested and processed.
+        for _ in 0..20 {
+            let _ = worker2_mesh.inbound_receiver().try_drain_pass();
+            tokio::task::yield_now().await;
+        }
+
+        let res = worker2_handle
+            .join()
+            .await
+            .expect("worker 2 task loop must join cleanly");
+        assert!(
+            res.is_ok(),
+            "worker loop should exit with Ok(()), got error: {res:?}"
+        );
     }
 }

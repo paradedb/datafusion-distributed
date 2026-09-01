@@ -97,6 +97,8 @@ pub(super) enum MppFrameKind {
     /// to the consumer, so it sees the actual crash reason instead of a
     /// detached channel.
     TaskError = 9,
+    /// Session has ended; leader is terminating the query run.
+    SessionEnd = 10,
 }
 
 /// Payload of a `SetPlan` frame: the plan-delivery message a worker needs to run one task,
@@ -418,6 +420,17 @@ impl MppFrameHeader {
         }
     }
 
+    /// Build a `SessionEnd` header stamped with `sender_proc` (usually the leader, proc 0).
+    pub fn session_end(sender_proc: u32) -> Self {
+        Self {
+            magic: MPP_FRAME_MAGIC,
+            flags: pack_flags(MppFrameKind::SessionEnd, sender_proc),
+            stage_id: 0,
+            task_id: 0,
+            partition: 0,
+        }
+    }
+
     /// Build a `Chunk` header for one piece of an oversized frame. The data stream mirrors the
     /// inner frame's addressing: together with `sender_proc` they key the
     /// receiver's reassembly, so chunked frames from two streams of the same proc can
@@ -466,6 +479,7 @@ impl MppFrameHeader {
             7 => Ok(MppFrameKind::Chunk),
             8 => Ok(MppFrameKind::ExecuteTask),
             9 => Ok(MppFrameKind::TaskError),
+            10 => Ok(MppFrameKind::SessionEnd),
             other => Err(DataFusionError::Internal(format!(
                 "mpp: unknown frame kind {other:#x}"
             ))),
@@ -675,6 +689,7 @@ enum FrameBody {
     ExecuteTask(ExecuteTaskFrame),
     Cancel,
     TaskError(String),
+    SessionEnd,
 }
 
 /// Inverse of the frame encoders. Parses the 20-byte header and decodes the payload according
@@ -683,7 +698,10 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
     let header = MppFrameHeader::parse(bytes)?;
     let payload = &bytes[MPP_FRAME_HEADER_SIZE..];
     match header.kind()? {
-        MppFrameKind::Eof | MppFrameKind::FeedEof | MppFrameKind::Cancel => {
+        MppFrameKind::Eof
+        | MppFrameKind::FeedEof
+        | MppFrameKind::Cancel
+        | MppFrameKind::SessionEnd => {
             if bytes.len() != MPP_FRAME_HEADER_SIZE {
                 return Err(DataFusionError::Internal(format!(
                     "mpp: payload-less frame carries payload ({} > {})",
@@ -693,8 +711,10 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
             }
             match header.kind()? {
                 MppFrameKind::Eof => Ok((header, FrameBody::Eof)),
+                MppFrameKind::FeedEof => Ok((header, FrameBody::FeedEof)),
                 MppFrameKind::Cancel => Ok((header, FrameBody::Cancel)),
-                _ => Ok((header, FrameBody::FeedEof)),
+                MppFrameKind::SessionEnd => Ok((header, FrameBody::SessionEnd)),
+                _ => unreachable!(),
             }
         }
         MppFrameKind::WorkUnit => {
@@ -1128,6 +1148,21 @@ impl MppSender {
                 Ok(true) => return,
                 Ok(false) => std::thread::yield_now(),
                 Err(_) => return, // the producer's inbox is gone; nothing left to cancel
+            }
+        }
+    }
+
+    /// Bounded synchronous send of a `SessionEnd` frame. The leader calls it on each outbound sender
+    /// to signal that the query run is done and idle worker request receivers should complete.
+    pub fn try_send_session_end(&self) {
+        let header = MppFrameHeader::session_end(self.header.sender_proc());
+        let mut buf = [0u8; MPP_FRAME_HEADER_SIZE];
+        header.write_to(&mut buf);
+        for _ in 0..MAX_CONTROL_SEND_SPINS {
+            match self.channel.try_send_bytes(&buf) {
+                Ok(true) => return,
+                Ok(false) => std::thread::yield_now(),
+                Err(_) => return, // the receiver's inbox is gone; nothing left to notify
             }
         }
     }
@@ -1602,6 +1637,7 @@ impl MppReceiver {
                         Ok((header, FrameBody::TaskError(msg))) => {
                             RecvBatchOutcome::TaskError { header, msg }
                         }
+                        Ok((_header, FrameBody::SessionEnd)) => RecvBatchOutcome::SessionEnd,
                         Err(e) => RecvBatchOutcome::TransportError(e),
                     };
                 }
@@ -1734,6 +1770,8 @@ pub(super) enum RecvBatchOutcome {
         header: MppFrameHeader,
         msg: String,
     },
+    /// Session has ended; leader is terminating the query run.
+    SessionEnd,
     /// A fatal structural or protocol error on the local side (e.g. corrupt bytes, IPC
     /// decode failure). The transport channel is unusable.
     TransportError(DataFusionError),
@@ -1882,6 +1920,7 @@ pub type ExecuteTaskRx =
 struct ExecuteTaskRegistry {
     map: HashMap<(u32, u32), ExecuteTaskSlot>,
     dead: Option<String>,
+    closed: bool,
 }
 
 enum ExecuteTaskSlot {
@@ -2087,6 +2126,36 @@ impl DrainHandle {
         }
     }
 
+    /// Clean session termination from the leader: close all control-plane registries (ExecuteTask, SetPlan, Feeds)
+    /// so idle worker wait loops unblock and complete cleanly with Ok(()).
+    fn close_control_scope(&self) {
+        let mut registry = self.feed_registry.lock().unwrap();
+        registry.dead = Some("session closed".to_string());
+        for (_, slot) in registry.map.drain() {
+            if let FeedSlot::Active(senders) = slot {
+                fail_feed_senders(&senders, "session closed");
+            }
+        }
+        drop(registry);
+
+        let mut plans = self.set_plan_registry.lock().unwrap();
+        plans.dead = Some("session closed".to_string());
+        for (_, slot) in plans.map.drain() {
+            if let SetPlanSlot::Waiting(tx) = slot {
+                let _ = tx.send(Err(DataFusionError::Execution(
+                    "session closed".to_string(),
+                )));
+            }
+        }
+        drop(plans);
+
+        let mut execs = self.execute_task_registry.lock().unwrap();
+        execs.closed = true;
+        // Dropping active `tx` by clearing execs.map causes all `rx.recv()` in `run_execute_task_loop`
+        // to yield `None`, ending the request loop cleanly.
+        execs.map.clear();
+    }
+
     /// Hard scope death: [`Self::detach_data_scope`] plus the control-plane registries. For
     /// ring corruption and embedder-driven teardown, where no further frame of any kind can be
     /// trusted to arrive.
@@ -2124,7 +2193,7 @@ impl DrainHandle {
         frame: ExecuteTaskFrame,
     ) {
         let mut guard = self.execute_task_registry.lock().unwrap();
-        if guard.dead.is_some() {
+        if guard.dead.is_some() || guard.closed {
             return;
         }
         let slot = guard
@@ -2148,6 +2217,10 @@ impl DrainHandle {
         let mut guard = self.execute_task_registry.lock().unwrap();
         if let Some(msg) = &guard.dead {
             return Err(DataFusionError::Execution(msg.clone()));
+        }
+        if guard.closed {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            return Ok(rx);
         }
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(slot) = guard.map.get_mut(&(stage_id, task_number)) {
@@ -2313,6 +2386,9 @@ impl DrainHandle {
                             "remote task {}.{} failed: {}",
                             header.stage_id, header.partition, msg
                         ));
+                    }
+                    RecvBatchOutcome::SessionEnd => {
+                        self.close_control_scope();
                     }
                     RecvBatchOutcome::Empty => break,
                     RecvBatchOutcome::Detached => {
@@ -2615,7 +2691,8 @@ mod tests {
                     | RecvBatchOutcome::SetPlan { .. }
                     | RecvBatchOutcome::ExecuteTask { .. }
                     | RecvBatchOutcome::Cancel { .. }
-                    | RecvBatchOutcome::TaskError { .. } => {}
+                    | RecvBatchOutcome::TaskError { .. }
+                    | RecvBatchOutcome::SessionEnd => {}
                     RecvBatchOutcome::Empty => {}
                     RecvBatchOutcome::Detached => {
                         done[i] = true;
@@ -3217,6 +3294,15 @@ mod tests {
             let (parsed_eof, _) = decode_frame(&eof_buf).expect("decode eof");
             assert_eq!(parsed_eof.sender_proc(), sp, "decoded eof sender_proc");
             assert_eq!(parsed_eof.kind().unwrap(), MppFrameKind::Eof);
+
+            let session_end_hdr = MppFrameHeader::session_end(sp);
+            assert_eq!(session_end_hdr.sender_proc(), sp);
+            assert_eq!(session_end_hdr.kind().unwrap(), MppFrameKind::SessionEnd);
+            let mut end_buf = vec![0u8; MPP_FRAME_HEADER_SIZE];
+            session_end_hdr.write_to(&mut end_buf);
+            let (parsed_end, body) = decode_frame(&end_buf).expect("decode session end");
+            assert_eq!(parsed_end.sender_proc(), sp);
+            assert!(matches!(body, FrameBody::SessionEnd));
         }
     }
 

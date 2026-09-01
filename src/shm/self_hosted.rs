@@ -901,7 +901,6 @@ impl TaskDriver {
             &launch.mesh,
             stage_num,
             task_i as u32,
-            n_partitions,
             token.clone(),
             |request, _headers, range| {
                 let len = range.len();

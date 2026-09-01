@@ -711,9 +711,10 @@ fn decode_frame(bytes: &[u8]) -> Result<(MppFrameHeader, FrameBody), DataFusionE
             }
             match header.kind()? {
                 MppFrameKind::Eof => Ok((header, FrameBody::Eof)),
+                MppFrameKind::FeedEof => Ok((header, FrameBody::FeedEof)),
                 MppFrameKind::Cancel => Ok((header, FrameBody::Cancel)),
                 MppFrameKind::SessionEnd => Ok((header, FrameBody::SessionEnd)),
-                _ => Ok((header, FrameBody::FeedEof)),
+                _ => unreachable!(),
             }
         }
         MppFrameKind::WorkUnit => {
@@ -2150,8 +2151,8 @@ impl DrainHandle {
 
         let mut execs = self.execute_task_registry.lock().unwrap();
         execs.closed = true;
-        // Dropping active `tx` in execs.map.drain() causes all `rx.recv()` in `run_execute_task_loop`
-        // to yield `None`, ending the request loop cleanly!
+        // Dropping active `tx` by clearing execs.map causes all `rx.recv()` in `run_execute_task_loop`
+        // to yield `None`, ending the request loop cleanly.
         execs.map.clear();
     }
 

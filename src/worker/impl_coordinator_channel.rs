@@ -222,7 +222,7 @@ fn send_metrics_via_channel(
 /// push transport reuses this for its metrics frame so the per-node shape matches what the
 /// coordinator channel reports. A node without metrics, or one whose metrics fail to encode,
 /// contributes an empty set in place: the consumer matches entries to plan nodes by pre-order
-/// position, so dropping an entry would mis-attribute every set after it.
+/// position, so dropping an entry would misattribute every set after it.
 pub fn collect_plan_metrics_protos(
     plan: &Arc<dyn ExecutionPlan>,
     dt_ctx: DistributedTaskContext,

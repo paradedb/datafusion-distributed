@@ -14,8 +14,7 @@ use crate::{
     CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedTaskContext,
     DistributedWorkUnitFeedContext, LoadInfo, LocalWorkerContext, MaybeEncoded, NetworkBoundaryExt,
     SetPlanRequest, TaskCompletedDynamicFilters, TaskKey, TaskMetrics, WorkUnitFeedDeclaration,
-    WorkerToCoordinatorMsg, get_distributed_channel_resolver,
-    get_distributed_dispatch_plan_source,
+    WorkerToCoordinatorMsg, get_distributed_channel_resolver, get_distributed_dispatch_plan_source,
 };
 use datafusion::common::DataFusionError;
 use datafusion::common::instant::Instant;

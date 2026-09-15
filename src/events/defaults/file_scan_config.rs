@@ -17,6 +17,14 @@ pub(crate) fn file_scan_config_desired_task_count(
     let dse: &DataSourceExec = ev.plan.downcast_ref()?;
     let file_scan: &FileScanConfig = dse.data_source().downcast_ref()?;
 
+    if let Some(datafusion::physical_expr::Partitioning::Range(range)) =
+        &file_scan.output_partitioning
+    {
+        return Some(Ok(DesiredTaskCountEventResponse::desired(
+            range.partition_count(),
+        )));
+    }
+
     let d_cfg = DistributedConfig::from_session_config(cfg).ok()?;
 
     let mut total_bytes = 0;
@@ -40,32 +48,48 @@ pub(crate) fn file_scan_config_scale_up_leaf_node(
     let file_scan = dse.data_source().downcast_ref::<FileScanConfig>()?;
     let partition_count = ev.plan.output_partitioning().partition_count();
 
-    let rebalanced = if file_scan.output_partitioning.is_some() {
+    let rebalanced = if matches!(
+        file_scan.output_partitioning,
+        Some(datafusion::physical_expr::Partitioning::Range(_))
+    ) {
+        rebalance_contiguous(&file_scan.file_groups, ev.task_count)
+    } else if file_scan.output_partitioning.is_some() {
         let all_partitioned_files = file_scan
             .file_groups
             .iter()
             .flat_map(|file_group| file_group.iter().cloned())
             .collect::<Vec<_>>();
-        rebalance_round_robin(all_partitioned_files, partition_count * ev.task_count)
-            .into_iter()
-            .map(FileGroup::new)
-            .collect::<Vec<_>>()
+        let round_robin =
+            rebalance_round_robin(all_partitioned_files, partition_count * ev.task_count)
+                .into_iter()
+                .map(FileGroup::new)
+                .collect::<Vec<_>>();
+        let mut grouped = vec![vec![]; ev.task_count];
+        for (i, fg) in round_robin.into_iter().enumerate() {
+            grouped[i % ev.task_count].push(fg);
+        }
+        grouped
     } else {
-        FileGroupPartitioner::new()
+        let partitioned = FileGroupPartitioner::new()
             .with_target_partitions(partition_count * ev.task_count)
             .with_repartition_file_min_size(0)
             .with_preserve_order_within_groups(!file_scan.output_ordering.is_empty())
             .repartition_file_groups(&file_scan.file_groups)
             .unwrap_or_else(|| file_scan.file_groups.clone())
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        let mut grouped = vec![vec![]; ev.task_count];
+        for (i, fg) in partitioned.into_iter().enumerate() {
+            grouped[i % ev.task_count].push(fg);
+        }
+        grouped
     };
 
-    let mut file_scan_template = file_scan.clone();
-    file_scan_template.file_groups.clear();
-    let mut file_scans = vec![file_scan_template; ev.task_count];
-    for (i, file_group) in rebalanced.into_iter().enumerate() {
-        file_scans[i % ev.task_count].file_groups.push(file_group);
+    let mut file_scans = Vec::with_capacity(ev.task_count);
+    for file_groups in rebalanced {
+        let mut template = file_scan.clone();
+        template.file_groups = file_groups;
+        file_scans.push(template);
     }
 
     let distributed_leaf_result = DistributedLeafExec::try_new(
@@ -79,6 +103,20 @@ pub(crate) fn file_scan_config_scale_up_leaf_node(
     Some(Ok(ScaleUpLeafNodeEventResponse::new(Arc::new(
         distributed_leaf,
     ))))
+}
+
+fn rebalance_contiguous<T: Clone>(items: &[T], target_tasks: usize) -> Vec<Vec<T>> {
+    if target_tasks == 0 {
+        return vec![];
+    }
+    let n = items.len();
+    let mut result = Vec::with_capacity(target_tasks);
+    for task_idx in 0..target_tasks {
+        let start = (task_idx * n) / target_tasks;
+        let end = ((task_idx + 1) * n) / target_tasks;
+        result.push(items[start..end].to_vec());
+    }
+    result
 }
 
 fn rebalance_round_robin<T>(items: Vec<T>, target_groups: usize) -> Vec<Vec<T>> {
@@ -169,6 +207,24 @@ mod tests {
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![1, 1, 1, 0, 0]
         );
+    }
+
+    #[test]
+    fn test_rebalance_contiguous_even_distribution() {
+        let groups = rebalance_contiguous(&[0, 1, 2, 3], 2);
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn test_rebalance_contiguous_one_to_one() {
+        let groups = rebalance_contiguous(&[0, 1, 2, 3], 4);
+        assert_eq!(groups, vec![vec![0], vec![1], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn test_rebalance_contiguous_uneven_distribution() {
+        let groups = rebalance_contiguous(&[0, 1, 2], 2);
+        assert_eq!(groups, vec![vec![0], vec![1, 2]]);
     }
 
     fn total_scan_bytes(plan: &Arc<dyn ExecutionPlan>) -> usize {

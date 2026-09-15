@@ -300,7 +300,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
             let inner = NetworkShuffleExecProto {
                 schema: Some(node.schema().try_into()?),
                 partitioning: Some(serialize_partitioning(
-                    node.properties().output_partitioning(),
+                    &node.partitioning,
                     self,
                     proto_converter,
                 )?),
@@ -565,15 +565,20 @@ fn new_network_hash_shuffle_exec(
     equivalence_properties: EquivalenceProperties,
     input_stage: Stage,
 ) -> NetworkShuffleExec {
+    let properties_partitioning = match &partitioning {
+        Partitioning::Range(_) => Partitioning::UnknownPartitioning(1),
+        _ => partitioning.clone(),
+    };
     NetworkShuffleExec {
         properties: Arc::new(PlanProperties::new(
             equivalence_properties,
-            partitioning,
+            properties_partitioning,
             EmissionType::Incremental,
             Boundedness::Bounded,
         )),
         worker_connections: WorkerConnectionPool::new(input_stage.task_count()),
         input_stage,
+        partitioning,
     }
 }
 

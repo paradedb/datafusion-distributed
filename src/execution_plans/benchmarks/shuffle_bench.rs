@@ -221,15 +221,18 @@ impl ShuffleFixture {
 
         let mut join_set = JoinSet::default();
         for task_index in 0..self.bench.consumer_tasks {
+            let partitioning =
+                Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], self.bench.partitions);
             let shuffle = NetworkShuffleExec {
                 properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(Arc::clone(&self.schema)),
-                    Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], self.bench.partitions),
+                    partitioning.clone(),
                     EmissionType::Incremental,
                     Boundedness::Bounded,
                 )),
                 input_stage: input_stage.clone(),
                 worker_connections: WorkerConnectionPool::new(self.bench.producer_tasks),
+                partitioning,
             };
             let task_ctx = Arc::new(task_ctx_with_extension(
                 &self.task_ctx,

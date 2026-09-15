@@ -1,7 +1,7 @@
 use crate::DistributedTaskContext;
 use crate::common::require_one_child;
 use crate::distributed_planner::{NetworkBoundary, ProducerHead};
-use crate::execution_plans::common::scale_partitioning_props;
+use crate::execution_plans::common::coalesce_partitioning_props;
 use crate::stage::{LocalStage, Stage};
 use crate::worker::WorkerConnectionPool;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -92,7 +92,7 @@ impl NetworkCoalesceExec {
         // per output task based on the maximum group size, returning empty streams for tasks with
         // smaller groups.
         let max_input_task_count = input_stage.task_count().div_ceil(consumer_tasks).max(1);
-        let props = scale_partitioning_props(&input_properties, |p| p * max_input_task_count)?;
+        let props = coalesce_partitioning_props(&input_properties, max_input_task_count)?;
 
         Ok(Self {
             properties: props,
@@ -198,9 +198,15 @@ impl NetworkBoundary for NetworkCoalesceExec {
 
     fn with_input_stage(&self, input_stage: Stage) -> Result<Arc<dyn NetworkBoundary>> {
         let mut self_clone = self.clone();
-        self_clone.properties = scale_partitioning_props(self_clone.properties(), |p| {
-            p * input_stage.task_count() / self_clone.input_stage.task_count().max(1)
-        })?;
+        if let Stage::Local(local) = &input_stage {
+            self_clone.properties =
+                coalesce_partitioning_props(local.plan.properties(), local.tasks)?;
+        } else {
+            let task_multiplier =
+                (input_stage.task_count() / self_clone.input_stage.task_count().max(1)).max(1);
+            self_clone.properties =
+                coalesce_partitioning_props(self_clone.properties(), task_multiplier)?;
+        }
         self_clone.worker_connections = WorkerConnectionPool::new(input_stage.task_count());
         self_clone.input_stage = input_stage;
         Ok(Arc::new(self_clone))
@@ -263,7 +269,10 @@ impl ExecutionPlan for NetworkCoalesceExec {
         let mut self_clone = self.as_ref().clone();
         match &mut self_clone.input_stage {
             Stage::Local(local) => {
-                local.plan = require_one_child(children)?;
+                let child = require_one_child(children)?;
+                self_clone.properties =
+                    coalesce_partitioning_props(child.properties(), local.tasks)?;
+                local.plan = child;
             }
             Stage::Remote(_) => {
                 if !children.is_empty() {

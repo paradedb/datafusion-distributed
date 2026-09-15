@@ -52,6 +52,7 @@ use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, Physic
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::expressions::Column;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
+
 use datafusion_distributed::test_utils::in_memory_channel_resolver::{
     InMemoryChannelResolver, InMemoryWorkerResolver,
 };

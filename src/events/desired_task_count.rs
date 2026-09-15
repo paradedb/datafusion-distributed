@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 /// Annotation attached to a single [ExecutionPlan] that determines how many distributed tasks
 /// it should run on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskCountAnnotation {
     /// The desired number of distributed tasks for this node. The final task count for the
     /// annotated node might not be exactly this number, it is more like a hint, so depending

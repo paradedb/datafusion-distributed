@@ -69,7 +69,7 @@ impl TableProvider for IcebergStaticTableProvider {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&[usize]>,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {

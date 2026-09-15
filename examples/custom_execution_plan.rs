@@ -109,7 +109,7 @@ impl TableProvider for NumbersTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&[usize]>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {

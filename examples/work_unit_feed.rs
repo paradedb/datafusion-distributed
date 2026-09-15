@@ -349,7 +349,7 @@ impl TableProvider for ScanTableProvider {
     async fn scan(
         &self,
         _: &dyn Session,
-        projection: Option<&[usize]>,
+        projection: Option<&Vec<usize>>,
         _: &[Expr],
         _: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -360,7 +360,7 @@ impl TableProvider for ScanTableProvider {
         Ok(Arc::new(RemoteScanExec::new(
             feed,
             self.per_partition_chunks.len(),
-            projection.map(Vec::from),
+            projection.cloned(),
         )))
     }
 }

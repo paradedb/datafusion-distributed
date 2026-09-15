@@ -10,7 +10,7 @@ Specifically:
 1. Enables `inject_network_boundaries` and `NetworkShuffleExec` to support `Partitioning::Range` alongside `Partitioning::Hash`.
 2. Updates `NetworkCoalesceExec::with_input_stage` and `NetworkCoalesceExec::with_new_children` to dynamically recompute advertised plan properties from the underlying plan instead of retaining stale partition counts when child stages are scaled down during stage preparation.
 3. Updates leaf file scan scaling (`file_scan_config.rs`) to allocate range-partitioned file groups contiguously across tasks in key order rather than interleaving via round-robin.
-4. Patches DataFusion dependencies onto `goutamadwant:feat/range-partitioning-scaling` incorporating upstream PR apache/datafusion#24766 (`RangePartitioning::scale`).
+4. Patches DataFusion dependencies onto `paradedb/datafusion:stuhood.branch-55-range-scaling` (cherry-picking `RangePartitioning::scale` onto `branch-55`).
 5. Adds comprehensive range partitioning test coverage in `tests/range_partitioning.rs`.
 
 ## Why
@@ -36,7 +36,6 @@ When a range shuffle occurs on the probe (right) side of a `HashJoinExec: mode=P
    - In `src/codec/distributed_codec.rs`, serialized `NetworkShuffleExec`'s configured partitioning and ensured worker-side decoded properties use single-partition unknown partitioning for range shuffles.
    - In `src/events/defaults/file_scan_config.rs`, added range awareness to `desired_task_count` and introduced `rebalance_contiguous` to allocate file groups contiguously across tasks in range order.
    - In `src/metrics/bytes_metric.rs`, `src/execution_plans/sampler.rs`, and `src/protocol/grpc/worker_client.rs`, disambiguated `bytes_counter_metric` from DataFusion's inherent `MetricBuilder::bytes_counter` method.
-   - Updated `TableProvider::scan` signatures across `iceberg/` and examples to `Option<&[usize]>` per DataFusion's updated trait signature.
 
 2. **`NetworkCoalesceExec` Dynamic Property Recomputation**
    - In `src/execution_plans/network_coalesce.rs`, updated `with_input_stage` and `with_new_children` to recompute advertised `PlanProperties` directly from `local.plan.properties()` scaled by `local.tasks` whenever the input stage is local.

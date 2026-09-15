@@ -43,7 +43,7 @@ mod tests {
         async fn scan(
             &self,
             state: &dyn datafusion::catalog::Session,
-            projection: Option<&[usize]>,
+            projection: Option<&Vec<usize>>,
             filters: &[Expr],
             limit: Option<usize>,
         ) -> Result<Arc<dyn ExecutionPlan>> {

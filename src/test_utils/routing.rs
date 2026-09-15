@@ -91,7 +91,7 @@ impl TableProvider for URLEmitterTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&[usize]>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -99,7 +99,7 @@ impl TableProvider for URLEmitterTableProvider {
             self.partitions,
             self.task_count,
             self.tag.clone(),
-            projection.map(Vec::from),
+            projection.cloned(),
         )))
     }
 }

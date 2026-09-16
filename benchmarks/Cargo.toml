@@ -58,3 +58,8 @@ harness = false
 [[bench]]
 name = "transport"
 harness = false
+
+[[bench]]
+name = "range_join_scenarios"
+harness = false
+

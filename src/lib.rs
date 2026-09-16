@@ -94,5 +94,5 @@ pub use worker::{
 #[cfg(all(feature = "grpc", any(feature = "integration", test)))]
 pub use execution_plans::benchmarks::{
     LocalRepartitionBench, LocalRepartitionFixture, LocalRepartitionMode, ShuffleBench,
-    ShuffleFixture, TransportBench, TransportBenchMode, TransportFixture,
+    ShuffleFixture, ShufflePartitioningMode, TransportBench, TransportBenchMode, TransportFixture,
 };

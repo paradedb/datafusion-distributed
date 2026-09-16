@@ -48,6 +48,10 @@ name = "broadcast_cache_scenarios"
 harness = false
 
 [[bench]]
+name = "range_join_scenarios"
+harness = false
+
+[[bench]]
 name = "shuffle"
 harness = false
 

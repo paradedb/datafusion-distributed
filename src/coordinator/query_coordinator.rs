@@ -184,7 +184,17 @@ impl<'a> StageCoordinator<'a> {
             .and_then(|source| source.dispatch_plan_proto(&task_key, &specialized))
         {
             Some(bytes) => MaybeEncoded::Encoded(bytes?),
-            None => MaybeEncoded::Decoded(Arc::clone(&specialized)),
+            None => {
+                let plan = if is_local_dynamic_filtering_enabled(session_config) {
+                    maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
+                        Arc::clone(&specialized),
+                        self.task_ctx,
+                    )?
+                } else {
+                    Arc::clone(&specialized)
+                };
+                MaybeEncoded::Decoded(plan)
+            }
         };
 
         if is_remote_dynamic_filtering_enabled(session_config)? {
@@ -515,14 +525,7 @@ impl<'a> StageCoordinator<'a> {
             // we are explicitly not retransforming the entire plan. if other operators cause shared state errors they will error out.
             Ok(Transformed::no(plan))
         })?;
-        let plan = if dynamic_filtering_enabled {
-            maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
-                Arc::clone(&transformed.data),
-                self.task_ctx,
-            )?
-        } else {
-            transformed.data
-        };
+        let plan = transformed.data;
         let dynamic_filter_remote_producer_ids =
             if dynamic_filtering_enabled && remote_dynamic_filtering_enabled {
                 dynamic_filter_remote_producer_ids(&plan)?

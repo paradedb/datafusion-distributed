@@ -170,7 +170,13 @@ impl<'a> StageCoordinator<'a> {
             .and_then(|source| source.dispatch_plan_proto(&task_key, &specialized))
         {
             Some(bytes) => MaybeEncoded::Encoded(bytes?),
-            None => MaybeEncoded::Decoded(Arc::clone(&specialized)),
+            None => {
+                let plan = maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
+                    Arc::clone(&specialized),
+                    self.task_ctx,
+                )?;
+                MaybeEncoded::Decoded(plan)
+            }
         };
 
         let mut headers = get_config_extension_propagation_headers(session_config)?;
@@ -467,11 +473,7 @@ impl<'a> StageCoordinator<'a> {
 
             Ok(Transformed::no(plan))
         })?;
-        let plan = maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
-            Arc::clone(&transformed.data),
-            self.task_ctx,
-        )?;
-        Ok((plan, work_unit_feed_declarations))
+        Ok((transformed.data, work_unit_feed_declarations))
     }
 }
 

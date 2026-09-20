@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   call-rebase:
-    uses: paradedb/actions/.github/workflows/upstream-sync-rebase.yml@v10
+    uses: paradedb/actions/.github/workflows/upstream-sync-rebase.yml@v14
     with:
       github_app_client_id: ${{ vars.PARADEDB_GITHUB_APP_CLIENT_ID }}
       approvers: datafusion-maintainers

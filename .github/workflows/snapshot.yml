@@ -35,7 +35,7 @@ jobs:
       - name: Create and Push Tag
         run: |
           set -euo pipefail
-          TAG_NAME="snapshot-${{ github.ref_name }}-$(date -u +%Y-%m-%d-%H%M%S)"
+          TAG_NAME="snapshot-${GITHUB_REF_NAME}-$(date -u +%Y-%m-%d-%H%M%S)"
           echo "Creating tag: $TAG_NAME"
           
           git tag "$TAG_NAME"

@@ -33,7 +33,7 @@ extensions_options! {
         /// the distributed plan. This does not control whether dynamic filtering is used during
         /// query execution.
         pub collect_dynamic_filters: bool, default = true
-        /// Control whether dynamic filters are distributed accross network boundaries. This does
+        /// Control whether dynamic filters are distributed across network boundaries. This does
         /// not control intra-stage filter behavior.
         pub remote_dynamic_filters: bool, default = true
         /// Enable broadcast joins for CollectLeft hash joins. When enabled, the build side of

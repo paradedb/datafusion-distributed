@@ -1359,4 +1359,61 @@ mod tests {
 
         let _ = worker_handle.join().await;
     }
+
+    /// When tasks are multiplexed across fewer worker processes than logical tasks, peer workers
+    /// may complete early, exit, and drop their DSM senders. This detaches the local process's DSM
+    /// inbox. Local in-process channels must NOT fail when DSM detaches, and must be able to send
+    /// and receive batches and EOF normally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_worker_exit_does_not_fail_multiplexed_local_channels() {
+        use crate::shm::transport::DrainItem;
+
+        let n_procs = 3; // Proc 0: leader, Proc 1: worker 1 (hosts local channel), Proc 2: peer worker 2
+        let boot = bootstrap_mesh(n_procs);
+        let mut workers = boot.workers;
+        let (_proc2, worker2_mesh, outbound2) = workers.pop().unwrap();
+        let (_proc1, worker1_mesh, _outbound1) = workers.pop().unwrap();
+
+        // Worker 1 opens a local in-process partition sink (producer).
+        let stream_key = MppDataStreamKey::new(1, 0, 0);
+        let mut local_sink = worker1_mesh.open_local_partition_sink(stream_key);
+
+        // Worker 1 also registers the consumer side for that local channel.
+        let local_consumer_channel = worker1_mesh
+            .inbound_receiver()
+            .register_data_channel(worker1_mesh.this_proc, stream_key);
+
+        // Worker 2 (and its outbound senders) exits/drops.
+        // Dropping worker 2's senders causes worker 1's DSM inbox sender count to drop to zero.
+        drop(outbound2);
+        drop(worker2_mesh);
+
+        // Worker 1 executes try_drain_pass, observing DSM detachment.
+        let _ = worker1_mesh.inbound_receiver().try_drain_pass();
+
+        // The local in-process channel on worker 1 must NOT be marked failed.
+        assert!(local_consumer_channel.try_pop().is_none());
+
+        // The local channel can continue sending batches and cleanly finish with EOF.
+        let schema = table_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        local_sink.send(&batch).await.unwrap();
+        local_sink.finish().await.unwrap();
+
+        match local_consumer_channel.try_pop() {
+            Some(DrainItem::Batch(b)) => assert_eq!(b.num_rows(), 2),
+            other => panic!("expected batch, got {other:?}"),
+        }
+        assert!(matches!(
+            local_consumer_channel.try_pop(),
+            Some(DrainItem::Eof)
+        ));
+    }
 }

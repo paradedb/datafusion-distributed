@@ -115,6 +115,7 @@ impl MppMesh {
         interrupt: Arc<dyn Interrupt>,
         alive: AliveFlag,
     ) -> Self {
+        inbound_receiver.set_this_proc(this_proc);
         Self {
             this_proc,
             n_procs,
@@ -236,6 +237,10 @@ impl MppMesh {
     /// Stream-level so any consumer can cancel its own input: every `(producer_proc, stage, task,
     /// partition)` channel has a single consumer, so one stream's drop never cuts off a sibling's.
     pub fn cancel_stream(&self, producer_proc: u32, stream: MppDataStreamKey) {
+        if producer_proc == self.this_proc {
+            self.inbound_receiver.cancel_stream(producer_proc, stream);
+            return;
+        }
         let guard = self.cancel_senders.lock().unwrap();
         let Some(senders) = guard.as_ref() else {
             return;

@@ -28,7 +28,6 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use datafusion::common::{HashMap, HashSet};
@@ -1519,24 +1518,18 @@ impl crate::PartitionSink for MppPartitionSink {
 /// by another fragment on the same worker process.
 pub struct LocalDrainPartitionSink {
     buffer: Arc<DrainBuffer>,
-    finished: bool,
 }
 
 impl LocalDrainPartitionSink {
     pub(super) fn new(buffer: Arc<DrainBuffer>) -> Self {
-        Self {
-            buffer,
-            finished: false,
-        }
+        Self { buffer }
     }
 }
 
 impl Drop for LocalDrainPartitionSink {
     fn drop(&mut self) {
-        if !self.finished {
-            self.buffer
-                .fail_pending("local partition sink dropped before EOF");
-        }
+        self.buffer
+            .fail_pending("local partition sink dropped before EOF");
     }
 }
 
@@ -1547,8 +1540,7 @@ impl crate::PartitionSink for LocalDrainPartitionSink {
         Ok(())
     }
 
-    async fn finish(mut self: Box<Self>) -> datafusion::common::Result<()> {
-        self.finished = true;
+    async fn finish(self: Box<Self>) -> datafusion::common::Result<()> {
         self.buffer.notify_source_done();
         Ok(())
     }
@@ -1761,22 +1753,25 @@ pub(super) enum RecvBatchOutcome {
 ///
 /// Each entry is a `DrainBuffer::new(1)`: exactly one sender_proc emits frames for any given
 /// channel. Per-channel EOF flows via the `Eof` frame demuxed onto the matching buffer; query-
-/// teardown unblock flows via [`DrainHandle::cancel_channel_buffers`] from the handle's `Drop`.
-const UNSET_PROC: u32 = u32::MAX;
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+enum ChannelBufferState {
+    #[default]
+    Live,
+    /// The remote inbox detached before draining cleanly. Remote channels
+    /// fail at registration time, but local in-process channels remain live.
+    Detached(String),
+    /// Hard failure recorded for the entire scope (e.g. from `fail_scope`).
+    Failed(String),
+}
 
 #[derive(Default)]
 struct ChannelBufferRegistry {
-    /// Keyed by `(sender_proc, stage_id, task_id, partition)`. The unified inbox carries frames
-    /// from every peer, so each `(stage, task, partition)` consumer gets its own per-sender
-    /// buffer. This preserves the implicit "one stream per sender" semantics that
-    /// `WorkerConnection::execute` consumers rely on.
-    map: HashMap<PhysicalStreamKey, Arc<DrainBuffer>>,
-    /// Whether the remote inbox detached before draining cleanly. Remote channels
-    /// fail at registration time too, so a consumer that registers after the detach
-    /// does not wait on a channel nothing will ever fill.
-    dead_inbox: bool,
-    /// Hard failure recorded for the entire scope (e.g. from `fail_scope`).
-    failed: Option<String>,
+    /// Remote inbound channels arriving over DSM from peer processes, keyed by
+    /// `(sender_proc, stage_id, task_id, partition)`.
+    remote: HashMap<PhysicalStreamKey, Arc<DrainBuffer>>,
+    /// Local in-process channels on this process, keyed by `(stage_id, task_id, partition)`.
+    local: HashMap<MppDataStreamKey, Arc<DrainBuffer>>,
+    state: ChannelBufferState,
 }
 
 /// Per-sender-proc drain: stashes the receivers and polls them inline from the cooperative spin
@@ -1790,9 +1785,6 @@ struct ChannelBufferRegistry {
 /// On drop, the handle cancels every channel buffer so any consumer blocked on `try_pop` unblocks
 /// with `Eof` — the drain can therefore never outlive its query, even on a panicked teardown.
 pub struct DrainHandle {
-    /// Local process index owning this drain handle, if known. Used to distinguish
-    /// remote DSM channels from local in-process channels.
-    this_proc: AtomicU32,
     /// Per-(stage_id, task_id, partition) channel buffer registry. Populated lazily on first frame for a
     /// channel, or up-front by callers (e.g. `WorkerConnection::execute`) that need a
     /// buffer to wait on before any frame arrives.
@@ -1915,20 +1907,10 @@ impl DrainHandle {
     /// Construct a cooperative drain handle. Channel buffers are populated lazily by
     /// [`Self::try_drain_pass`] when a frame arrives, or up-front by [`Self::register_channel`]
     /// when a consumer needs a buffer to wait on before any frame has come in.
-    #[cfg(test)]
     pub(super) fn cooperative(receivers: Vec<MppReceiver>) -> Self {
-        Self::cooperative_with_proc(None, receivers)
-    }
-
-    /// Construct a cooperative drain handle with a known local process index.
-    pub(super) fn cooperative_with_proc(
-        this_proc: Option<u32>,
-        receivers: Vec<MppReceiver>,
-    ) -> Self {
         let wrapped = receivers.into_iter().map(Some).collect();
         let (task_metrics_tx, task_metrics_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            this_proc: AtomicU32::new(this_proc.unwrap_or(UNSET_PROC)),
             channel_buffers: Mutex::new(ChannelBufferRegistry::default()),
             coop_receivers: Mutex::new(wrapped),
             feed_registry: Mutex::new(FeedRegistry::default()),
@@ -1938,17 +1920,6 @@ impl DrainHandle {
             execute_task_registry: Mutex::new(ExecuteTaskRegistry::default()),
             cancelled_streams: Mutex::new(HashSet::default()),
         }
-    }
-
-    /// Set the local process index owning this handle.
-    pub fn set_this_proc(&self, proc: u32) {
-        self.this_proc.store(proc, Ordering::Release);
-    }
-
-    /// The local process index owning this handle, if known.
-    pub fn this_proc(&self) -> Option<u32> {
-        let val = self.this_proc.load(Ordering::Acquire);
-        if val == UNSET_PROC { None } else { Some(val) }
     }
 
     /// Record a `Cancel` frame: the consumer abandoned this data stream, so this proc's producer
@@ -1963,15 +1934,14 @@ impl DrainHandle {
         self.cancelled_streams.lock().unwrap().contains(&stream)
     }
 
-    /// Cancel a stream buffer and record the cancellation. For local channels where both producer
-    /// and consumer reside on this proc, bypassing DSM.
-    pub(super) fn cancel_stream(&self, sender_proc: u32, stream: MppDataStreamKey) {
-        self.note_cancel(stream);
+    /// Cancel a stream buffer for a local channel where both producer and consumer reside
+    /// on this proc, bypassing DSM.
+    pub(super) fn cancel_local_stream(&self, stream: MppDataStreamKey) {
         let guard = self
             .channel_buffers
             .lock()
             .expect("DrainHandle channel_buffers mutex poisoned");
-        if let Some(buf) = guard.map.get(&PhysicalStreamKey::new(sender_proc, stream)) {
+        if let Some(buf) = guard.local.get(&stream) {
             buf.cancel();
         }
     }
@@ -2127,25 +2097,21 @@ impl DrainHandle {
     /// says nothing about them: a peer that completed normally has EOF'd everything it served,
     /// while this proc may still owe the leader work it has not been asked for yet.
     ///
-    /// Local in-process channels (`sender_proc == this_proc`) bypass the DSM inbox entirely
-    /// and are not failed on DSM detachment; they remain live until the local producer finishes.
+    /// Local in-process channels bypass the DSM inbox entirely and are not failed on DSM
+    /// detachment; they remain live until the local producer finishes.
     fn detach_data_scope(&self, reason: &str) {
-        let this_proc = self.this_proc();
         let to_fail = {
             let mut guard = self
                 .channel_buffers
                 .lock()
                 .expect("DrainHandle channel_buffers mutex poisoned");
-            if guard.dead_inbox {
-                return;
+            match &guard.state {
+                ChannelBufferState::Detached(_) | ChannelBufferState::Failed(_) => return,
+                ChannelBufferState::Live => {
+                    guard.state = ChannelBufferState::Detached(reason.to_string());
+                }
             }
-            guard.dead_inbox = true;
-            guard
-                .map
-                .iter()
-                .filter(|(key, _)| this_proc != Some(key.sender_proc))
-                .map(|(_, buf)| Arc::clone(buf))
-                .collect::<Vec<_>>()
+            guard.remote.values().cloned().collect::<Vec<_>>()
         };
         for buf in to_fail {
             buf.fail_pending(reason);
@@ -2161,15 +2127,22 @@ impl DrainHandle {
                 .channel_buffers
                 .lock()
                 .expect("DrainHandle channel_buffers mutex poisoned");
-            guard.dead_inbox = true;
-            guard.failed = Some(reason.to_string());
-            guard.map.values().cloned().collect::<Vec<_>>()
+            if let ChannelBufferState::Failed(_) = &guard.state {
+                // First error wins; keep the original failure reason for late registrations.
+            } else {
+                guard.state = ChannelBufferState::Failed(reason.to_string());
+            }
+            let mut buffers = guard.remote.values().cloned().collect::<Vec<_>>();
+            buffers.extend(guard.local.values().cloned());
+            buffers
         };
         for buf in to_fail {
             buf.fail_pending(reason);
         }
         let mut registry = self.feed_registry.lock().unwrap();
-        registry.dead = Some(reason.to_string());
+        if registry.dead.is_none() {
+            registry.dead = Some(reason.to_string());
+        }
         for (_, slot) in registry.map.drain() {
             if let FeedSlot::Active(senders) = slot {
                 fail_feed_senders(&senders, reason);
@@ -2177,14 +2150,18 @@ impl DrainHandle {
         }
         drop(registry);
         let mut plans = self.set_plan_registry.lock().unwrap();
-        plans.dead = Some(reason.to_string());
+        if plans.dead.is_none() {
+            plans.dead = Some(reason.to_string());
+        }
         for (_, slot) in plans.map.drain() {
             if let SetPlanSlot::Waiting(tx) = slot {
                 let _ = tx.send(Err(DataFusionError::Execution(reason.to_string())));
             }
         }
         let mut execs = self.execute_task_registry.lock().unwrap();
-        execs.dead = Some(reason.to_string());
+        if execs.dead.is_none() {
+            execs.dead = Some(reason.to_string());
+        }
         for (_, slot) in execs.map.drain() {
             if let ExecuteTaskSlot::Active(tx) = slot {
                 let _ = tx.send(Err(DataFusionError::Execution(reason.to_string())));
@@ -2248,8 +2225,8 @@ impl DrainHandle {
         Ok(rx)
     }
 
-    /// Register (or look up) the channel buffer for one producer's data stream.
-    /// The returned `Arc<DrainBuffer>` is the canonical destination for frames matching
+    /// Register (or look up) the channel buffer for one remote producer's data stream arriving
+    /// over DSM. The returned `Arc<DrainBuffer>` is the canonical destination for frames matching
     /// that key: `try_drain_pass` pushes into the same entry on every `Batch { header, .. }`
     /// whose `header.sender_proc()` / `stage_id` / `partition` matches.
     pub(super) fn register_data_channel(
@@ -2261,18 +2238,14 @@ impl DrainHandle {
             .channel_buffers
             .lock()
             .expect("DrainHandle channel_buffers mutex poisoned");
-        let failure_reason = if let Some(err) = &guard.failed {
-            Some(err.clone())
-        } else if guard.dead_inbox && self.this_proc() != Some(sender_proc) {
-            Some(
-                "transport receiver detached before this channel's EOF; the producer went away"
-                    .to_string(),
-            )
-        } else {
-            None
+        let failure_reason = match &guard.state {
+            ChannelBufferState::Live => None,
+            ChannelBufferState::Detached(reason) | ChannelBufferState::Failed(reason) => {
+                Some(reason.clone())
+            }
         };
         let buf = guard
-            .map
+            .remote
             .entry(PhysicalStreamKey::new(sender_proc, stream))
             .or_insert_with(|| {
                 // num_sources stays 1: each (sender_proc, stage, task, partition) tuple has
@@ -2280,6 +2253,30 @@ impl DrainHandle {
                 // inbox is shared across all senders.
                 DrainBuffer::new(1)
             })
+            .clone();
+        drop(guard);
+        if let Some(reason) = failure_reason {
+            buf.fail_pending(&reason);
+        }
+        buf
+    }
+
+    /// Register (or look up) the channel buffer for a local in-process data stream.
+    /// Local channels bypass DSM and survive remote inbox detachment, failing only on
+    /// hard scope failure.
+    pub(super) fn register_local_channel(&self, stream: MppDataStreamKey) -> Arc<DrainBuffer> {
+        let mut guard = self
+            .channel_buffers
+            .lock()
+            .expect("DrainHandle channel_buffers mutex poisoned");
+        let failure_reason = match &guard.state {
+            ChannelBufferState::Failed(reason) => Some(reason.clone()),
+            ChannelBufferState::Live | ChannelBufferState::Detached(_) => None,
+        };
+        let buf = guard
+            .local
+            .entry(stream)
+            .or_insert_with(|| DrainBuffer::new(1))
             .clone();
         drop(guard);
         if let Some(reason) = failure_reason {
@@ -2302,7 +2299,9 @@ impl DrainHandle {
                 .channel_buffers
                 .lock()
                 .expect("DrainHandle channel_buffers mutex poisoned");
-            guard.map.values().cloned().collect::<Vec<_>>()
+            let mut buffers = guard.remote.values().cloned().collect::<Vec<_>>();
+            buffers.extend(guard.local.values().cloned());
+            buffers
         };
         for buf in to_cancel {
             buf.cancel();
@@ -3210,17 +3209,17 @@ mod tests {
     }
 
     /// A peer process departs, detaching the DSM data plane. Remote channels that were waiting on
-    /// their `Eof` fail, but local in-process channels (`sender_proc == this_proc`) must NOT fail
-    /// because their producers do not communicate over the DSM inbox.
+    /// A peer process departs, detaching the DSM data plane. Remote channels that were waiting on
+    /// their `Eof` fail, but local in-process channels must NOT fail because their producers do not
+    /// communicate over the DSM inbox.
     #[test]
     fn peer_detach_does_not_fail_local_channels() {
         let (_region, peer, _leader, drain) = detached_test_inbox();
-        drain.set_this_proc(1);
 
         // Remote channel awaiting EOF from peer proc 2.
         let remote_dep = drain.register_data_channel(2, MppDataStreamKey::new(2, 1, 0));
-        // Local channel on this proc (proc 1).
-        let local_channel = drain.register_data_channel(1, MppDataStreamKey::new(2, 1, 1));
+        // Local channel on this proc.
+        let local_channel = drain.register_local_channel(MppDataStreamKey::new(2, 1, 1));
 
         drop(peer);
         drain.try_drain_pass().expect("drain over the detach");
@@ -3244,20 +3243,20 @@ mod tests {
         assert!(matches!(late_remote.try_pop(), Some(DrainItem::Failed(_))));
 
         // Late registration for local proc succeeds and does not fail.
-        let late_local = drain.register_data_channel(1, MppDataStreamKey::new(2, 1, 2));
+        let late_local = drain.register_local_channel(MppDataStreamKey::new(2, 1, 2));
         assert!(late_local.try_pop().is_none());
         late_local.notify_source_done();
         assert!(matches!(late_local.try_pop(), Some(DrainItem::Eof)));
     }
 
-    /// Hard scope failure (e.g. from `fail_scope`) must fail both remote and local channels.
+    /// Hard scope failure (e.g. from `fail_scope`) must fail both remote and local channels,
+    /// and preserve the first failure reason.
     #[test]
     fn fail_scope_fails_both_remote_and_local_channels() {
         let drain = DrainHandle::cooperative(vec![]);
-        drain.set_this_proc(1);
 
         let remote = drain.register_data_channel(2, MppDataStreamKey::new(2, 0, 0));
-        let local = drain.register_data_channel(1, MppDataStreamKey::new(2, 0, 1));
+        let local = drain.register_local_channel(MppDataStreamKey::new(2, 0, 1));
 
         drain.fail_scope("worker 2 panicked");
 
@@ -3270,16 +3269,24 @@ mod tests {
             Some(DrainItem::Failed(msg)) if msg.contains("worker 2 panicked")
         ));
 
-        // Late registrations also fail.
+        // Late registrations also fail with the first failure reason.
         let late_remote = drain.register_data_channel(2, MppDataStreamKey::new(2, 0, 2));
         assert!(matches!(
             late_remote.try_pop(),
             Some(DrainItem::Failed(msg)) if msg.contains("worker 2 panicked")
         ));
 
-        let late_local = drain.register_data_channel(1, MppDataStreamKey::new(2, 0, 3));
+        let late_local = drain.register_local_channel(MppDataStreamKey::new(2, 0, 3));
         assert!(matches!(
             late_local.try_pop(),
+            Some(DrainItem::Failed(msg)) if msg.contains("worker 2 panicked")
+        ));
+
+        // A second fail_scope does not overwrite the first reason (first error wins).
+        drain.fail_scope("worker 3 panicked");
+        let late_local_2 = drain.register_local_channel(MppDataStreamKey::new(2, 0, 4));
+        assert!(matches!(
+            late_local_2.try_pop(),
             Some(DrainItem::Failed(msg)) if msg.contains("worker 2 panicked")
         ));
     }
@@ -3310,15 +3317,14 @@ mod tests {
     /// Cancelling a local stream on `DrainHandle` marks the local buffer cancelled so the sink observes it.
     #[test]
     fn local_stream_cancellation_marks_buffer_cancelled() {
-        let drain = DrainHandle::cooperative_with_proc(Some(1), vec![]);
+        let drain = DrainHandle::cooperative(vec![]);
         let stream = MppDataStreamKey::new(2, 0, 1);
-        let buffer = drain.register_data_channel(1, stream);
+        let buffer = drain.register_local_channel(stream);
         let sink = LocalDrainPartitionSink::new(Arc::clone(&buffer));
         assert!(!crate::PartitionSink::cancelled(&sink));
 
-        drain.cancel_stream(1, stream);
+        drain.cancel_local_stream(stream);
         assert!(crate::PartitionSink::cancelled(&sink));
-        assert!(drain.stream_cancelled(stream));
     }
 
     #[test]
@@ -4381,10 +4387,12 @@ mod tests {
 
         let buf_a = handle.register_data_channel(0, MppDataStreamKey::new(0, 0, 0));
         let buf_b = handle.register_data_channel(0, MppDataStreamKey::new(7, 0, 3));
+        let buf_c = handle.register_local_channel(MppDataStreamKey::new(1, 0, 1));
         // No data ever flows; the handle is just dropped.
         drop(handle);
 
         assert!(matches!(buf_a.try_pop(), Some(DrainItem::Eof)));
         assert!(matches!(buf_b.try_pop(), Some(DrainItem::Eof)));
+        assert!(matches!(buf_c.try_pop(), Some(DrainItem::Eof)));
     }
 }

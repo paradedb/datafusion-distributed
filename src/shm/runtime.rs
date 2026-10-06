@@ -115,7 +115,6 @@ impl MppMesh {
         interrupt: Arc<dyn Interrupt>,
         alive: AliveFlag,
     ) -> Self {
-        inbound_receiver.set_this_proc(this_proc);
         Self {
             this_proc,
             n_procs,
@@ -238,7 +237,7 @@ impl MppMesh {
     /// partition)` channel has a single consumer, so one stream's drop never cuts off a sibling's.
     pub fn cancel_stream(&self, producer_proc: u32, stream: MppDataStreamKey) {
         if producer_proc == self.this_proc {
-            self.inbound_receiver.cancel_stream(producer_proc, stream);
+            self.inbound_receiver.cancel_local_stream(stream);
             return;
         }
         let guard = self.cancel_senders.lock().unwrap();
@@ -284,9 +283,7 @@ impl MppMesh {
 
     /// Opens a [`PartitionSink`] for a local in-process data stream (self-loop).
     pub fn open_local_partition_sink(&self, stream: MppDataStreamKey) -> Box<dyn PartitionSink> {
-        let buffer = self
-            .inbound_receiver
-            .register_data_channel(self.this_proc, stream);
+        let buffer = self.inbound_receiver.register_local_channel(stream);
         Box::new(LocalDrainPartitionSink::new(buffer))
     }
 
@@ -593,7 +590,11 @@ fn pull_partition_stream(
         stream.task_id,
         stream.partition,
     );
-    let buffer = drain.register_data_channel(producer_proc, stream);
+    let buffer = if producer_proc == mesh.this_proc {
+        drain.register_local_channel(stream)
+    } else {
+        drain.register_data_channel(producer_proc, stream)
+    };
     let stream = async_stream::stream! {
         // Any consumer cancels its own input stream when it drops early. The mesh no-ops the send
         // until the embedder wires this proc's outbound senders.

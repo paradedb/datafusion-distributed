@@ -1381,7 +1381,7 @@ mod tests {
         // Worker 1 also registers the consumer side for that local channel.
         let local_consumer_channel = worker1_mesh
             .inbound_receiver()
-            .register_data_channel(worker1_mesh.this_proc, stream_key);
+            .register_local_channel(stream_key);
 
         // Worker 2 (and its outbound senders) exits/drops.
         // Dropping worker 2's senders causes worker 1's DSM inbox sender count to drop to zero.

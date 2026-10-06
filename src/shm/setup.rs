@@ -175,10 +175,9 @@ pub unsafe fn leader_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative_with_proc(
-        Some(0),
-        vec![MppReceiver::new(Box::new(inbox))],
-    ));
+    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
+        inbox,
+    ))]));
     // The leader hosts no producer fragments, but its senders carry the control plane:
     // work-unit frames (and later dynamic filters) flow leader -> worker through them. Empty
     // when the embedder did not opt in: a ring latches `detached` once its sender count hits
@@ -296,10 +295,9 @@ pub unsafe fn worker_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative_with_proc(
-        Some(proc_idx),
-        vec![MppReceiver::new(Box::new(inbox))],
-    ));
+    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
+        inbox,
+    ))]));
     let mesh = Arc::new(MppMesh::new(
         proc_idx,
         total_procs,

@@ -235,6 +235,27 @@ impl ChildrenIsolatorUnionExec {
             task_idx_map: self.task_idx_map.clone(),
         }
     }
+
+    /// The outer tasks of the enclosing stage that execute `child`, each paired with the inner
+    /// [`DistributedTaskContext`] this node hands that child in `execute`.
+    ///
+    /// The inverse of the `task_idx_map[outer]` lookup `execute` performs. A push-based
+    /// transport addresses a child's inputs before any task runs, so it needs the child-local
+    /// task index a nested boundary reports translated back to the outer task hosting it.
+    pub fn outer_tasks_for_child(
+        &self,
+        child: usize,
+    ) -> impl Iterator<Item = (usize, DistributedTaskContext)> + '_ {
+        self.task_idx_map
+            .iter()
+            .enumerate()
+            .flat_map(move |(outer, entries)| {
+                entries
+                    .iter()
+                    .filter(move |(c, _)| *c == child)
+                    .map(move |(_, inner)| (outer, *inner))
+            })
+    }
 }
 
 impl DisplayAs for ChildrenIsolatorUnionExec {
@@ -603,6 +624,7 @@ fn split_children(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
     fn children_split_all_1_task() -> Result<(), Box<dyn std::error::Error>> {
@@ -854,6 +876,69 @@ mod tests {
             err.to_string().contains("max task count of 0"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Every pair `outer_tasks_for_child` yields is an entry of `task_idx_map[outer]`, none is
+    /// missed, and a child's inner indices are exactly `0..inner.task_count`.
+    #[test]
+    fn outer_tasks_for_child_inverts_task_idx_map() -> Result<(), Box<dyn std::error::Error>> {
+        let shapes: Vec<(Vec<ChildWeight>, usize)> = vec![
+            // The aggregate-union repro: two children, three tasks -> t0:[c0(0/2)] t1:[c0(1/2)] t2:[c1].
+            (vec![des(2.0), des(1.0)], 3),
+            // Same children listed the other way round.
+            (vec![des(1.0), des(2.0)], 3),
+            // More children than tasks: a zero-share child is packed into an occupied slot.
+            (vec![des(1.0), des(1.0), des(1.0)], 2),
+            // More tasks than children.
+            (vec![des(1.0), des(2.0), des(3.0)], 6),
+            // Capped children leave an empty slot.
+            (vec![max(1), max(1)], 3),
+            // Heavy child dominates; light children ride along.
+            (vec![des(10.0), des(1.0), des(1.0)], 3),
+            (vec![des(1.0)], 1),
+        ];
+        for (weights, task_count) in shapes {
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+            let children: Vec<Arc<dyn ExecutionPlan>> = (0..weights.len())
+                .map(|_| Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>)
+                .collect();
+            let union = ChildrenIsolatorUnionExec::from_children_and_weights(
+                children,
+                weights.clone(),
+                task_count,
+            )?;
+
+            let mut seen = 0usize;
+            for child in 0..weights.len() {
+                let pairs: Vec<_> = union.outer_tasks_for_child(child).collect();
+                for (outer, inner) in &pairs {
+                    assert!(
+                        union.task_idx_map[*outer].contains(&(child, *inner)),
+                        "weights={weights:?} tasks={task_count}: ({outer}, {inner:?}) not in task_idx_map"
+                    );
+                }
+                let mut inner_indices: Vec<usize> =
+                    pairs.iter().map(|(_, c)| c.task_index).collect();
+                inner_indices.sort_unstable();
+                let inner_count = pairs.first().map_or(0, |(_, c)| c.task_count);
+                assert!(
+                    pairs.iter().all(|(_, c)| c.task_count == inner_count),
+                    "weights={weights:?} tasks={task_count}: child {child} has mixed inner task counts"
+                );
+                assert_eq!(
+                    inner_indices,
+                    (0..inner_count).collect::<Vec<_>>(),
+                    "weights={weights:?} tasks={task_count}: child {child} inner indices are not dense"
+                );
+                seen += pairs.len();
+            }
+            let total: usize = union.task_idx_map.iter().map(Vec::len).sum();
+            assert_eq!(
+                seen, total,
+                "weights={weights:?} tasks={task_count}: pairs missed"
+            );
+        }
+        Ok(())
     }
 
     fn ctx(task_index: usize, task_count: usize) -> DistributedTaskContext {

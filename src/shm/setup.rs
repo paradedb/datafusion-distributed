@@ -32,7 +32,7 @@ use std::ffi::c_void;
 use std::future::Future;
 use std::sync::Arc;
 
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::stream::StreamExt;
@@ -45,8 +45,9 @@ use super::mesh::{DsmInboxReceiver, DsmInboxSender};
 use super::mpsc_ring::{DsmMpscSender, NO_RECEIVER_TOKEN, Wakeup};
 use super::runtime::MppMesh;
 use super::transport::{
-    BatchChannelSender, DrainHandle, ExecuteTaskRx, IncomingExecuteTaskRequest, Interrupt,
-    MppDataStreamKey, MppFrameHeader, MppReceiver, MppSender,
+    BatchChannelSender, CooperativeDrainSet, DrainHandle, ExecuteTaskRx,
+    IncomingExecuteTaskRequest, Interrupt, MppDataStreamKey, MppFrameHeader, MppPartitionSink,
+    MppReceiver, MppSender,
 };
 use crate::proto as pb;
 use crate::work_unit_feed::RemoteWorkUnitFeedRegistry;
@@ -316,9 +317,9 @@ pub unsafe fn worker_setup(
     })
 }
 
-/// Run a producer fragment plan to exhaustion, pushing every output batch into the matching
-/// per-partition [`PartitionSink`]. The output partition count of `plan` must equal `sinks.len()`;
-/// `sinks[partition]` is the send end the caller routed for that output partition.
+/// Run `partition_range` of a producer fragment plan to exhaustion, pushing every output batch
+/// into the matching per-partition [`PartitionSink`]. `sinks.len()` must equal
+/// `partition_range.len()`; `sinks[i]` is the send end for partition `partition_range.start + i`.
 ///
 /// Each partition's [`PartitionSink::finish`] sends a per-channel EOF when its stream ends,
 /// regardless of how it ended: the shared queue is multiplexed across fragments, so dropping a sink
@@ -374,15 +375,69 @@ pub async fn run_worker_fragment(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ProducerTask {
+    stage_id: u32,
+    task_number: u32,
+}
+
+/// Open a [`PartitionSink`] for each partition in `range` of `task`, addressed to the consumer
+/// process `dest_proc` that requested the range via [`ExecuteTaskFrame`].
+///
+/// [`ExecuteTaskFrame`]: super::transport::ExecuteTaskFrame
+fn open_partition_sinks(
+    mesh: &Arc<MppMesh>,
+    outbound_senders: &[Option<MppSender>],
+    dest_proc: u32,
+    task: ProducerTask,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<Box<dyn PartitionSink>>> {
+    let mut sinks: Vec<Box<dyn PartitionSink>> = Vec::with_capacity(range.len());
+    for q in range {
+        let q_u32 = u32::try_from(q).map_err(|_| {
+            internal_datafusion_err!(
+                "shm transport: output partition {q} exceeds transport u32 \
+                 (stage_id={} task_number={})",
+                task.stage_id,
+                task.task_number
+            )
+        })?;
+        let stream_key = MppDataStreamKey::new(task.stage_id, task.task_number, q_u32);
+        if dest_proc == mesh.this_proc {
+            sinks.push(mesh.open_local_partition_sink(stream_key));
+        } else {
+            let base = outbound_senders
+                .get(dest_proc as usize)
+                .and_then(|s| s.as_ref())
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "shm transport: outbound_senders[{dest_proc}] is None (unattached); \
+                         stage_id={} task_number={}",
+                        task.stage_id,
+                        task.task_number
+                    )
+                })?;
+            sinks.push(Box::new(MppPartitionSink::new(
+                base.clone_with_header(MppFrameHeader::batch(stream_key, mesh.this_proc))
+                    .with_cooperative_drain(Arc::clone(mesh) as Arc<dyn CooperativeDrainSet>),
+            )));
+        }
+    }
+    Ok(sinks)
+}
+
 /// Run the worker request loop for receiving [`ExecuteTaskFrame`] requests, validating partition
-/// ranges, and delegating execution of each requested range to `spawn_range`.
+/// ranges, opening per-partition sinks toward the requesting consumer process, and delegating
+/// execution of each requested range to `spawn_range`.
 ///
 /// # Lifecycle & Guarantees
 /// - **On-Demand Range Execution:** Listens on the mesh for incoming [`ExecuteTaskFrame`] messages,
-///   extracting the requested partition range (`start..end`) and headers.
+///   extracting the requesting `sender_proc`, the requested partition range (`start..end`), and headers.
 /// - **Partition Validation & Single-Claim Accounting:** Ensures that `start <= end` and `end <= n_partitions`,
 ///   and verifies that no partition within `start..end` has been claimed by a previous frame. Returns an
 ///   [`DataFusionError::Execution`] error if bounds are exceeded or duplicate partition claims occur.
+/// - **Demand-Driven Routing:** Opens a [`PartitionSink`] per partition in `start..end` addressed to
+///   `sender_proc` (local drain sink when `sender_proc == mesh.this_proc`, or `outbound_senders[sender_proc]`).
 /// - **Cancellation & Early Termination Unwinding:** Selects on `token.cancelled()`. If the query is
 ///   cancelled or terminates early (e.g. satisfied by a `LIMIT` clause downstream), the request loop
 ///   breaks out immediately and drops active sub-futures.
@@ -392,21 +447,30 @@ pub async fn run_worker_fragment(
 ///   spawned stream futures in `spawn_range` have completed to EOF.
 ///
 /// * `mesh`: The MPP mesh used to coordinate routing, draining, and error handling.
+/// * `outbound_senders`: The worker session's per-peer outbound senders, indexed by destination `proc_idx`.
 /// * `stage_id`: The stage ID this task belongs to.
 /// * `task_number`: The task index within the stage.
 /// * `n_partitions`: Total number of output partitions expected across all request frames for this task.
 /// * `token`: Cancellation token used to unwind the request loop on query cancellation or early teardown.
-/// * `spawn_range`: Closure invoked for each valid, unclaimed partition range `start..end`. Must return a future executing the partition streams for that range.
+/// * `spawn_range`: Closure invoked for each valid, unclaimed partition range `start..end` and its opened sinks.
+///
+/// [`ExecuteTaskFrame`]: super::transport::ExecuteTaskFrame
 pub async fn run_execute_task_loop<F, Fut>(
     mesh: &Arc<MppMesh>,
+    outbound_senders: &[Option<MppSender>],
     stage_id: u32,
     task_number: u32,
     n_partitions: usize,
     token: CancellationToken,
-    spawn_range: F,
+    mut spawn_range: F,
 ) -> Result<()>
 where
-    F: FnMut(pb::ExecuteTaskRequest, http::HeaderMap, std::ops::Range<usize>) -> Fut,
+    F: FnMut(
+        pb::ExecuteTaskRequest,
+        http::HeaderMap,
+        std::ops::Range<usize>,
+        Vec<Box<dyn PartitionSink>>,
+    ) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let rx = mesh.take_execute_task_rx(stage_id, task_number)?;
@@ -414,8 +478,23 @@ where
         let inbound = Arc::clone(mesh.inbound_receiver());
         move || inbound.try_drain_pass()
     };
-    let (res, failed_sender_proc) =
-        run_execute_task_loop_inner(rx, n_partitions, token, drain_pass, spawn_range).await;
+    let task = ProducerTask {
+        stage_id,
+        task_number,
+    };
+    let (res, failed_sender_proc) = run_execute_task_loop_inner(
+        rx,
+        n_partitions,
+        token,
+        drain_pass,
+        move |sender_proc, request, headers, range| {
+            let fut_res =
+                open_partition_sinks(mesh, outbound_senders, sender_proc, task, range.clone())
+                    .map(|sinks| spawn_range(request, headers, range, sinks));
+            async move { fut_res?.await }
+        },
+    )
+    .await;
     // Only send TaskError if the loop returned an actual execution error or fragment panic.
     // Healthy early termination (such as downstream LIMIT queries or cancellation token unwinding)
     // completes cleanly and returns Ok(()), so no TaskError is published.
@@ -436,7 +515,7 @@ async fn run_execute_task_loop_inner<F, Fut>(
     mut spawn_range: F,
 ) -> (Result<()>, Option<u32>)
 where
-    F: FnMut(pb::ExecuteTaskRequest, http::HeaderMap, std::ops::Range<usize>) -> Fut,
+    F: FnMut(u32, pb::ExecuteTaskRequest, http::HeaderMap, std::ops::Range<usize>) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     if n_partitions == 0 {
@@ -485,7 +564,7 @@ where
                             *claimed_slot = true;
                         }
 
-                        let range_fut = spawn_range(request, headers, start..end);
+                        let range_fut = spawn_range(sender_proc, request, headers, start..end);
                         sub_futures.push(async move {
                             use futures::FutureExt;
                             let res = std::panic::AssertUnwindSafe(range_fut)
@@ -540,6 +619,7 @@ where
 mod tests {
     use super::super::transport::ExecuteTaskFrame;
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -549,8 +629,9 @@ mod tests {
         let total_partitions = 4;
         let ranges_processed = Arc::new(AtomicUsize::new(0));
         let total_partition_len_processed = Arc::new(AtomicUsize::new(0));
+        let observed_senders = Arc::new(Mutex::new(Vec::new()));
 
-        // Frame 1: sub-range 0..2
+        // Frame 1: sub-range 0..2 from consumer proc 1
         let frame1 = ExecuteTaskFrame::from_parts(
             pb::ExecuteTaskRequest {
                 task_key: Some(pb::TaskKey {
@@ -566,7 +647,7 @@ mod tests {
         )
         .unwrap();
 
-        // Frame 2: sub-range 2..4
+        // Frame 2: sub-range 2..4 from consumer proc 2
         let frame2 = ExecuteTaskFrame::from_parts(
             pb::ExecuteTaskRequest {
                 task_key: Some(pb::TaskKey {
@@ -583,31 +664,34 @@ mod tests {
         .unwrap();
 
         tx.send(Ok(IncomingExecuteTaskRequest {
-            sender_proc: 0,
+            sender_proc: 1,
             frame: frame1,
         }))
         .unwrap();
         tx.send(Ok(IncomingExecuteTaskRequest {
-            sender_proc: 0,
+            sender_proc: 2,
             frame: frame2,
         }))
         .unwrap();
 
         let ranges_counter = Arc::clone(&ranges_processed);
         let len_counter = Arc::clone(&total_partition_len_processed);
+        let senders = Arc::clone(&observed_senders);
 
         let (res, _) = run_execute_task_loop_inner(
             rx,
             total_partitions,
             token,
             || Ok(()),
-            move |_request, _headers, range| {
+            move |sender_proc, _request, _headers, range| {
                 let r_counter = Arc::clone(&ranges_counter);
                 let l_counter = Arc::clone(&len_counter);
+                let senders = Arc::clone(&senders);
                 let len = range.len();
                 async move {
                     r_counter.fetch_add(1, Ordering::SeqCst);
                     l_counter.fetch_add(len, Ordering::SeqCst);
+                    senders.lock().unwrap().push((sender_proc, range));
                     Ok(())
                 }
             },
@@ -617,6 +701,10 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(ranges_processed.load(Ordering::SeqCst), 2);
         assert_eq!(total_partition_len_processed.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            *observed_senders.lock().unwrap(),
+            vec![(1, 0..2), (2, 2..4)]
+        );
     }
 
     #[tokio::test]
@@ -630,7 +718,7 @@ mod tests {
             4,
             token,
             || Ok(()),
-            |_request, _headers, _range| async { Ok(()) },
+            |_sender_proc, _request, _headers, _range| async { Ok(()) },
         )
         .await;
 

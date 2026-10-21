@@ -21,8 +21,8 @@
 //! This is the rebase-safety payoff: a single process plays every role that production splits
 //! across the leader (build and slice the plan), Postgres (allocate the DSM region, launch the
 //! workers), and each worker (run a producer fragment and push it through the mesh). If an upstream
-//! change breaks the channel-protocol contract, the boundary routing API, or the ready-to-run
-//! fragment contract, the test below fails here, before any downstream embedder rebuilds.
+//! change breaks the channel-protocol contract or the ready-to-run fragment contract, the test
+//! below fails here, before any downstream embedder rebuilds.
 //!
 //! Workers are passive executors: they run the ready-to-run per-task plans the coordinator
 //! dispatches (task-specialized, nested stages `Remote`), whose boundary leaves read the mesh
@@ -32,9 +32,8 @@
 //!
 //! What's faithful vs. simplified relative to the Postgres path:
 //! - Faithful: the DSM ring mesh, the framing, the cooperative drain, `ShmWorkerChannel::execute_task`,
-//!   the per-fragment routing (`collect_dispatched_stages`), `run_worker_fragment`, the leader
-//!   consuming via `DistributedExec::execute`, and the dispatch handoff through
-//!   `DispatchPlanSource`.
+//!   `run_execute_task_loop`, `run_worker_fragment`, the leader consuming via
+//!   `DistributedExec::execute`, and the dispatch handoff through `DispatchPlanSource`.
 //! - Simplified: the dispatched subplans are captured as `Arc`s rather than serialized through
 //!   the `SetPlan` frames the coordinator routes over the mesh (all roles live in one address
 //!   space), the wakeup is a no-op (the cooperative consumer yields rather than parking), and
@@ -49,7 +48,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::runtime::JoinSet;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{DataFusionError, HashMap, Result};
+use datafusion::common::{HashMap, Result};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_plan::{
@@ -59,8 +58,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::{
     DispatchPlanSource, DistributedConfig, DistributedExec, DistributedExt, DistributedLeafExec,
-    DistributedTaskContext, NetworkBoundaryExt, NetworkBroadcastExec, NetworkCoalesceExec,
-    NetworkShuffleExec, PartitionSink, SessionStateBuilderExt, Stage, TaskKey, WorkerSink,
+    DistributedTaskContext, NetworkBoundaryExt, SessionStateBuilderExt, Stage, TaskKey,
     decode_task_metrics,
 };
 
@@ -68,7 +66,7 @@ use super::mpsc_ring::Wakeup;
 use super::runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
 use super::setup::{collect_task_metrics, dsm_region_bytes, leader_setup, worker_setup};
 use super::transport::{
-    CooperativeDrainSet, MppDataStreamKey, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt,
+    CooperativeDrainSet, MppDataStreamKey, MppFrameHeader, MppSender, NoInterrupt,
 };
 
 /// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
@@ -126,33 +124,19 @@ fn receiver_token(proc_idx: u32) -> u64 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Leader-side producer-stage discovery (in-process port of pg_search's `collect_dispatched_stages`).
-// The crate's gRPC path keys dispatch on resolver URLs and never decides this; the shm_mq peers are
-// push-driven without URLs, so the embedder classifies each boundary's routing here.
+// Leader-side producer-stage discovery (in-process port of pg_search's `collect_stages`).
+// Workers launch once upfront, so the leader enumerates every producer stage (`stage_num`,
+// `task_count`) so each worker knows which `(stage_id, task_idx)` fragments it owns under
+// `proc_for_task`. Routing of output partitions is demand-driven at runtime via `ExecuteTaskFrame`.
 // ---------------------------------------------------------------------------------------------
 
-/// Routing rule for a producer fragment's output partitions.
-#[derive(Clone, Debug)]
-enum FragmentRouting {
-    /// Every output partition goes to one destination proc (a `NetworkCoalesceExec`, or the
-    /// top-level gather to the leader).
-    Coalesce { dest_proc: u32 },
-    /// Hash-partitioned mesh (`NetworkShuffleExec` / `NetworkBroadcastExec`): output partition `q`
-    /// goes to the consumer task the crate's `route_partition(q)` selects.
-    Hashed {
-        consumer_task: Vec<u32>,
-        broadcast: bool,
-    },
-}
-
-/// One producer stage's routing metadata, captured from a network boundary. The stage's plan is
+/// One producer stage's sizing metadata, captured from a network boundary. The stage's plan is
 /// not captured here: workers run the specialized plans the coordinator dispatches, delivered
 /// through the leader session's [`CapturingPlanSource`].
 #[derive(Clone, Debug)]
 struct StageEntry {
     stage_num: u32,
     task_count: usize,
-    routing: FragmentRouting,
 }
 
 /// The dispatched plans, keyed by `(stage_id, task_number)`. Filled by [`CapturingPlanSource`]
@@ -181,75 +165,28 @@ impl DispatchPlanSource for CapturingPlanSource {
 }
 
 /// Walk the distributed physical plan and collect every producer stage, once per boundary.
-fn collect_dispatched_stages(root: &Arc<dyn ExecutionPlan>, n_workers: u32) -> Vec<StageEntry> {
+fn collect_dispatched_stages(root: &Arc<dyn ExecutionPlan>) -> Vec<StageEntry> {
     let mut out = Vec::new();
-    collect_stages(root, n_workers, /* nested = */ false, &mut out);
+    collect_stages(root, &mut out);
     out
 }
 
-fn collect_stages(
-    plan: &Arc<dyn ExecutionPlan>,
-    n_workers: u32,
-    nested: bool,
-    out: &mut Vec<StageEntry>,
-) {
+fn collect_stages(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<StageEntry>) {
     if let Some(nb) = plan.as_ref().as_network_boundary() {
         let stage = nb.input_stage();
-        let stage_id = stage.num() as u32;
-        let route_consumer_tasks = || {
-            // The crate owns the consumer-slice layout, so the push side reads it from
-            // `route_partition` instead of re-deriving it and drifting when the layout changes.
-            let n_out = stage
-                .local_plan()
-                .map_or(0, |p| p.properties().partitioning.partition_count());
-            (0..n_out)
-                .map(|q| {
-                    nb.route_partition(q)
-                        .expect("route_partition")
-                        .consumer_task as u32
-                })
-                .collect::<Vec<u32>>()
-        };
-        let plan_any = plan.as_ref();
-        let routing = if plan_any.is::<NetworkCoalesceExec>() {
-            if nested {
-                FragmentRouting::Coalesce {
-                    dest_proc: proc_for_task(n_workers, 0),
-                }
-            } else {
-                FragmentRouting::Coalesce { dest_proc: 0 }
-            }
-        } else if plan_any.is::<NetworkShuffleExec>() {
-            assert!(nested, "top-level NetworkShuffleExec is unsupported");
-            FragmentRouting::Hashed {
-                consumer_task: route_consumer_tasks(),
-                broadcast: false,
-            }
-        } else if plan_any.is::<NetworkBroadcastExec>() {
-            assert!(nested, "top-level NetworkBroadcastExec is unsupported");
-            FragmentRouting::Hashed {
-                consumer_task: route_consumer_tasks(),
-                broadcast: true,
-            }
-        } else {
-            panic!("unrecognized network boundary {}", plan.name());
-        };
-
-        let task_count = stage.task_count();
         if let Some(stage_plan) = stage.local_plan() {
             out.push(StageEntry {
-                stage_num: stage_id,
-                task_count,
-                routing,
+                stage_num: stage.num() as u32,
+                task_count: stage.task_count(),
             });
             // The boundary's children() returns [stage.plan], so descending here would double-count
-            // every nested stage. Recurse through the stage plan directly with nested = true.
-            collect_stages(stage_plan, n_workers, true, out);
+            // every nested stage. Recurse through the stage plan directly.
+            collect_stages(stage_plan, out);
         }
         return;
     }
     for child in plan.children() {
-        collect_stages(child, n_workers, nested, out);
+        collect_stages(child, out);
     }
 }
 
@@ -259,7 +196,6 @@ struct FragmentAssignment {
     stage_id: u32,
     task_idx: usize,
     task_count: usize,
-    routing: FragmentRouting,
 }
 
 /// Rebuild a plan subtree so each fragment executes its own node instances. In production every
@@ -325,23 +261,10 @@ fn fragments_for_proc(
             if proc_for_task(n_workers, task_idx as u32) != this_proc {
                 continue;
             }
-            // Broadcast caps its build subtree at task 0; the other tasks would re-emit the same
-            // canonical replica and the consumer's select_all would over-count.
-            if matches!(
-                entry.routing,
-                FragmentRouting::Hashed {
-                    broadcast: true,
-                    ..
-                }
-            ) && task_idx != 0
-            {
-                continue;
-            }
             out.push(FragmentAssignment {
                 stage_id: entry.stage_num,
                 task_idx,
                 task_count: entry.task_count,
-                routing: entry.routing.clone(),
             });
         }
     }
@@ -368,21 +291,16 @@ fn fragment_task_ctx(
 }
 
 /// Run all fragments owned by one worker proc, then signal completion. Mirrors the body of
-/// pg_search's `run_mpp_worker`: build a [`WorkerSink`] that routes by task and partition, open a
-/// [`PartitionSink`] per output partition, execute each dispatched fragment as-is (it arrives
-/// ready-to-run, nested stages `Remote`, boundary leaves reading the mesh), and join.
+/// pg_search's `run_mpp_worker`: execute each dispatched fragment via [`run_execute_task_loop`]
+/// (which opens per-partition sinks on demand toward the consumer proc that sends each
+/// `ExecuteTaskFrame`), and join.
 async fn run_worker_proc(
     fragments: Vec<FragmentAssignment>,
     outbound: Vec<Option<MppSender>>,
     mesh: Arc<MppMesh>,
     session: SessionContext,
-    n_workers: u32,
     captured: CapturedPlans,
 ) -> Result<()> {
-    let mut routing = HashMap::new();
-    for fragment in &fragments {
-        routing.insert(fragment.stage_id, fragment.routing.clone());
-    }
     // The metrics frames go to the leader after the fragments finish; the clone keeps one sender
     // on the leader's inbox alive past the drop below, which only delays that ring's detach
     // observation, never a per-channel EOF.
@@ -390,15 +308,7 @@ async fn run_worker_proc(
         .first()
         .and_then(|s| s.as_ref())
         .map(|s| s.clone_with_header(MppFrameHeader::task_metrics(0, 0, mesh.this_proc)));
-
-    // One sink serves every stage this proc produces; it owns the base outbound senders and routes
-    // each (stage, task, partition) to the destination proc's send end.
-    let worker_sink = Arc::new(ShmMqWorkerSink {
-        outbound,
-        mesh: Arc::clone(&mesh),
-        n_workers,
-        routing,
-    });
+    let outbound: Arc<[Option<MppSender>]> = outbound.into();
 
     let mut prepared = Vec::with_capacity(fragments.len());
     for fragment in &fragments {
@@ -441,30 +351,22 @@ async fn run_worker_proc(
             Arc::clone(&plan),
         ));
         let mesh = Arc::clone(&mesh);
+        let outbound = Arc::clone(&outbound);
         let stage_id = fragment.stage_id;
         let task_idx = fragment.task_idx as u32;
-        let worker_sink = Arc::clone(&worker_sink);
 
         futures.push(async move {
             crate::shm::setup::run_execute_task_loop(
                 &mesh,
+                &outbound,
                 stage_id,
                 task_idx,
                 n_out,
                 tokio_util::sync::CancellationToken::new(),
-                |_request, _headers, range| {
+                |_request, _headers, range, task_sinks| {
                     let plan = Arc::clone(&plan);
                     let task_ctx = Arc::clone(&task_ctx);
-                    let worker_sink = Arc::clone(&worker_sink);
                     async move {
-                        let mut task_sinks = Vec::with_capacity(range.len());
-                        for q in range.clone() {
-                            task_sinks.push(worker_sink.open_partition(
-                                stage_id as usize,
-                                task_idx as usize,
-                                q,
-                            )?);
-                        }
                         crate::shm::setup::run_worker_fragment(plan, task_sinks, task_ctx, range)
                             .await
                     }
@@ -490,57 +392,6 @@ async fn run_worker_proc(
         }
     }
     Ok(())
-}
-
-/// Test-harness [`WorkerSink`]: routes each `(stage, task, partition)` to the destination proc's outbound
-/// send end, the in-process analog of what pg_search builds on a real backend. Holds the base
-/// senders plus the per-stage routing so `open_partition` reproduces the header + cooperative-drain
-/// wiring the produce loop used to apply inline.
-struct ShmMqWorkerSink {
-    outbound: Vec<Option<MppSender>>,
-    mesh: Arc<MppMesh>,
-    n_workers: u32,
-    routing: HashMap<u32, FragmentRouting>,
-}
-
-impl WorkerSink for ShmMqWorkerSink {
-    fn open_partition(
-        &self,
-        stage: usize,
-        task: usize,
-        partition: usize,
-    ) -> Result<Box<dyn PartitionSink>> {
-        let routing = self.routing.get(&(stage as u32)).ok_or_else(|| {
-            DataFusionError::Internal(format!("run_worker_proc: no routing for stage {stage}"))
-        })?;
-        let dest_proc = match routing {
-            FragmentRouting::Coalesce { dest_proc } => *dest_proc,
-            FragmentRouting::Hashed { consumer_task, .. } => {
-                proc_for_task(self.n_workers, consumer_task[partition])
-            }
-        };
-        let stream_key = MppDataStreamKey::new(
-            stage as u32,
-            u32::try_from(task).map_err(|_| {
-                DataFusionError::Internal(format!(
-                    "run_worker_proc: task {task} exceeds transport u32"
-                ))
-            })?,
-            partition as u32,
-        );
-        if dest_proc == self.mesh.this_proc {
-            return Ok(self.mesh.open_local_partition_sink(stream_key));
-        }
-        let base = self.outbound[dest_proc as usize].as_ref().ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "run_worker_proc: no outbound sender for dest proc {dest_proc}"
-            ))
-        })?;
-        let sender = base
-            .clone_with_header(MppFrameHeader::batch(stream_key, self.mesh.this_proc))
-            .with_cooperative_drain(Arc::clone(&self.mesh) as Arc<dyn CooperativeDrainSet>);
-        Ok(Box::new(MppPartitionSink::new(sender)))
-    }
 }
 
 /// Splits an in-memory `DataSourceExec` leaf across tasks, the in-memory analog of the crate's
@@ -868,7 +719,7 @@ mod tests {
             physical.name()
         );
 
-        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+        let entries = collect_dispatched_stages(&physical);
         // There are five producer tasks but only three workers. Round-robin assignment puts
         // tasks 0 and 3 on worker 1, and they both send stage output partition 0 to the leader.
         // The task id in the transport header is what keeps task 0's EOF from closing task 3.
@@ -908,7 +759,6 @@ mod tests {
                 outbound,
                 mesh,
                 session,
-                N_WORKERS,
                 Arc::clone(&captured),
             ));
         }
@@ -1069,21 +919,15 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap();
-        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+        let entries = collect_dispatched_stages(&physical);
         assert!(
-            entries
-                .iter()
-                .any(|e| matches!(e.routing, FragmentRouting::Hashed { .. })),
-            "expected a hash-routed producer stage; got {:?}",
-            entries.iter().map(|e| &e.routing).collect::<Vec<_>>()
+            entries.len() >= 2,
+            "expected at least two producer stages (gather + shuffle); got {entries:?}"
         );
         let multiplexed = entries
             .iter()
-            .find(|entry| {
-                entry.task_count == N_TASKS
-                    && matches!(entry.routing, FragmentRouting::Hashed { .. })
-            })
-            .expect("five-task hash-routed producer stage");
+            .find(|entry| entry.task_count == N_TASKS)
+            .expect("five-task producer stage");
         assert_eq!(
             fragments_for_proc(std::slice::from_ref(multiplexed), 1, N_WORKERS)
                 .iter()
@@ -1108,7 +952,6 @@ mod tests {
                 outbound,
                 mesh,
                 session,
-                N_WORKERS,
                 Arc::clone(&captured),
             ));
         }
@@ -1160,7 +1003,7 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap();
-        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+        let entries = collect_dispatched_stages(&physical);
 
         let mut workers = JoinSet::new();
         for (proc_idx, mesh, outbound) in boot.workers {
@@ -1172,7 +1015,6 @@ mod tests {
                 outbound,
                 mesh,
                 session,
-                N_WORKERS,
                 Arc::clone(&captured),
             ));
         }
@@ -1210,7 +1052,7 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap();
-        let entries = collect_dispatched_stages(&physical, N_WORKERS);
+        let entries = collect_dispatched_stages(&physical);
 
         let mut workers = JoinSet::new();
         for (proc_idx, mesh, outbound) in boot.workers {
@@ -1229,7 +1071,6 @@ mod tests {
                 outbound,
                 mesh,
                 session,
-                N_WORKERS,
                 Arc::clone(&captured),
             ));
         }
@@ -1302,15 +1143,17 @@ mod tests {
         // Worker 1 runs execute task loop where the fragment panics.
         let worker_mesh = Arc::clone(&worker_attach.mesh);
         let loop_mesh = Arc::clone(&worker_mesh);
+        let outbound = worker_attach.outbound_senders().to_vec();
         let worker_token = token.clone();
         let worker_handle = SpawnedTask::spawn(async move {
             run_execute_task_loop(
                 &loop_mesh,
+                &outbound,
                 1, // stage_id 1
                 0, // task_number 0
                 1, // 1 partition
                 worker_token,
-                |_req, _hdr, _range| async move {
+                |_req, _hdr, _range, _sinks| async move {
                     panic!("simulated worker fragment crash");
                 },
             )
@@ -1415,5 +1258,74 @@ mod tests {
             local_consumer_channel.try_pop(),
             Some(DrainItem::Eof)
         ));
+    }
+
+    /// A `UNION ALL` of two `GROUP BY` pipelines over differently-keyed shuffles plans a
+    /// `ChildrenIsolatorUnionExec` in the consumer stage, isolating the second child onto a
+    /// non-zero outer task while handing it a 0-based inner `DistributedTaskContext`. Because
+    /// `run_execute_task_loop` opens partition sinks toward the `sender_proc` of each incoming
+    /// `ExecuteTaskFrame`, the second child's producer stage routes directly to the worker proc
+    /// hosting its outer task without static placement tables.
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_isolated_union_query_matches_serial() {
+        let query = "SELECT val, NULL AS id, count(*) AS c FROM t GROUP BY val \
+                     UNION ALL \
+                     SELECT NULL AS val, id, count(*) AS c FROM t GROUP BY id \
+                     ORDER BY val NULLS LAST, id NULLS LAST";
+
+        let serial_ctx = SessionContext::new();
+        register_table_with_partitions(&serial_ctx, N_WORKERS as i32);
+        let expected = serial_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let boot = bootstrap_mesh(N_WORKERS + 1);
+        let captured = new_captured_plans();
+        let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
+        let physical = leader_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let display = crate::display_plan_ascii(physical.as_ref(), false);
+        assert!(
+            display.contains("DistributedUnionExec"),
+            "expected ChildrenIsolatorUnionExec in plan:\n{display}"
+        );
+
+        let entries = collect_dispatched_stages(&physical);
+        let mut workers = JoinSet::new();
+        for (proc_idx, mesh, outbound) in boot.workers {
+            let fragments = fragments_for_proc(&entries, proc_idx, N_WORKERS);
+            let session = build_session(Arc::clone(&mesh), None);
+            workers.spawn(run_worker_proc(
+                fragments,
+                outbound,
+                mesh,
+                session,
+                Arc::clone(&captured),
+            ));
+        }
+
+        let leader_task_ctx = leader_ctx.task_ctx();
+        let stream = physical.execute(0, leader_task_ctx).unwrap();
+        let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        while let Some(res) = workers.join_next().await {
+            res.expect("worker task panicked").expect("worker proc");
+        }
+
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        assert_eq!(
+            pretty_format_batches(&expected).unwrap().to_string(),
+            pretty_format_batches(&got).unwrap().to_string(),
+            "distributed isolated union != serial"
+        );
     }
 }

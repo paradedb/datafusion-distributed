@@ -227,16 +227,6 @@ impl NetworkBoundary for NetworkCoalesceExec {
     fn producer_head(&self, _consumer_task_count: usize) -> Result<ProducerHead> {
         Ok(ProducerHead::None)
     }
-
-    fn route_partition(
-        &self,
-        output_partition: usize,
-    ) -> Result<crate::distributed_planner::PartitionRoute> {
-        internal_err!(
-            "NetworkCoalesceExec routes by producer task group, not by output partition; \
-             partition {output_partition} has no slice-layout route"
-        )
-    }
 }
 
 impl DisplayAs for NetworkCoalesceExec {
@@ -404,27 +394,6 @@ struct TaskGroup {
     max_len: usize,
 }
 
-/// The consumer task, among `consumer_task_count`, that reads producer task `producer_task` of
-/// `input_task_count` through a [NetworkCoalesceExec]: the same contiguous grouping `execute`
-/// uses. `None` when `producer_task` is outside `0..input_task_count` or there are no consumers.
-///
-/// A pull-based transport never needs this: each consumer computes its own group in `execute`.
-/// A push-based transport addresses a producer task's output before any consumer asks, so it
-/// reads the grouping here instead of re-deriving it.
-pub fn coalesce_consumer_task(
-    input_task_count: usize,
-    consumer_task_count: usize,
-    producer_task: usize,
-) -> Option<usize> {
-    if consumer_task_count == 0 || producer_task >= input_task_count {
-        return None;
-    }
-    (0..consumer_task_count).find(|&consumer| {
-        let group = task_group(input_task_count, consumer, consumer_task_count);
-        (group.start_task..group.start_task + group.len).contains(&producer_task)
-    })
-}
-
 /// Returns the contiguous group of input tasks assigned to DistributedTaskContext::task_index.
 fn task_group(input_task_count: usize, task_index: usize, task_count: usize) -> TaskGroup {
     if task_count == 0 {
@@ -455,30 +424,6 @@ fn task_group(input_task_count: usize, task_index: usize, task_count: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `coalesce_consumer_task` is the inverse of `task_group`: for every consumer, every
-    /// producer task in its group maps back to it, and producer tasks past the input count map
-    /// to nothing.
-    #[test]
-    fn coalesce_consumer_task_inverts_task_group() {
-        for (input_tasks, consumers) in [(4, 1), (5, 2), (6, 3), (2, 3), (7, 4), (1, 1)] {
-            for consumer in 0..consumers {
-                let group = task_group(input_tasks, consumer, consumers);
-                for producer in group.start_task..group.start_task + group.len {
-                    assert_eq!(
-                        coalesce_consumer_task(input_tasks, consumers, producer),
-                        Some(consumer),
-                        "input_tasks={input_tasks} consumers={consumers} producer={producer}"
-                    );
-                }
-            }
-            assert_eq!(
-                coalesce_consumer_task(input_tasks, consumers, input_tasks),
-                None
-            );
-        }
-        assert_eq!(coalesce_consumer_task(2, 0, 0), None);
-    }
     use datafusion::arrow::datatypes::Schema;
     use datafusion::physical_plan::empty::EmptyExec;
 

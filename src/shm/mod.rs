@@ -69,7 +69,7 @@ pub use setup::{
     install_work_unit_channels, leader_setup, region_total, run_execute_task_loop,
     run_worker_fragment, worker_setup,
 };
-pub use sink::{PartitionSink, WorkerSink};
+pub use sink::PartitionSink;
 pub use transport::{
     CooperativeDrainSet, ExecuteTaskFrame, ExecuteTaskRx, Interrupt, LocalDrainPartitionSink,
     MppDataStreamKey, MppFrameHeader, MppPartitionSink, MppSender, NoInterrupt, SendBatchStats,

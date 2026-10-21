@@ -19,6 +19,6 @@ pub use children_isolator_union::ChildrenIsolatorUnionExec;
 pub use distributed_leaf::DistributedLeafExec;
 pub(crate) use metrics::MetricsWrapperExec;
 pub use network_broadcast::NetworkBroadcastExec;
-pub use network_coalesce::NetworkCoalesceExec;
+pub use network_coalesce::{NetworkCoalesceExec, coalesce_consumer_task};
 pub use network_shuffle::{NetworkShuffleExec, PRODUCER_SALT_DEFAULT, ShuffleMode};
 pub use sampler::SamplerExec;

@@ -28,8 +28,7 @@ pub use arrow_ipc::CompressionType;
 pub use coordinator::{DistributedExec, MetricsStore};
 pub use distributed_ext::{DistributedExt, DistributedGetterExt};
 pub use distributed_planner::{
-    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, PartitionRoute, ProducerHead,
-    SessionStateBuilderExt,
+    DistributedConfig, NetworkBoundary, NetworkBoundaryExt, ProducerHead, SessionStateBuilderExt,
 };
 pub use dynamic_filtering::rewrite_distributed_plan_with_dynamic_filters;
 pub use events::{
@@ -66,10 +65,9 @@ pub use protocol::generated::worker as proto;
 pub use codec::DistributedCodec;
 pub use common::MaybeEncoded;
 pub use dispatch_plan_source::{DispatchPlanSource, get_distributed_dispatch_plan_source};
-// The producer-side sink traits live in `shm` because only a push-based transport produces through
-// them; re-exported at the crate root so `crate::PartitionSink` resolves the way the shm core spells
-// it.
-pub use shm::{PartitionSink, WorkerSink};
+// The producer-side sink trait lives in `shm` and is re-exported at the crate root so
+// `crate::PartitionSink` resolves the way the shm core spells it.
+pub use shm::PartitionSink;
 pub use worker_resolver::{WorkerResolver, get_distributed_worker_resolver};
 
 pub use protocol::{

@@ -358,7 +358,7 @@ async fn _inject_network_boundaries(
             "Cannot assign a required task count of {min}, the max task slots available are {max_tasks}"
         );
     }
-    task_count.soft = task_count.soft.max(max_tasks as f64);
+    task_count.soft = task_count.soft.min(max_tasks as f64);
 
     // TODO: This behavior change arguably belongs in a separate PR. Consider removing
     // let task_count = task_count
@@ -1123,8 +1123,8 @@ mod tests {
             .broadcast_joins(false)
             .desired_task_count_handler(repartition_max_one_desired_task_count_handler);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=2.00, min=1
+        assert_snapshot!(annotated, @"
+        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=2.00, range=1..=2
           FilterExec: task_count=TaskCountAnnotation: soft=2.00, exact=1
             RepartitionExec: task_count=TaskCountAnnotation: soft=2.00, exact=1
               DistributedLeafExec: task_count=TaskCountAnnotation: soft=2.00, exact=1
@@ -1207,8 +1207,8 @@ mod tests {
             .broadcast_joins(false)
             .desired_task_count_handler(repartition_max_one_desired_task_count_handler);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
-        assert_snapshot!(annotated, @r"
-        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=3.00, min=1
+        assert_snapshot!(annotated, @"
+        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=3.00, range=1..=3
           FilterExec: task_count=TaskCountAnnotation: soft=3.00, exact=1
             RepartitionExec: task_count=TaskCountAnnotation: soft=3.00, exact=1
               DistributedLeafExec: task_count=TaskCountAnnotation: soft=3.00, exact=1

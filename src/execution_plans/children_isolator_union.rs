@@ -446,7 +446,9 @@ fn split_children(
                     "ChildrenIsolatorUnionExec child {i} requires {exact} tasks, but the union has only {task_count_budget}"
                 );
             }
-            TaskCountRestriction::Min(minimum) if minimum.get() > task_count_budget => {
+            TaskCountRestriction::Min(minimum) | TaskCountRestriction::Range(minimum, _)
+                if minimum.get() > task_count_budget =>
+            {
                 return plan_err!(
                     "ChildrenIsolatorUnionExec child {i} requires at least {minimum} tasks, but the union has only {task_count_budget}"
                 );
@@ -574,10 +576,9 @@ fn split_children(
     // This can reduce OR increase the total. If it exceeds the budget, children will share
     // outer slots in step 6; their individual exact counts are never reduced to make them fit.
     for (task_count, annotation) in child_task_counts.iter_mut().zip(children.iter()) {
-        *task_count = match annotation.restriction {
-            TaskCountRestriction::None => *task_count,
-            TaskCountRestriction::Exact(exact) => exact.get(),
-            TaskCountRestriction::Min(min) => (*task_count).max(min.get()),
+        *task_count = match annotation.get_min() {
+            None => *task_count,
+            Some(min) => (*task_count).max(min.get()),
         };
     }
 

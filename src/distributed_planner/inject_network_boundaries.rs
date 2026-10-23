@@ -251,7 +251,7 @@ async fn _inject_network_boundaries(
         session_config: nb_ctx.cfg,
     };
 
-    let task_count = if plan.children().is_empty() {
+    let mut task_count = if plan.children().is_empty() {
         // This is a leaf node, maybe a DataSourceExec, or maybe something else custom from the user.
         // If we could not determine how many tasks this leaf node should run on, we need to assume
         // it cannot be distributed and use just 1 task.
@@ -263,9 +263,11 @@ async fn _inject_network_boundaries(
     } else if plan.is::<ChildrenIsolatorUnionExec>() {
         // In ChildrenIsolatorUnionExec, load estimates are summed because all the children are
         // executed concurrently. The largest child exact count or inherited minimum sets
-        // the union's minimum task count.
+        // the union's minimum task count. The union's max becomes the accumulated max of all of the
+        // children, or None if any child has no max.
         let mut load: f64 = 0.0;
         let mut min: Option<NonZeroUsize> = None;
+        let mut max: Option<usize> = Some(0);
         for child in &processed_children {
             let child_count = nb_ctx.task_count(child)?;
             load += match child_count.restriction {
@@ -275,12 +277,16 @@ async fn _inject_network_boundaries(
             if let Some(count) = child_count.get_min() {
                 min = Some(min.map_or(count, |current| current.max(count)));
             }
+            max = match child_count.get_max() {
+                Some(m) => max.map(|max| max + m.get()),
+                None => None,
+            };
         }
-        // Exact children cannot use more tasks than their combined counts. A flexible child
-        // can absorb additional tasks, so it leaves the upper bound unlimited.
-        match min {
-            Some(value) => TaskCountAnnotation::min(value, load),
-            None => TaskCountAnnotation::soft(load),
+        match (min, max.and_then(NonZeroUsize::new)) {
+            (Some(value), None) => TaskCountAnnotation::min(value, load),
+            (None, Some(max)) => TaskCountAnnotation::max(max, load),
+            (Some(min), Some(max)) => TaskCountAnnotation::range(min, max, load),
+            (None, None) => TaskCountAnnotation::soft(load),
         }
     } else if let Some(node) = plan.downcast_ref::<HashJoinExec>()
         && node.mode == PartitionMode::CollectLeft
@@ -343,18 +349,28 @@ async fn _inject_network_boundaries(
         processed_children,
         ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
     )?;
-    // Cap the task count restriction by the configured max-per-stage budget.
+    // Cap the reconciled task count by the configured max-per-stage budget.
     let max_tasks = nb_ctx.max_tasks()?;
-    let task_count = task_count
-        .merge(TaskCountAnnotation::max(
-            NonZeroUsize::new(max_tasks).expect("max_tasks() should always be non-zero"),
-            task_count.soft,
-        ))
-        .map_err(|e| {
-            e.context(format!(
-                "attempting to cap task count the maximum slots available {max_tasks}"
-            ))
-        })?;
+    if let Some(min) = task_count.get_min()
+        && max_tasks < min.get()
+    {
+        return plan_err!(
+            "Cannot assign a required task count of {min}, the max task slots available are {max_tasks}"
+        );
+    }
+    task_count.soft = task_count.soft.max(max_tasks as f64);
+
+    // TODO: This behavior change arguably belongs in a separate PR. Consider removing
+    // let task_count = task_count
+    //     .merge(TaskCountAnnotation::max(
+    //         NonZeroUsize::new(max_tasks).expect("max_tasks() should always be non-zero"),
+    //         task_count.soft,
+    //     ))
+    //     .map_err(|e| {
+    //         e.context(format!(
+    //             "attempting to cap task count the maximum slots available {max_tasks}"
+    //         ))
+    //     })?;
 
     // Upon reaching a hash repartition, we need to introduce a network shuffle right above it.
     if let Some(r_exec) = plan.downcast_ref::<RepartitionExec>()

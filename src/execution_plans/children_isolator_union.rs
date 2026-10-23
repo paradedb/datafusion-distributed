@@ -391,8 +391,7 @@ impl Stream for ObservedStream {
 }
 
 /// Given per-child [`TaskCountAnnotation`]s and a `task_count_budget`, distribute task slots
-/// proportional to soft task-count estimates, then impose each child's exact count or minimum.
-/// When a light exact child shares a slot, a flexible child can still use the full task budget.
+/// proportional to soft task-count estimates, then impose each child's restriction.
 ///
 /// The tables at each step follow one example through to its final task map. Columns always
 /// identify children (`cN`). In the placement tables, rows identify outer union tasks (`tN`),
@@ -559,7 +558,7 @@ fn split_children(
         }
     }
 
-    // Step 4: impose each child's exact count or minimum.
+    // Step 4: impose each child's count requirements
     //
     // +------------------+---------+---------+---------+---------+
     // |                  | c0      | c1      | c2      | c3      |
@@ -576,9 +575,11 @@ fn split_children(
     // This can reduce OR increase the total. If it exceeds the budget, children will share
     // outer slots in step 6; their individual exact counts are never reduced to make them fit.
     for (task_count, annotation) in child_task_counts.iter_mut().zip(children.iter()) {
-        *task_count = match annotation.get_min() {
-            None => *task_count,
-            Some(min) => (*task_count).max(min.get()),
+        if let Some(min) = annotation.get_min() {
+            *task_count = (*task_count).max(min.get());
+        };
+        if let Some(max) = annotation.get_max() {
+            *task_count = (*task_count).min(max.get());
         };
     }
 
@@ -600,7 +601,11 @@ fn split_children(
     let mut unallocated_task_counts = task_count_budget.saturating_sub(allocated_task_counts);
     while unallocated_task_counts > 0 {
         let Some(idx) = (0..child_count)
-            .filter(|&idx| !matches!(children[idx].restriction, TaskCountRestriction::Exact(_)))
+            .filter(|&idx| {
+                children[idx]
+                    .get_max()
+                    .is_none_or(|max| child_task_counts[idx] < max.get())
+            })
             .max_by(|&a, &b| {
                 let a_deficit = unrounded_child_task_counts[a] - child_task_counts[a] as f64;
                 let b_deficit = unrounded_child_task_counts[b] - child_task_counts[b] as f64;
@@ -610,7 +615,7 @@ fn split_children(
                     .then(b.cmp(&a))
             })
         else {
-            // Every child has an exact count; leftover budget becomes empty slots.
+            // Every is at its exact or max count. leftover budget becomes empty slots.
             break;
         };
         child_task_counts[idx] += 1;
@@ -984,6 +989,81 @@ mod tests {
         assert!(err.to_string().contains("requires at least 2 tasks"));
     }
 
+    #[test]
+    fn split_children_maximums_cap_share_and_free_slots() -> Result<(), DataFusionError> {
+        // c0's share rounds to 4, but it is capped at 1; c1 absorbs the freed slots.
+        assert_eq!(
+            split_children(&[max(1, 9.0), soft(1.0)], 4)?,
+            vec![
+                vec![(0, ctx(0, 1))],
+                vec![(1, ctx(0, 3))],
+                vec![(1, ctx(1, 3))],
+                vec![(1, ctx(2, 3))],
+            ]
+        );
+        // With all-zero weights, the even split is still capped and the remainder refilled.
+        assert_eq!(
+            split_children(&[max(1, 0.0), soft(0.0)], 4)?,
+            vec![
+                vec![(0, ctx(0, 1))],
+                vec![(1, ctx(0, 3))],
+                vec![(1, ctx(1, 3))],
+                vec![(1, ctx(2, 3))],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn split_children_all_capped_leaves_empty_slots() -> Result<(), DataFusionError> {
+        assert_eq!(
+            split_children(&[max(1, 1.0), max(1, 1.0)], 4)?,
+            vec![vec![(0, ctx(0, 1))], vec![(1, ctx(0, 1))], vec![], vec![]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn split_children_ranges_bound_share() -> Result<(), DataFusionError> {
+        // Share of 3 is inside 2..=4 and is kept.
+        assert_eq!(
+            split_children(&[range(2, 4, 1.0), soft(1.0)], 6)?,
+            vec![
+                vec![(0, ctx(0, 3))],
+                vec![(0, ctx(1, 3))],
+                vec![(0, ctx(2, 3))],
+                vec![(1, ctx(0, 3))],
+                vec![(1, ctx(1, 3))],
+                vec![(1, ctx(2, 3))],
+            ]
+        );
+        // Share of 5 is above 2..=3, so c0 is lowered to 3 and c1 takes the freed slots.
+        assert_eq!(
+            split_children(&[range(2, 3, 9.0), soft(1.0)], 6)?,
+            vec![
+                vec![(0, ctx(0, 3))],
+                vec![(0, ctx(1, 3))],
+                vec![(0, ctx(2, 3))],
+                vec![(1, ctx(0, 3))],
+                vec![(1, ctx(1, 3))],
+                vec![(1, ctx(2, 3))],
+            ]
+        );
+        // Share of 1 is below 2..=3, so c0 is raised to 2 and c1 wraps into a shared slot.
+        assert_eq!(
+            split_children(&[range(2, 3, 1.0), soft(9.0)], 6)?,
+            vec![
+                vec![(0, ctx(0, 2)), (1, ctx(4, 5))],
+                vec![(0, ctx(1, 2))],
+                vec![(1, ctx(0, 5))],
+                vec![(1, ctx(1, 5))],
+                vec![(1, ctx(2, 5))],
+                vec![(1, ctx(3, 5))],
+            ]
+        );
+        Ok(())
+    }
+
     /// Negative and non-finite weights are rejected upfront.
     #[test]
     fn split_children_rejects_negative_weight() {
@@ -1038,6 +1118,20 @@ mod tests {
         TaskCountAnnotation::exact(
             NonZeroUsize::new(n).expect("exact count must be nonzero"),
             n,
+        )
+    }
+
+    /// Shorthand for a maximum task count — keeps the unit tests readable.
+    fn max(n: usize, w: f64) -> TaskCountAnnotation {
+        TaskCountAnnotation::max(NonZeroUsize::new(n).expect("max must be nonzero"), w)
+    }
+
+    /// Shorthand for an inclusive task count range — keeps the unit tests readable.
+    fn range(min: usize, max: usize, w: f64) -> TaskCountAnnotation {
+        TaskCountAnnotation::range(
+            NonZeroUsize::new(min).expect("min must be nonzero"),
+            NonZeroUsize::new(max).expect("max must be nonzero"),
+            w,
         )
     }
 }

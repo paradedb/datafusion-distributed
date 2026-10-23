@@ -42,7 +42,7 @@ impl TaskCountRestriction {
                 Self::Exact(a)
             }
             (Self::Min(a), TaskCountRestriction::Min(b)) => Self::Min(a.max(b)),
-            (Self::Max(a), TaskCountRestriction::Max(b)) => Self::Min(a.min(b)),
+            (Self::Max(a), TaskCountRestriction::Max(b)) => Self::Max(a.min(b)),
             (Self::Exact(exact), TaskCountRestriction::Min(min))
             | (Self::Min(min), TaskCountRestriction::Exact(exact)) => {
                 if exact < min {
@@ -103,7 +103,7 @@ impl TaskCountRestriction {
             }
             (Self::Range(amin, amax), TaskCountRestriction::Range(bmin, bmax)) => {
                 // ranges must overlap.
-                if amin <= bmax && bmin <= amax {
+                if !(amin <= bmax && bmin <= amax) {
                     return plan_err!(
                         "Incompatible task count ranges of {amin}..={amax} and {bmin}..={bmax}"
                     );

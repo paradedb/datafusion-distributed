@@ -1138,47 +1138,48 @@ mod tests {
         let ctx = create_context();
 
         let schema = schema_i32("h");
-        let left = Arc::new(new_network_hash_shuffle_exec(
-            Partitioning::RoundRobinBatch(2),
-            EquivalenceProperties::new(schema.clone()),
-            dummy_stage(),
-            DEFAULT_MODE,
-        )) as Arc<dyn ExecutionPlan>;
-        let right = Arc::new(new_network_hash_shuffle_exec(
-            Partitioning::RoundRobinBatch(2),
-            EquivalenceProperties::new(schema.clone()),
-            dummy_stage(),
-            DEFAULT_MODE,
-        )) as Arc<dyn ExecutionPlan>;
+        let annotations = vec![
+            TaskCountAnnotation::min(NonZeroUsize::new(4).unwrap(), 3.0),
+            TaskCountAnnotation::exact(NonZeroUsize::MIN, 1.0),
+            // A heavy soft estimate, so losing the max on decode would change the task map.
+            TaskCountAnnotation::max(NonZeroUsize::new(2).unwrap(), 9.0),
+            TaskCountAnnotation::try_range(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(3).unwrap(),
+                2.0,
+            )?,
+        ];
+        let children = annotations
+            .iter()
+            .map(|_| {
+                Arc::new(new_network_hash_shuffle_exec(
+                    Partitioning::RoundRobinBatch(2),
+                    EquivalenceProperties::new(schema.clone()),
+                    dummy_stage(),
+                    DEFAULT_MODE,
+                )) as Arc<dyn ExecutionPlan>
+            })
+            .collect::<Vec<_>>();
 
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(ChildrenIsolatorUnionExec::from_children_and_annotations(
-                vec![left.clone(), right.clone()],
-                vec![
-                    TaskCountAnnotation::min(NonZeroUsize::new(4).unwrap(), 3.0),
-                    TaskCountAnnotation::exact(NonZeroUsize::MIN, 1.0),
-                ],
+                children.clone(),
+                annotations.clone(),
                 4,
             )?);
 
         let mut buf = Vec::new();
         codec.try_encode(plan.clone(), &mut buf, &default_proto_converter())?;
 
-        let decoded = codec.try_decode(&buf, &[left, right], &ctx, &default_proto_converter())?;
+        let decoded = codec.try_decode(&buf, &children, &ctx, &default_proto_converter())?;
         assert_eq!(repr(&plan), repr(&decoded));
         let decoded_union = decoded
             .downcast_ref::<ChildrenIsolatorUnionExec>()
             .expect("decoded union");
-        assert_eq!(decoded_union.child_annotations[0].soft, 3.0);
-        assert_eq!(
-            decoded_union.child_annotations[0].restriction,
-            TaskCountRestriction::Min(NonZeroUsize::new(4).unwrap())
-        );
-        assert_eq!(decoded_union.child_annotations[1].soft, 1.0);
-        assert_eq!(
-            decoded_union.child_annotations[1].restriction,
-            TaskCountRestriction::Exact(NonZeroUsize::MIN)
-        );
+        for (decoded, original) in decoded_union.child_annotations.iter().zip(&annotations) {
+            assert_eq!(decoded.soft, original.soft);
+            assert_eq!(decoded.restriction, original.restriction);
+        }
         let rebuilt = Arc::clone(&decoded).replace_children(
             decoded.children().into_iter().map(Arc::clone).collect(),
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),

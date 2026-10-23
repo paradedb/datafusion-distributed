@@ -556,6 +556,11 @@ fn parse_task_count_annotation(value: TaskCountAnnotationProto) -> Result<TaskCo
             .ok_or_else(|| internal_datafusion_err!("Task-count minimum must be nonzero"))?;
         annotation = TaskCountAnnotation::min(min, value.soft);
     }
+    if let Some(max) = value.max {
+        let max = NonZeroUsize::new(max as usize)
+            .ok_or_else(|| internal_datafusion_err!("Task-count maximum must be nonzero"))?;
+        annotation = annotation.merge(TaskCountAnnotation::max(max, value.soft))?;
+    }
     if let Some(exact) = value.hard {
         let exact = NonZeroUsize::new(exact as usize)
             .ok_or_else(|| internal_datafusion_err!("Exact task count must be nonzero"))?;

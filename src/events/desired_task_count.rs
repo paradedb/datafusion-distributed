@@ -65,7 +65,7 @@ impl TaskCountRestriction {
             | (Self::Range(min, max), TaskCountRestriction::Exact(exact)) => {
                 if !(min..=max).contains(&exact) {
                     return plan_err!(
-                        "Exact task count {exact} is outside of tthe required range {min}..={max}"
+                        "Exact task count {exact} is outside of the required range {min}..={max}"
                     );
                 }
                 Self::Exact(exact)
@@ -203,20 +203,25 @@ impl TaskCountAnnotation {
     /// Requires the node to execute in a number of tasks contained within `range`, while
     /// retaining `soft` as its soft task-count estimate. The planner may assign any number within
     /// `range` based on this estimate and other nodes' requirements.
-    pub fn range<T: AsPrimitive<f64> + 'static>(
+    pub fn try_range<T: AsPrimitive<f64> + 'static>(
         min: NonZeroUsize,
         max: NonZeroUsize,
         soft: T,
-    ) -> Self {
+    ) -> Result<Self> {
+        if min > max {
+            return plan_err!(
+                "TaskCountRestriction::range minimum must be less-than or equal to maximum"
+            );
+        }
         let restriction = if min == max {
             TaskCountRestriction::Exact(min)
         } else {
             TaskCountRestriction::Range(min, max)
         };
-        Self {
+        Ok(Self {
             soft: soft.as_(),
             restriction,
-        }
+        })
     }
 }
 

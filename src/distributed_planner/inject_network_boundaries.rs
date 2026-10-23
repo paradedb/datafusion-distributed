@@ -272,7 +272,9 @@ async fn _inject_network_boundaries(
             let child_count = nb_ctx.task_count(child)?;
             load += match child_count.restriction {
                 TaskCountRestriction::Exact(count) => child_count.soft.min(count.get() as f64),
-                _ => child_count.soft,
+                _ => child_count
+                    .soft
+                    .min(child_count.get_max().unwrap_or(NonZeroUsize::MAX).get() as f64),
             };
             if let Some(count) = child_count.get_min() {
                 min = Some(min.map_or(count, |current| current.max(count)));
@@ -285,7 +287,7 @@ async fn _inject_network_boundaries(
         match (min, max.and_then(NonZeroUsize::new)) {
             (Some(value), None) => TaskCountAnnotation::min(value, load),
             (None, Some(max)) => TaskCountAnnotation::max(max, load),
-            (Some(min), Some(max)) => TaskCountAnnotation::range(min, max, load),
+            (Some(min), Some(max)) => TaskCountAnnotation::try_range(min, max, load)?,
             (None, None) => TaskCountAnnotation::soft(load),
         }
     } else if let Some(node) = plan.downcast_ref::<HashJoinExec>()

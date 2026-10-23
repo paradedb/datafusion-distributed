@@ -251,7 +251,7 @@ async fn _inject_network_boundaries(
         session_config: nb_ctx.cfg,
     };
 
-    let mut task_count = if plan.children().is_empty() {
+    let task_count = if plan.children().is_empty() {
         // This is a leaf node, maybe a DataSourceExec, or maybe something else custom from the user.
         // If we could not determine how many tasks this leaf node should run on, we need to assume
         // it cannot be distributed and use just 1 task.
@@ -272,9 +272,7 @@ async fn _inject_network_boundaries(
                 TaskCountRestriction::Exact(count) => child_count.soft.min(count.get() as f64),
                 _ => child_count.soft,
             };
-            if let TaskCountRestriction::Exact(count) | TaskCountRestriction::Min(count) =
-                child_count.restriction
-            {
+            if let Some(count) = child_count.get_min() {
                 min = Some(min.map_or(count, |current| current.max(count)));
             }
         }
@@ -345,17 +343,18 @@ async fn _inject_network_boundaries(
         processed_children,
         ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
     )?;
-    // Cap the reconciled task count by the configured max-per-stage budget.
+    // Cap the task count restriction by the configured max-per-stage budget.
     let max_tasks = nb_ctx.max_tasks()?;
-    if let TaskCountRestriction::Exact(count) | TaskCountRestriction::Min(count) =
-        task_count.restriction
-        && count.get() > max_tasks
-    {
-        return plan_err!(
-            "Cannot assign a required task count of {count}, the max task slots available are {max_tasks}"
-        );
-    }
-    task_count.soft = task_count.soft.min(max_tasks as f64);
+    let task_count = task_count
+        .merge(TaskCountAnnotation::max(
+            NonZeroUsize::new(max_tasks).expect("max_tasks() should always be non-zero"),
+            task_count.soft,
+        ))
+        .map_err(|e| {
+            e.context(format!(
+                "attempting to cap task count the maximum slots available {max_tasks}"
+            ))
+        })?;
 
     // Upon reaching a hash repartition, we need to introduce a network shuffle right above it.
     if let Some(r_exec) = plan.downcast_ref::<RepartitionExec>()

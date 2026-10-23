@@ -26,6 +26,99 @@ pub(crate) enum TaskCountRestriction {
     None,
     Exact(NonZeroUsize),
     Min(NonZeroUsize),
+    Max(NonZeroUsize),
+    /// Inclusive range of (min, max)
+    Range(NonZeroUsize, NonZeroUsize),
+}
+
+impl TaskCountRestriction {
+    pub(crate) fn merge(self, other: Self) -> Result<Self> {
+        let restriction = match (self, other) {
+            (Self::None, restriction) | (restriction, Self::None) => restriction,
+            (Self::Exact(a), TaskCountRestriction::Exact(b)) => {
+                if a != b {
+                    return plan_err!("Incompatible exact task counts {a} and {b}");
+                }
+                Self::Exact(a)
+            }
+            (Self::Min(a), TaskCountRestriction::Min(b)) => Self::Min(a.max(b)),
+            (Self::Max(a), TaskCountRestriction::Max(b)) => Self::Min(a.min(b)),
+            (Self::Exact(exact), TaskCountRestriction::Min(min))
+            | (Self::Min(min), TaskCountRestriction::Exact(exact)) => {
+                if exact < min {
+                    return plan_err!(
+                        "Exact task count {exact} is below the required minimum {min}"
+                    );
+                }
+                Self::Exact(exact)
+            }
+            (Self::Exact(exact), TaskCountRestriction::Max(max))
+            | (Self::Max(max), TaskCountRestriction::Exact(exact)) => {
+                if exact > max {
+                    return plan_err!(
+                        "Exact task count {exact} is above the required maximum {max}"
+                    );
+                }
+                Self::Exact(exact)
+            }
+            (Self::Exact(exact), TaskCountRestriction::Range(min, max))
+            | (Self::Range(min, max), TaskCountRestriction::Exact(exact)) => {
+                if !(min..=max).contains(&exact) {
+                    return plan_err!(
+                        "Exact task count {exact} is outside of tthe required range {min}..={max}"
+                    );
+                }
+                Self::Exact(exact)
+            }
+            (Self::Range(rmin, rmax), TaskCountRestriction::Min(min))
+            | (Self::Min(min), TaskCountRestriction::Range(rmin, rmax)) => {
+                if min > rmax {
+                    return plan_err!(
+                        "Minimum task count {min} is above the required maximum {rmax}"
+                    );
+                }
+                Self::Range(min.max(rmin), rmax)
+            }
+            (Self::Range(rmin, rmax), TaskCountRestriction::Max(max))
+            | (Self::Max(max), TaskCountRestriction::Range(rmin, rmax)) => {
+                if max < rmin {
+                    return plan_err!(
+                        "Maximum task count {max} is below the required minimum {rmin}"
+                    );
+                }
+                Self::Range(rmin, max.min(rmax))
+            }
+            (Self::Min(min), TaskCountRestriction::Max(max))
+            | (Self::Max(max), TaskCountRestriction::Min(min)) => {
+                if min > max {
+                    return plan_err!(
+                        "Minimum task count {min} is above the required maximum {max}"
+                    );
+                }
+                if min == max {
+                    Self::Exact(min)
+                } else {
+                    Self::Range(min, max)
+                }
+            }
+            (Self::Range(amin, amax), TaskCountRestriction::Range(bmin, bmax)) => {
+                // ranges must overlap.
+                if amin <= bmax && bmin <= amax {
+                    return plan_err!(
+                        "Incompatible task count ranges of {amin}..={amax} and {bmin}..={bmax}"
+                    );
+                }
+                let min = amin.max(bmin);
+                let max = amax.min(bmax);
+                if min == max {
+                    Self::Exact(min)
+                } else {
+                    Self::Range(min, max)
+                }
+            }
+        };
+        Ok(restriction)
+    }
 }
 
 impl TaskCountAnnotation {
@@ -62,9 +155,28 @@ impl TaskCountAnnotation {
     /// Gets the exact task count if any.
     pub fn get_exact(&self) -> Option<NonZeroUsize> {
         match self.restriction {
-            TaskCountRestriction::None => None,
             TaskCountRestriction::Exact(v) => Some(v),
-            TaskCountRestriction::Min(_) => None,
+            _ => None,
+        }
+    }
+
+    /// Gets the minimum task count if any.
+    pub fn get_min(&self) -> Option<NonZeroUsize> {
+        match self.restriction {
+            TaskCountRestriction::Exact(min)
+            | TaskCountRestriction::Min(min)
+            | TaskCountRestriction::Range(min, _) => Some(min),
+            _ => None,
+        }
+    }
+
+    /// Gets the maximum task count if any.
+    pub fn get_max(&self) -> Option<NonZeroUsize> {
+        match self.restriction {
+            TaskCountRestriction::Exact(max)
+            | TaskCountRestriction::Max(max)
+            | TaskCountRestriction::Range(_, max) => Some(max),
+            _ => None,
         }
     }
 
@@ -75,6 +187,35 @@ impl TaskCountAnnotation {
         Self {
             soft: soft.as_(),
             restriction: TaskCountRestriction::Min(min),
+        }
+    }
+
+    /// Requires the node to execute in at most `max` tasks, while retaining `soft` as its soft
+    /// task-count estimate. The planner may assign fewer than `max` tasks based on this estimate
+    /// and other nodes' requirements.
+    pub(crate) fn max<T: AsPrimitive<f64> + 'static>(max: NonZeroUsize, soft: T) -> Self {
+        Self {
+            soft: soft.as_(),
+            restriction: TaskCountRestriction::Max(max),
+        }
+    }
+
+    /// Requires the node to execute in a number of tasks contained within `range`, while
+    /// retaining `soft` as its soft task-count estimate. The planner may assign any number within
+    /// `range` based on this estimate and other nodes' requirements.
+    pub(crate) fn range<T: AsPrimitive<f64> + 'static>(
+        min: NonZeroUsize,
+        max: NonZeroUsize,
+        soft: T,
+    ) -> Self {
+        let restriction = if min == max {
+            TaskCountRestriction::Exact(min)
+        } else {
+            TaskCountRestriction::Range(min, max)
+        };
+        Self {
+            soft: soft.as_(),
+            restriction,
         }
     }
 }
@@ -172,32 +313,13 @@ impl TaskCountAnnotation {
             TaskCountRestriction::None => tasks,
             TaskCountRestriction::Exact(exact) => exact.get(),
             TaskCountRestriction::Min(min) => tasks.max(min.get()),
+            TaskCountRestriction::Max(max) => tasks.min(max.get()),
+            TaskCountRestriction::Range(min, max) => min.get().max(tasks).min(max.get()),
         }
     }
 
     pub(crate) fn merge(self, other: TaskCountAnnotation) -> Result<Self> {
-        let restriction = match (self.restriction, other.restriction) {
-            (TaskCountRestriction::None, restriction)
-            | (restriction, TaskCountRestriction::None) => restriction,
-            (TaskCountRestriction::Exact(a), TaskCountRestriction::Exact(b)) => {
-                if a != b {
-                    return plan_err!("Incompatible exact task counts {a} and {b}");
-                }
-                TaskCountRestriction::Exact(a)
-            }
-            (TaskCountRestriction::Min(a), TaskCountRestriction::Min(b)) => {
-                TaskCountRestriction::Min(a.max(b))
-            }
-            (TaskCountRestriction::Exact(exact), TaskCountRestriction::Min(min))
-            | (TaskCountRestriction::Min(min), TaskCountRestriction::Exact(exact)) => {
-                if exact < min {
-                    return plan_err!(
-                        "Exact task count {exact} is below the required minimum {min}"
-                    );
-                }
-                TaskCountRestriction::Exact(exact)
-            }
-        };
+        let restriction = self.restriction.merge(other.restriction)?;
         Ok(Self {
             soft: self.soft.max(other.soft),
             restriction,
@@ -212,6 +334,8 @@ impl Debug for TaskCountAnnotation {
             TaskCountRestriction::None => {}
             TaskCountRestriction::Exact(exact) => write!(f, ", exact={exact}")?,
             TaskCountRestriction::Min(min) => write!(f, ", min={min}")?,
+            TaskCountRestriction::Max(max) => write!(f, ", max={max}")?,
+            TaskCountRestriction::Range(min, max) => write!(f, ", range={min}..={max}")?,
         }
         Ok(())
     }

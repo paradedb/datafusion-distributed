@@ -565,15 +565,20 @@ fn parse_task_count_annotation(value: TaskCountAnnotationProto) -> Result<TaskCo
 }
 
 fn serialize_task_count_annotation(value: TaskCountAnnotation) -> TaskCountAnnotationProto {
-    let (hard, min) = match value.restriction {
-        TaskCountRestriction::None => (None, None),
-        TaskCountRestriction::Exact(exact) => (Some(exact.get() as u64), None),
-        TaskCountRestriction::Min(min) => (None, Some(min.get() as u64)),
+    let (hard, min, max) = match value.restriction {
+        TaskCountRestriction::None => (None, None, None),
+        TaskCountRestriction::Exact(exact) => (Some(exact.get() as u64), None, None),
+        TaskCountRestriction::Min(min) => (None, Some(min.get() as u64), None),
+        TaskCountRestriction::Max(max) => (None, None, Some(max.get() as u64)),
+        TaskCountRestriction::Range(min, max) => {
+            (None, Some(min.get() as u64), Some(max.get() as u64))
+        }
     };
     TaskCountAnnotationProto {
         soft: value.soft,
         hard,
         min,
+        max,
     }
 }
 
@@ -673,6 +678,8 @@ pub struct TaskCountAnnotationProto {
     hard: Option<u64>,
     #[prost(uint64, optional, tag = "3")]
     min: Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    max: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

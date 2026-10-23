@@ -183,7 +183,7 @@ impl TaskCountAnnotation {
     /// Requires the node to execute in at least `min` tasks, while retaining `soft` as its soft
     /// task-count estimate. The planner may assign more than `min` tasks based on this estimate
     /// and other nodes' requirements.
-    pub(crate) fn min<T: AsPrimitive<f64> + 'static>(min: NonZeroUsize, soft: T) -> Self {
+    pub fn min<T: AsPrimitive<f64> + 'static>(min: NonZeroUsize, soft: T) -> Self {
         Self {
             soft: soft.as_(),
             restriction: TaskCountRestriction::Min(min),
@@ -193,7 +193,7 @@ impl TaskCountAnnotation {
     /// Requires the node to execute in at most `max` tasks, while retaining `soft` as its soft
     /// task-count estimate. The planner may assign fewer than `max` tasks based on this estimate
     /// and other nodes' requirements.
-    pub(crate) fn max<T: AsPrimitive<f64> + 'static>(max: NonZeroUsize, soft: T) -> Self {
+    pub fn max<T: AsPrimitive<f64> + 'static>(max: NonZeroUsize, soft: T) -> Self {
         Self {
             soft: soft.as_(),
             restriction: TaskCountRestriction::Max(max),
@@ -203,7 +203,7 @@ impl TaskCountAnnotation {
     /// Requires the node to execute in a number of tasks contained within `range`, while
     /// retaining `soft` as its soft task-count estimate. The planner may assign any number within
     /// `range` based on this estimate and other nodes' requirements.
-    pub(crate) fn range<T: AsPrimitive<f64> + 'static>(
+    pub fn range<T: AsPrimitive<f64> + 'static>(
         min: NonZeroUsize,
         max: NonZeroUsize,
         soft: T,

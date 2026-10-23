@@ -1123,7 +1123,7 @@ mod tests {
             .desired_task_count_handler(repartition_max_one_desired_task_count_handler);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
         assert_snapshot!(annotated, @"
-        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=2.00, range=1..=2
+        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=2.00, min=1
           FilterExec: task_count=TaskCountAnnotation: soft=2.00, exact=1
             RepartitionExec: task_count=TaskCountAnnotation: soft=2.00, exact=1
               DistributedLeafExec: task_count=TaskCountAnnotation: soft=2.00, exact=1
@@ -1207,7 +1207,7 @@ mod tests {
             .desired_task_count_handler(repartition_max_one_desired_task_count_handler);
         let annotated = annotate_test_plan(test_plan_builder, query).await;
         assert_snapshot!(annotated, @"
-        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=3.00, range=1..=3
+        ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=3.00, min=1
           FilterExec: task_count=TaskCountAnnotation: soft=3.00, exact=1
             RepartitionExec: task_count=TaskCountAnnotation: soft=3.00, exact=1
               DistributedLeafExec: task_count=TaskCountAnnotation: soft=3.00, exact=1

@@ -1128,10 +1128,11 @@ mod tests {
 
     /// Shorthand for an inclusive task count range — keeps the unit tests readable.
     fn range(min: usize, max: usize, w: f64) -> TaskCountAnnotation {
-        TaskCountAnnotation::range(
+        TaskCountAnnotation::try_range(
             NonZeroUsize::new(min).expect("min must be nonzero"),
             NonZeroUsize::new(max).expect("max must be nonzero"),
             w,
         )
+        .expect("min must not exceed max")
     }
 }

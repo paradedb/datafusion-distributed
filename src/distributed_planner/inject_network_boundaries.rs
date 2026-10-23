@@ -263,11 +263,9 @@ async fn _inject_network_boundaries(
     } else if plan.is::<ChildrenIsolatorUnionExec>() {
         // In ChildrenIsolatorUnionExec, load estimates are summed because all the children are
         // executed concurrently. The largest child exact count or inherited minimum sets
-        // the union's minimum task count. The union's max becomes the accumulated max of all of the
-        // children, or None if any child has no max.
+        // the union's minimum task count.
         let mut load: f64 = 0.0;
         let mut min: Option<NonZeroUsize> = None;
-        let mut max: Option<usize> = Some(0);
         for child in &processed_children {
             let child_count = nb_ctx.task_count(child)?;
             load += match child_count.restriction {
@@ -279,16 +277,15 @@ async fn _inject_network_boundaries(
             if let Some(count) = child_count.get_min() {
                 min = Some(min.map_or(count, |current| current.max(count)));
             }
-            max = match child_count.get_max() {
-                Some(m) => max.map(|max| max + m.get()),
-                None => None,
-            };
         }
-        match (min, max.and_then(NonZeroUsize::new)) {
-            (Some(value), None) => TaskCountAnnotation::min(value, load),
-            (None, Some(max)) => TaskCountAnnotation::max(max, load),
-            (Some(min), Some(max)) => TaskCountAnnotation::try_range(min, max, load)?,
-            (None, None) => TaskCountAnnotation::soft(load),
+        // Exact children cannot use more tasks than their combined counts. A flexible child
+        // can absorb additional tasks, so it leaves the upper bound unlimited.
+        //
+        // Max could be set as the sum of the child maxes, but we don't do that here to allow the
+        // union to potentially scale up to meet the needs of a larger sibling
+        match min {
+            Some(value) => TaskCountAnnotation::min(value, load),
+            None => TaskCountAnnotation::soft(load),
         }
     } else if let Some(node) = plan.downcast_ref::<HashJoinExec>()
         && node.mode == PartitionMode::CollectLeft

@@ -269,6 +269,35 @@ impl DesiredTaskCountEventResponse {
         }
     }
 
+    /// Requires the node to execute in at least `min` tasks, while retaining `soft` as its soft
+    /// task-count estimate. If another node imposes an incompatible count, planning fails.
+    pub fn min<T: AsPrimitive<f64> + 'static>(min: NonZeroUsize, soft: T) -> Self {
+        DesiredTaskCountEventResponse {
+            task_count: TaskCountAnnotation::min(min, soft),
+        }
+    }
+
+    /// Requires the node to execute in at most `max` tasks, while retaining `soft` as its soft
+    /// task-count estimate. If another node imposes an incompatible count, planning fails.
+    pub fn max<T: AsPrimitive<f64> + 'static>(max: NonZeroUsize, soft: T) -> Self {
+        DesiredTaskCountEventResponse {
+            task_count: TaskCountAnnotation::max(max, soft),
+        }
+    }
+
+    /// Requires the node to execute in between `min` and `max` tasks (inclusive), while retaining
+    /// `soft` as its soft task-count estimate. If another node imposes an incompatible count,
+    /// planning fails. Returns an error if `min` is greater than `max`.
+    pub fn try_range<T: AsPrimitive<f64> + 'static>(
+        min: NonZeroUsize,
+        max: NonZeroUsize,
+        soft: T,
+    ) -> Result<Self> {
+        Ok(DesiredTaskCountEventResponse {
+            task_count: TaskCountAnnotation::try_range(min, max, soft)?,
+        })
+    }
+
     /// Requires the node to execute in exactly one task without contributing a soft task-count
     /// estimate upstream.
     pub fn exactly_one() -> Self {

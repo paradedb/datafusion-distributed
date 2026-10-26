@@ -65,9 +65,7 @@ use crate::{
 use super::mpsc_ring::Wakeup;
 use super::runtime::{InProcessWorkerResolver, MppMesh, ShmChannelResolver, proc_for_task};
 use super::setup::{collect_task_metrics, dsm_region_bytes, leader_setup, worker_setup};
-use super::transport::{
-    CooperativeDrainSet, MppDataStreamKey, MppFrameHeader, MppSender, NoInterrupt,
-};
+use super::transport::{CooperativeDrainSet, MppDataStreamKey, MppSender, NoInterrupt};
 
 /// Per-inbox DSM ring size for the in-process mesh. Generous: the test ships a handful of tiny
 /// batches, so backpressure never kicks in. Production sizes this from `paradedb.mpp_queue_size`.
@@ -301,13 +299,6 @@ async fn run_worker_proc(
     session: SessionContext,
     captured: CapturedPlans,
 ) -> Result<()> {
-    // The metrics frames go to the leader after the fragments finish; the clone keeps one sender
-    // on the leader's inbox alive past the drop below, which only delays that ring's detach
-    // observation, never a per-channel EOF.
-    let metrics_sender_base = outbound
-        .first()
-        .and_then(|s| s.as_ref())
-        .map(|s| s.clone_with_header(MppFrameHeader::task_metrics(0, 0, mesh.this_proc)));
     let outbound: Arc<[Option<MppSender>]> = outbound.into();
 
     let mut prepared = Vec::with_capacity(fragments.len());
@@ -380,16 +371,10 @@ async fn run_worker_proc(
     }
     // Report per-fragment metrics, the same frames pg's workers ship after their last EOF; the
     // leader files them into the executed plan's metrics store.
-    if let Some(base) = metrics_sender_base {
-        for (stage_id, task_idx, task_count, plan) in &executed {
-            let frame = collect_task_metrics(plan, *task_idx, *task_count);
-            let sender = base.clone_with_header(MppFrameHeader::task_metrics(
-                *stage_id,
-                *task_idx as u32,
-                mesh.this_proc,
-            ));
-            let _ = sender.send_task_metrics_best_effort(&frame).await;
-        }
+    for (stage_id, task_idx, task_count, plan) in &executed {
+        let frame = collect_task_metrics(plan, *task_idx, *task_count);
+        mesh.send_task_metrics_best_effort(&outbound, *stage_id, *task_idx as u32, &frame)
+            .await;
     }
     Ok(())
 }
@@ -460,8 +445,8 @@ mod tests {
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
 
-    /// Total procs = leader (proc 0) + `N_WORKERS` producers. `proc_for_task` maps task `i` to
-    /// proc `1 + i % N_WORKERS`, so one worker can own multiple logical tasks.
+    /// Total procs = `N_WORKERS` (leader proc 0 + `N_WORKERS - 1` worker procs). `proc_for_task`
+    /// maps task `i` to proc `i % N_WORKERS`, so one proc can own multiple logical tasks.
     const N_WORKERS: u32 = 3;
 
     fn table_schema() -> SchemaRef {
@@ -538,8 +523,8 @@ mod tests {
 
         // procs: leader 0, plus workers 1 and 2.
         let boot = bootstrap_mesh(3);
-        let consumer = Arc::clone(&boot.workers[0].1); // proc 1
-        let producer = Arc::clone(&boot.workers[1].1); // proc 2
+        let consumer = Arc::clone(&boot.workers[1].1); // proc 1
+        let producer = Arc::clone(&boot.workers[2].1); // proc 2
 
         let cancelled = MppDataStreamKey::new(7, 0, 0);
         let sibling_task = MppDataStreamKey::new(7, 3, 0);
@@ -651,8 +636,8 @@ mod tests {
         let expected_ids = ids_of(&expected);
         assert_eq!(expected_ids, (0..(N_TASKS as i32 * 2)).collect::<Vec<_>>());
 
-        // One heap region stands in for the DSM segment; size it for n_procs = leader + workers.
-        let n_procs = N_WORKERS + 1;
+        // One heap region stands in for the DSM segment; size it for n_procs = N_WORKERS.
+        let n_procs = N_WORKERS;
         let region_total = dsm_region_bytes(n_procs, IN_PROCESS_QUEUE_BYTES, 0).unwrap();
         let region = HeapRegion::new(region_total);
         let base = SharedBase(region.base());
@@ -660,7 +645,7 @@ mod tests {
 
         // Leader first (it initializes the rings), then each worker attaches. No plan bytes travel
         // through the region here; all roles share the producer subplans as Arcs.
-        let leader_mesh = unsafe {
+        let leader_attach = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -672,9 +657,16 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
-        let mut worker_setups = Vec::new();
+        .unwrap();
+        let leader_mesh = Arc::clone(&leader_attach.mesh);
+        let leader_worker = leader_attach
+            .worker
+            .expect("attach_senders = true must populate leader.worker");
+        let mut worker_setups = vec![(
+            0,
+            Arc::clone(&leader_worker.mesh),
+            leader_worker.outbound_senders().to_vec(),
+        )];
         for proc_idx in 1..n_procs {
             let attach = unsafe {
                 worker_setup(
@@ -717,9 +709,9 @@ mod tests {
         );
 
         let entries = collect_dispatched_stages(&physical);
-        // There are five producer tasks but only three workers. Round-robin assignment puts
-        // tasks 0 and 3 on worker 1, and they both send stage output partition 0 to the leader.
-        // The task id in the transport header is what keeps task 0's EOF from closing task 3.
+        // There are five producer tasks but only three procs. Round-robin assignment puts
+        // tasks 0 and 3 on proc 0, and tasks 1 and 4 on proc 1.
+        // The task id in the transport header is what keeps task 1's EOF from closing task 4.
         assert!(
             entries.iter().any(|e| e.task_count == N_TASKS),
             "expected a producer stage with task_count = {N_TASKS}; got {:?}",
@@ -734,7 +726,7 @@ mod tests {
                 .iter()
                 .map(|fragment| fragment.task_idx)
                 .collect::<Vec<_>>(),
-            vec![0, 3],
+            vec![1, 4],
             "worker 1 must own two populated producer tasks"
         );
 
@@ -841,7 +833,7 @@ mod tests {
         let region = HeapRegion::new(region_total);
         let base = SharedBase(region.base());
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
-        let leader_mesh = unsafe {
+        let leader_attach = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -853,9 +845,16 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
-        let mut workers = Vec::new();
+        .unwrap();
+        let leader_mesh = Arc::clone(&leader_attach.mesh);
+        let leader_worker = leader_attach
+            .worker
+            .expect("attach_senders = true must populate leader.worker");
+        let mut workers = vec![(
+            0,
+            Arc::clone(&leader_worker.mesh),
+            leader_worker.outbound_senders().to_vec(),
+        )];
         for proc_idx in 1..n_procs {
             let attach = unsafe {
                 worker_setup(
@@ -900,7 +899,7 @@ mod tests {
             .await
             .unwrap();
 
-        let boot = bootstrap_mesh(N_WORKERS + 1);
+        let boot = bootstrap_mesh(N_WORKERS);
         let captured = new_captured_plans();
         let leader_ctx = build_session_with_worker_and_partitions(
             Arc::clone(&boot.leader_mesh),
@@ -930,7 +929,7 @@ mod tests {
                 .iter()
                 .map(|fragment| fragment.task_idx)
                 .collect::<Vec<_>>(),
-            vec![0, 3],
+            vec![1, 4],
             "worker 1 must own two shuffled producer tasks"
         );
 
@@ -989,7 +988,7 @@ mod tests {
             .unwrap();
 
         // 64 KiB rings against ~700 KiB of per-worker aggregate state.
-        let boot = bootstrap_mesh_with_queue(N_WORKERS + 1, 64 * 1024);
+        let boot = bootstrap_mesh_with_queue(N_WORKERS, 64 * 1024);
         let captured = new_captured_plans();
         let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
         register_wide_table(&leader_ctx);
@@ -1039,7 +1038,7 @@ mod tests {
     async fn producer_loss_fails_the_gather_instead_of_hanging() {
         let query = "SELECT id, val FROM t ORDER BY id";
 
-        let boot = bootstrap_mesh(N_WORKERS + 1);
+        let boot = bootstrap_mesh(N_WORKERS);
         let captured = new_captured_plans();
         let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
         let physical = leader_ctx
@@ -1106,7 +1105,7 @@ mod tests {
         let base = SharedBase(region.base());
         let wakeup: Arc<dyn Wakeup> = Arc::new(NoopWakeup);
 
-        let leader_mesh = unsafe {
+        let leader_attach = unsafe {
             leader_setup(
                 base.0,
                 n_procs,
@@ -1118,8 +1117,8 @@ mod tests {
                 /* attach_senders */ true,
             )
         }
-        .unwrap()
-        .mesh;
+        .unwrap();
+        let leader_mesh = Arc::clone(&leader_attach.mesh);
 
         let worker_attach = unsafe {
             worker_setup(
@@ -1137,7 +1136,7 @@ mod tests {
 
         let token = CancellationToken::new();
 
-        // Worker 1 runs execute task loop where the fragment panics.
+        // Worker 1 runs execute task loop where the fragment panics (task_number = 1 maps to proc 1).
         let worker_mesh = Arc::clone(&worker_attach.mesh);
         let loop_mesh = Arc::clone(&worker_mesh);
         let outbound = worker_attach.outbound_senders().to_vec();
@@ -1147,7 +1146,7 @@ mod tests {
                 &loop_mesh,
                 &outbound,
                 1, // stage_id 1
-                0, // task_number 0
+                1, // task_number 1 (proc 1)
                 1, // 1 partition
                 worker_token,
                 |_req, _hdr, _range, _sinks| async move {
@@ -1157,17 +1156,17 @@ mod tests {
             .await
         });
 
-        // Leader (proc 0) registers a channel for task (stage 1, task 0, partition 0) and sends ExecuteTask.
+        // Leader (proc 0) registers a channel for task (stage 1, task 1, partition 0) and sends ExecuteTask.
         let channel = leader_mesh
             .inbound_receiver()
-            .register_data_channel(1, MppDataStreamKey::new(1, 0, 0));
+            .register_data_channel(1, MppDataStreamKey::new(1, 1, 0));
 
         let request = ExecuteTaskFrame::from_parts(
             pb::ExecuteTaskRequest {
                 task_key: Some(pb::TaskKey {
                     query_id: vec![1; 16],
                     stage_id: 1,
-                    task_number: 0,
+                    task_number: 1,
                 }),
                 target_partition_start: 0,
                 target_partition_end: 1,
@@ -1177,7 +1176,7 @@ mod tests {
         )
         .unwrap();
 
-        leader_mesh.send_execute_task(1, 0, request).await.unwrap();
+        leader_mesh.send_execute_task(1, 1, request).await.unwrap();
 
         // Drive drain passes on worker and leader until the TaskError arrives.
         let mut item = None;
@@ -1223,10 +1222,11 @@ mod tests {
             .inbound_receiver()
             .register_local_channel(stream_key);
 
-        // Worker 2 (and its outbound senders) exits/drops.
-        // Dropping worker 2's senders causes worker 1's DSM inbox sender count to drop to zero.
+        // Peer procs (proc 0 and worker 2) and their outbound senders exit/drop.
+        // Dropping all peer senders causes worker 1's DSM inbox sender count to drop to zero.
         drop(outbound2);
         drop(worker2_mesh);
+        drop(workers);
 
         // Worker 1 executes try_drain_pass, observing DSM detachment.
         let _ = worker1_mesh.inbound_receiver().try_drain_pass();
@@ -1280,7 +1280,7 @@ mod tests {
             .await
             .unwrap();
 
-        let boot = bootstrap_mesh(N_WORKERS + 1);
+        let boot = bootstrap_mesh(N_WORKERS);
         let captured = new_captured_plans();
         let leader_ctx = build_session(Arc::clone(&boot.leader_mesh), Some(Arc::clone(&captured)));
         let physical = leader_ctx
@@ -1323,6 +1323,120 @@ mod tests {
             pretty_format_batches(&expected).unwrap().to_string(),
             pretty_format_batches(&got).unwrap().to_string(),
             "distributed isolated union != serial"
+        );
+    }
+
+    /// With `n_procs = 1` and `N_TASKS = 4`, all 4 tasks of every stage run inside `proc 0`
+    /// and serialize their control frames, shuffle batches, coalesce batches, and task metrics
+    /// through `proc 0`'s own `DsmMpscRing`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn single_proc_multiplexed_shuffle_query_runs_over_self_ring() {
+        let query = "SELECT val, count(*) AS c, sum(id) AS s FROM t GROUP BY val ORDER BY val";
+        const N_TASKS: usize = 4;
+
+        let serial_ctx = SessionContext::new();
+        register_table_with_partitions(&serial_ctx, N_TASKS as i32);
+        let expected = serial_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let boot = bootstrap_mesh(1);
+        assert_eq!(boot.workers.len(), 1);
+        assert_eq!(boot.workers[0].0, 0);
+        assert!(
+            boot.workers[0].2[0].is_some(),
+            "proc 0 must have a self-sender attached at outbound_senders[0]"
+        );
+
+        let captured = new_captured_plans();
+        let leader_ctx = build_session_with_worker_and_partitions(
+            Arc::clone(&boot.leader_mesh),
+            Some(Arc::clone(&captured)),
+            N_TASKS,
+            N_TASKS,
+            N_TASKS as i32,
+        );
+        let physical = leader_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let display = crate::display_plan_ascii(physical.as_ref(), false);
+        assert!(
+            display.contains("NetworkShuffleExec"),
+            "expected NetworkShuffleExec in plan:\n{display}"
+        );
+
+        let entries = collect_dispatched_stages(&physical);
+        let mut workers = JoinSet::new();
+        for (proc_idx, mesh, outbound) in boot.workers {
+            let fragments = fragments_for_proc(&entries, proc_idx, 1);
+            assert!(
+                fragments.len() >= N_TASKS,
+                "proc 0 must own all tasks across all stages"
+            );
+            let session = build_session_with_worker_and_partitions(
+                Arc::clone(&mesh),
+                None,
+                N_TASKS,
+                N_TASKS,
+                N_TASKS as i32,
+            );
+            workers.spawn(run_worker_proc(
+                fragments,
+                outbound,
+                mesh,
+                session,
+                Arc::clone(&captured),
+            ));
+        }
+
+        let leader_task_ctx = leader_ctx.task_ctx();
+        let stream = physical.execute(0, leader_task_ctx).unwrap();
+        let got: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        while let Some(res) = workers.join_next().await {
+            res.expect("worker task panicked").expect("worker proc");
+        }
+
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        assert_eq!(
+            pretty_format_batches(&expected).unwrap().to_string(),
+            pretty_format_batches(&got).unwrap().to_string(),
+            "single-proc distributed shuffle != serial"
+        );
+
+        let mut expected_reports = 0usize;
+        let _ = physical.apply(|node| {
+            if let Some(nb) = node.as_ref().as_network_boundary() {
+                expected_reports += nb.input_stage().task_count();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        let mut rx = boot
+            .leader_mesh
+            .take_task_metrics_receiver()
+            .expect("task metrics receiver");
+        let mut received = 0usize;
+        for _ in 0..100 {
+            let _ = boot.leader_mesh.try_drain_pass();
+            while let Ok((_stage_id, _task_number, metrics)) = rx.try_recv() {
+                let _ = decode_task_metrics(metrics).expect("decode task metrics");
+                received += 1;
+            }
+            if received == expected_reports {
+                break;
+            }
+        }
+        assert_eq!(
+            received, expected_reports,
+            "all single-proc fragment task metrics must round-trip over proc 0's ring"
         );
     }
 }

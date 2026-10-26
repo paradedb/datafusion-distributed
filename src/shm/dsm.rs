@@ -185,8 +185,8 @@ pub(super) fn compute_dsm_layout(
     queue_bytes: usize,
     plan_len: usize,
 ) -> Result<DsmLayout, &'static str> {
-    if n_procs < 2 {
-        return Err("mpp: n_procs must be >= 2 (leader + at least one worker)");
+    if n_procs < 1 {
+        return Err("mpp: n_procs must be >= 1");
     }
     // MAXALIGN-round-down first (operator-friendly), then round up to the ring's
     // 64-byte alignment requirement. Doing it in this order means each per-inbox
@@ -259,6 +259,11 @@ pub(super) struct ProcAttach {
     /// `outbound_senders[i]` writes to peer `peer_proc_for_index(this_proc, i)`'s inbox.
     /// `peer_proc(i) = i if i < this_proc else i + 1` skips the self-loop entry.
     pub(super) outbound_senders: Vec<DsmMpscSender>,
+    /// Sender to this process's own inbox (`counts_as_data: false`), present in single-process
+    /// mode (`attach_senders && n_procs == 1`) so self-routed data/control frames serialize
+    /// through `DsmMpscRing` without masking remote peer detachment. When `n_procs > 1`, same-proc
+    /// traffic uses the zero-copy in-memory fast path instead.
+    pub(super) self_sender: Option<DsmMpscSender>,
     /// This process's own MPSC inbox receiver. Drained inline by `DrainHandle`.
     pub(super) inbound_receiver: DsmMpscReceiver,
     pub(super) alive: AliveFlag,
@@ -332,14 +337,21 @@ pub(super) unsafe fn leader_init(
     }
 
     // Initialize the N MPSC inboxes. Workers can't do this (the region is uninitialized
-    // at their attach time), so the leader runs DsmMpscRing::create_at for every receiver.
+    // at their attach time), so the leader runs DsmMpscRing::create_at for every receiver
+    // and pre-seeds each inbox's expected peer data-sender count before any worker attaches.
     let header = MppDsmHeader::from_layout(layout);
     let n_procs = layout.n_procs;
     let (ring_slots, slot_capacity) = ring_dims_for(layout.queue_bytes);
     for r in 0..n_procs {
         let off = header.inbox_offset(r) as usize;
         let inbox_addr = unsafe { base.add(off) };
-        unsafe { mpsc_ring::create_at(inbox_addr, ring_slots, slot_capacity) };
+        let ring_ptr = unsafe { mpsc_ring::create_at(inbox_addr, ring_slots, slot_capacity) };
+        let expected_senders = if r == 0 || attach_senders {
+            n_procs.saturating_sub(1)
+        } else {
+            n_procs.saturating_sub(2)
+        };
+        unsafe { mpsc_ring::set_initial_senders(ring_ptr, expected_senders) };
     }
 
     let attach = unsafe { attach_proc(base, &header, 0, attach_senders, wakeup) };
@@ -350,11 +362,9 @@ pub(super) unsafe fn leader_init(
 /// parallel workers). Attach as receiver to this proc's own MPSC inbox, and (if
 /// `attach_senders` is true) as sender to every peer's inbox.
 ///
-/// `attach_senders = false` is for the leader (consumer-only). If the leader attached
-/// as sender it would bump every peer inbox's `sender_count` and decrement it on `Drop`;
-/// if it dropped before any worker bumped, the 1 → 0 transition would flip `detached`
-/// on every peer inbox and every later worker send would fail `SendError::Detached`.
-/// Skipping keeps `sender_count` honest (only producers ever increment).
+/// Each inbox's `sender_count` is pre-seeded in [`leader_init`] to the total number of peer
+/// data producers in the mesh (`n_procs - 1` when `attach_senders` is true), so attaching
+/// claims a pre-counted slot via [`DsmMpscSender::from_precounted`] and dropping decrements it.
 ///
 /// # Safety
 /// - `base` must point to a DSM region whose header has been validated.
@@ -368,7 +378,7 @@ unsafe fn attach_proc(
     wakeup: Arc<dyn Wakeup>,
 ) -> ProcAttach {
     let n_procs = header.n_procs;
-    let peer_count = (n_procs - 1) as usize;
+    let peer_count = n_procs.saturating_sub(1) as usize;
     let mut outbound_senders = Vec::with_capacity(if attach_senders { peer_count } else { 0 });
 
     let (ring_slots, slot_capacity) = ring_dims_for(header.queue_bytes as usize);
@@ -377,16 +387,14 @@ unsafe fn attach_proc(
     let alive = Arc::new(AtomicBool::new(true));
 
     if attach_senders {
-        for peer_idx in 0..(n_procs - 1) {
+        for peer_idx in 0..n_procs.saturating_sub(1) {
             let r = peer_proc_for_index(this_proc, peer_idx);
             let off = header.inbox_offset(r) as usize;
             let inbox_addr = unsafe { base.add(off) };
             let nn = unsafe { mpsc_ring::attach_at(inbox_addr, ring_slots, slot_capacity) }
                 .expect("DsmMpscRing attach_at: leader-initialized region must validate");
-            let sender = if this_proc == 0 {
-                unsafe { DsmMpscSender::new_control(nn, Arc::clone(&wakeup), Arc::clone(&alive)) }
-            } else {
-                unsafe { DsmMpscSender::new(nn, Arc::clone(&wakeup), Arc::clone(&alive)) }
+            let sender = unsafe {
+                DsmMpscSender::from_precounted(nn, Arc::clone(&wakeup), Arc::clone(&alive))
             };
             outbound_senders.push(sender);
         }
@@ -397,10 +405,16 @@ unsafe fn attach_proc(
     let own_inbox_addr = unsafe { base.add(own_off) };
     let own_nn = unsafe { mpsc_ring::attach_at(own_inbox_addr, ring_slots, slot_capacity) }
         .expect("DsmMpscRing attach_at: own inbox must validate");
+    let self_sender = if attach_senders && n_procs == 1 {
+        Some(unsafe { DsmMpscSender::new_control(own_nn, Arc::clone(&wakeup), Arc::clone(&alive)) })
+    } else {
+        None
+    };
     let inbound_receiver = unsafe { DsmMpscReceiver::new(own_nn, Arc::clone(&alive)) };
 
     ProcAttach {
         outbound_senders,
+        self_sender,
         inbound_receiver,
         alive,
     }

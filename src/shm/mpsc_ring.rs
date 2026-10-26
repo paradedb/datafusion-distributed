@@ -374,6 +374,18 @@ pub(super) unsafe fn create_at(
     header_ptr
 }
 
+/// Pre-seed `sender_count` on a ring created by [`create_at`] when the total number of peer
+/// data producers in the mesh is known upfront (`leader_init`). Pairing this with
+/// [`DsmMpscSender::from_precounted`] avoids a `0 -> 1 -> 0` race if an early producer finishes
+/// and drops its sender before a slower peer has attached.
+///
+/// # Safety
+/// - `header` must point at a ring header initialized by [`create_at`] before any concurrent
+///   sender attaches or drops.
+pub(super) unsafe fn set_initial_senders(header: *mut DsmMpscRingHeader, count: u32) {
+    unsafe { (*header).sender_count.store(count, Ordering::Release) };
+}
+
 /// Take an already-initialized ring header pointer and confirm its shape matches caller's
 /// expectations. The caller's `expected_ring_size` / `expected_slot_capacity` must match
 /// the values written at `create_at` time; mismatch is a hard error (returns null).
@@ -636,6 +648,7 @@ impl DsmMpscSender {
     /// # Safety
     /// `ring` must point to a header initialized by [`create_at`] and not yet
     /// deallocated.
+    #[cfg(test)]
     pub(super) unsafe fn new(
         ring: NonNull<DsmMpscRingHeader>,
         wakeup: Arc<dyn Wakeup>,
@@ -651,8 +664,30 @@ impl DsmMpscSender {
         }
     }
 
-    /// Wrap an already-initialized ring as a control sender. Does NOT increment `sender_count`,
-    /// so it doesn't prevent the consumer from detecting when all true data producers drop.
+    /// Wrap an already-initialized ring whose `sender_count` was pre-seeded at ring creation
+    /// time via [`set_initial_senders`]. Does not increment `sender_count` on attach, and
+    /// decrements it on `Drop` (`counts_as_data = true`) so the ring detaches once all
+    /// expected peer data producers have dropped.
+    ///
+    /// # Safety
+    /// `ring` must point to a header initialized by [`create_at`] and not yet deallocated,
+    /// with one unit of `sender_count` reserved for this handle.
+    pub(super) unsafe fn from_precounted(
+        ring: NonNull<DsmMpscRingHeader>,
+        wakeup: Arc<dyn Wakeup>,
+        alive: AliveFlag,
+    ) -> Self {
+        Self {
+            ring,
+            wakeup,
+            counts_as_data: true,
+            alive,
+        }
+    }
+
+    /// Wrap an already-initialized ring as a control or self-loop sender. Does NOT increment
+    /// `sender_count`, so it doesn't prevent the consumer from detecting when all remote data
+    /// producers drop.
     pub(super) unsafe fn new_control(
         ring: NonNull<DsmMpscRingHeader>,
         wakeup: Arc<dyn Wakeup>,

@@ -75,19 +75,19 @@ pub unsafe fn region_total(base: *const c_void) -> usize {
     unsafe { read_region_total(base) as usize }
 }
 
-/// Wrap each peer-indexed `DsmMpscSender` into an outbound `MppSender` keyed by destination proc.
-/// The dispatcher `clone_with_header`s these per output partition before sending, so the
-/// placeholder header is never observed on the wire. Slot `this_proc` stays `None` because
-/// local communication routes in-process via `LocalWorkerContext`.
+/// Wrap each peer-indexed `DsmMpscSender` (plus the optional `self_sender`) into an outbound
+/// `MppSender` keyed by destination proc. The dispatcher `clone_with_header`s these per output
+/// partition before sending, so the placeholder header is never observed on the wire.
 ///
 /// Returns `(data, cancel)`. `data` is the producer's output senders. `cancel` is a control-plane
-/// sibling onto each peer inbox, used by [`MppMesh::cancel_stream`]: a consumer reaches its producer
+/// sibling onto each inbox, used by [`MppMesh::cancel_stream`]: a consumer reaches its producer
 /// without counting as one of that producer's data senders, so a held `Cancel` sender never masks
 /// the producer-gone `detached` signal.
 fn build_outbound_senders(
     this_proc: u32,
     total_procs: u32,
     peer_senders: Vec<DsmMpscSender>,
+    self_sender: Option<DsmMpscSender>,
 ) -> (Vec<Option<MppSender>>, Vec<Option<MppSender>>) {
     let mut senders: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
     let mut cancel: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
@@ -116,20 +116,34 @@ fn build_outbound_senders(
             MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), this_proc),
         ));
     }
+    if let Some(dsm_send) = self_sender {
+        let control: Arc<dyn BatchChannelSender> =
+            Arc::new(DsmInboxSender::new(dsm_send.to_control()));
+        cancel[this_proc as usize] = Some(MppSender::with_header(
+            control,
+            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), this_proc),
+        ));
+        let shared: Arc<dyn BatchChannelSender> = Arc::new(DsmInboxSender::new(dsm_send));
+        senders[this_proc as usize] = Some(MppSender::with_header(
+            shared,
+            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), this_proc),
+        ));
+    }
     (senders, cancel)
 }
 
 /// What [`leader_setup`] hands back to the embedder: the active leader session on the mesh.
 ///
-/// Dropping this handle drops `_outbound_senders`, notifying peer worker inboxes that the leader
-/// has detached. Fields `mesh` and `plan_bytes` are accessible, while `_outbound_senders` is private
-/// to prevent premature destructuring.
+/// Separates the leader's two roles on `proc 0`:
+/// - `mesh`: the coordinator and root-stage consumer handle installed on the leader's
+///   DataFusion session.
+/// - `worker`: the optional [`WorkerSession`] for `proc 0`'s own producer fragment runner when
+///   `attach_senders` is true.
 pub struct LeaderSession {
     /// The leader's mesh, installed on its DataFusion session.
     pub mesh: Arc<MppMesh>,
-    /// Outbound senders keyed by destination proc index, for the control plane: work-unit
-    /// frames flow leader -> worker through them. Private to enforce session scope retention.
-    _outbound_senders: Vec<Option<MppSender>>,
+    /// Producer worker session for `proc 0` when the leader participates in producer stages.
+    pub worker: Option<WorkerSession>,
 }
 
 /// Initialize the shared region as the leader (`proc 0`) and return its session handle.
@@ -176,21 +190,19 @@ pub unsafe fn leader_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
-        inbox,
-    ))]));
-    // The leader hosts no producer fragments, but its senders carry the control plane:
-    // work-unit frames (and later dynamic filters) flow leader -> worker through them. Empty
-    // when the embedder did not opt in: a ring latches `detached` once its sender count hits
-    // zero, so senders that might drop before every worker attached must never exist.
+    let inbound = Arc::new(
+        DrainHandle::cooperative(vec![MppReceiver::new(Box::new(inbox))]).with_own_proc(0),
+    );
     let (outbound_senders, cancel_senders) =
-        build_outbound_senders(0, n_procs, attach.outbound_senders);
+        build_outbound_senders(0, n_procs, attach.outbound_senders, attach.self_sender);
     let mesh = Arc::new(MppMesh::new(0, n_procs, inbound, interrupt, attach.alive));
     mesh.set_cancel_senders(Arc::new(std::sync::Mutex::new(cancel_senders)));
-    Ok(LeaderSession {
-        mesh,
+    let worker = attach_senders.then(|| WorkerSession {
+        mesh: Arc::clone(&mesh),
+        plan_bytes: plan_bytes.to_vec(),
         _outbound_senders: outbound_senders,
-    })
+    });
+    Ok(LeaderSession { mesh, worker })
 }
 
 /// Build one task's work-unit feed channels, install the receiving ends on `cfg` (where the
@@ -255,12 +267,6 @@ pub struct WorkerSession {
     _outbound_senders: Vec<Option<MppSender>>,
 }
 
-impl LeaderSession {
-    pub fn outbound_senders(&self) -> &[Option<MppSender>] {
-        &self._outbound_senders
-    }
-}
-
 impl WorkerSession {
     pub fn outbound_senders(&self) -> &[Option<MppSender>] {
         &self._outbound_senders
@@ -292,13 +298,18 @@ pub unsafe fn worker_setup(
             .map_err(DataFusionError::Internal)?;
     let total_procs = header.n_procs;
 
-    let (outbound, cancel) = build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
+    let (outbound, cancel) = build_outbound_senders(
+        proc_idx,
+        total_procs,
+        attach.outbound_senders,
+        attach.self_sender,
+    );
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
-        inbox,
-    ))]));
+    let inbound = Arc::new(
+        DrainHandle::cooperative(vec![MppReceiver::new(Box::new(inbox))]).with_own_proc(proc_idx),
+    );
     let mesh = Arc::new(MppMesh::new(
         proc_idx,
         total_procs,
@@ -346,7 +357,18 @@ pub async fn run_worker_fragment(
         futures.push(async move {
             let stream_result: Result<()> = async {
                 let mut stream = plan.execute(partition, ctx)?;
-                while let Some(batch) = stream.next().await {
+                loop {
+                    if sink.cancelled() {
+                        break;
+                    }
+                    let next_batch = tokio::select! {
+                        biased;
+                        batch = stream.next() => batch,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => continue,
+                    };
+                    let Some(batch) = next_batch else {
+                        break;
+                    };
                     let batch = batch?;
                     if batch.num_rows() == 0 {
                         continue;
@@ -403,24 +425,23 @@ fn open_partition_sinks(
             )
         })?;
         let stream_key = MppDataStreamKey::new(task.stage_id, task.task_number, q_u32);
-        if dest_proc == mesh.this_proc {
-            sinks.push(mesh.open_local_partition_sink(stream_key));
-        } else {
-            let base = outbound_senders
-                .get(dest_proc as usize)
-                .and_then(|s| s.as_ref())
-                .ok_or_else(|| {
-                    internal_datafusion_err!(
-                        "shm transport: outbound_senders[{dest_proc}] is None (unattached); \
-                         stage_id={} task_number={}",
-                        task.stage_id,
-                        task.task_number
-                    )
-                })?;
+        if let Some(base) = outbound_senders
+            .get(dest_proc as usize)
+            .and_then(|s| s.as_ref())
+        {
             sinks.push(Box::new(MppPartitionSink::new(
                 base.clone_with_header(MppFrameHeader::batch(stream_key, mesh.this_proc))
                     .with_cooperative_drain(Arc::clone(mesh) as Arc<dyn CooperativeDrainSet>),
             )));
+        } else if dest_proc == mesh.this_proc {
+            sinks.push(mesh.open_local_partition_sink(stream_key));
+        } else {
+            return Err(internal_datafusion_err!(
+                "shm transport: outbound_senders[{dest_proc}] is None (unattached); \
+                 stage_id={} task_number={}",
+                task.stage_id,
+                task.task_number
+            ));
         }
     }
     Ok(sinks)
@@ -498,11 +519,17 @@ where
     // Only send TaskError if the loop returned an actual execution error or fragment panic.
     // Healthy early termination (such as downstream LIMIT queries or cancellation token unwinding)
     // completes cleanly and returns Ok(()), so no TaskError is published.
-    if let (Err(e), Some(sender)) = (
-        &res,
-        failed_sender_proc.and_then(|p| mesh.error_sender(p, stage_id, task_number)),
-    ) {
-        let _ = sender.send_task_error_best_effort(&e.to_string()).await;
+    if let Err(e) = &res {
+        let msg = e.to_string();
+        mesh.inbound_receiver().fail_scope(&format!(
+            "remote task {stage_id}.{task_number} failed: {msg}"
+        ));
+        if let Some(p) = failed_sender_proc
+            && p != mesh.this_proc
+            && let Some(sender) = mesh.error_sender(p, stage_id, task_number)
+        {
+            let _ = sender.send_task_error_best_effort(&msg).await;
+        }
     }
     res
 }

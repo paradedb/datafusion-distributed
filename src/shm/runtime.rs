@@ -64,15 +64,15 @@ use super::transport::{
 /// is `None`.
 pub type PeerSenders = Arc<Mutex<Vec<Option<MppSender>>>>;
 
-/// `task_idx → proc_idx` round-robin over the worker procs. The leader is `proc_idx = 0`
-/// (consumer-only), workers are `1..n_procs` (each hosts producer fragments).
+/// `task_idx → proc_idx` round-robin over all participating procs (`0..n_procs`). The leader is
+/// `proc_idx = 0` and workers are `1..n_procs`; all procs host producer fragments.
 ///
 /// A stage's task count is set by the DF-D task estimator chain, not by the worker proc count.
-/// Several tasks may share a worker; their data streams remain independent because the transport
+/// Several tasks may share a proc; their data streams remain independent because the transport
 /// key includes `task_id` in addition to the sender proc, stage, and output partition.
 #[inline]
 pub fn proc_for_task(n_workers: u32, task_idx: u32) -> u32 {
-    1 + (task_idx % n_workers.max(1))
+    task_idx % n_workers.max(1)
 }
 
 /// Runtime handle the customscan populates at DSM-init time.
@@ -159,20 +159,27 @@ impl MppMesh {
         frame: SetPlanFrame,
     ) -> Result<()> {
         let dest_proc = proc_for_task(self.n_workers(), task_number);
-        if dest_proc == self.this_proc {
-            self.inbound_receiver
-                .route_set_plan(stage_id, task_number, frame);
-            return Ok(());
-        }
         let sender = {
             let guard = self.cancel_senders.lock().unwrap();
             let Some(senders) = guard.as_ref() else {
+                if dest_proc == self.this_proc {
+                    self.inbound_receiver
+                        .route_set_plan(stage_id, task_number, frame);
+                    return Ok(());
+                }
                 return internal_err!(
                     "shm mesh: control senders not installed; cannot route SetPlan"
                 );
             };
             let senders = senders.lock().unwrap();
             let Some(Some(base)) = senders.get(dest_proc as usize) else {
+                if dest_proc == self.this_proc {
+                    drop(senders);
+                    drop(guard);
+                    self.inbound_receiver
+                        .route_set_plan(stage_id, task_number, frame);
+                    return Ok(());
+                }
                 return internal_err!("shm mesh: no control sender for proc {dest_proc}");
             };
             base.clone_with_header(MppFrameHeader::set_plan(stage_id, task_number, 0))
@@ -191,20 +198,35 @@ impl MppMesh {
         frame: crate::shm::transport::ExecuteTaskFrame,
     ) -> Result<()> {
         let dest_proc = proc_for_task(self.n_workers(), task_number);
-        if dest_proc == self.this_proc {
-            self.inbound_receiver
-                .route_execute_task(stage_id, task_number, self.this_proc, frame);
-            return Ok(());
-        }
         let sender = {
             let guard = self.cancel_senders.lock().unwrap();
             let Some(senders) = guard.as_ref() else {
+                if dest_proc == self.this_proc {
+                    self.inbound_receiver.route_execute_task(
+                        stage_id,
+                        task_number,
+                        self.this_proc,
+                        frame,
+                    );
+                    return Ok(());
+                }
                 return internal_err!(
                     "shm mesh: control senders not installed; cannot route ExecuteTask"
                 );
             };
             let senders = senders.lock().unwrap();
             let Some(Some(base)) = senders.get(dest_proc as usize) else {
+                if dest_proc == self.this_proc {
+                    drop(senders);
+                    drop(guard);
+                    self.inbound_receiver.route_execute_task(
+                        stage_id,
+                        task_number,
+                        self.this_proc,
+                        frame,
+                    );
+                    return Ok(());
+                }
                 return internal_err!("shm mesh: no control sender for proc {dest_proc}");
             };
             base.clone_with_header(crate::shm::transport::MppFrameHeader::execute_task(
@@ -238,7 +260,6 @@ impl MppMesh {
     pub fn cancel_stream(&self, producer_proc: u32, stream: MppDataStreamKey) {
         if producer_proc == self.this_proc {
             self.inbound_receiver.cancel_local_stream(stream);
-            return;
         }
         let guard = self.cancel_senders.lock().unwrap();
         let Some(senders) = guard.as_ref() else {
@@ -282,9 +303,15 @@ impl MppMesh {
     }
 
     /// Opens a [`PartitionSink`] for a local in-process data stream (self-loop).
-    pub fn open_local_partition_sink(&self, stream: MppDataStreamKey) -> Box<dyn PartitionSink> {
+    pub fn open_local_partition_sink(
+        self: &Arc<Self>,
+        stream: MppDataStreamKey,
+    ) -> Box<dyn PartitionSink> {
         let buffer = self.inbound_receiver.register_local_channel(stream);
-        Box::new(LocalDrainPartitionSink::new(buffer))
+        Box::new(
+            LocalDrainPartitionSink::new(buffer)
+                .with_cooperative_drain(Arc::clone(self) as Arc<dyn CooperativeDrainSet>),
+        )
     }
 
     /// Install the senders of one task's work-unit feed channels on this proc's drain, so
@@ -325,21 +352,51 @@ impl MppMesh {
         self.inbound_receiver.take_task_metrics_receiver()
     }
 
-    /// Number of worker procs (= `n_procs - 1`, since the leader is proc 0). Used as the
-    /// modulus in [`proc_for_task`].
-    ///
-    /// The embedder must guarantee `n_procs >= 2` (one consumer-only leader plus at least one
-    /// producer worker) before constructing an `MppMesh`; the subtraction is otherwise unsound.
-    /// `compute_dsm_layout` enforces the same bound. Asserted in debug builds so a future misuse
-    /// fails loudly.
+    /// Best-effort delivery of a fragment's `TaskMetrics` to the leader (`proc 0`).
+    /// Uses `outbound_senders[0]` when present, or routes in-process when `this_proc == 0`
+    /// and no self-sender is attached.
+    pub async fn send_task_metrics_best_effort(
+        self: &Arc<Self>,
+        outbound_senders: &[Option<MppSender>],
+        stage_id: u32,
+        task_number: u32,
+        metrics: &pb::TaskMetrics,
+    ) {
+        if let Some(Some(base)) = outbound_senders.first() {
+            let sender = base
+                .clone_with_header(MppFrameHeader::task_metrics(
+                    stage_id,
+                    task_number,
+                    self.this_proc,
+                ))
+                .with_cooperative_drain(Arc::clone(self) as Arc<dyn CooperativeDrainSet>);
+            let _ = sender.send_task_metrics_best_effort(metrics).await;
+        } else if self.this_proc == 0 {
+            self.inbound_receiver
+                .route_task_metrics(stage_id, task_number, metrics.clone());
+        }
+    }
+
+    /// Fail all local and remote channels on this proc's drain handle with `reason`.
+    pub fn fail_local_scope(&self, reason: &str) {
+        self.inbound_receiver.fail_scope(reason);
+    }
+
+    /// True once all remote producer processes have detached their senders from this proc's
+    /// ring (or when `n_procs <= 1`, where there are no remote producer processes).
+    pub fn all_remote_producers_detached(&self) -> bool {
+        self.n_procs <= 1 || self.inbound_receiver.is_data_detached()
+    }
+
+    /// Number of participating worker procs (`= n_procs`, since the leader `proc 0` also
+    /// participates alongside `1..n_procs`). Used as the modulus in [`proc_for_task`].
     pub fn n_workers(&self) -> u32 {
         debug_assert!(
-            self.n_procs >= 2,
-            "MppMesh::n_workers() called with n_procs={} (< 2); the embedder must gate on \
-             n_procs >= 2",
+            self.n_procs >= 1,
+            "MppMesh::n_workers() called with n_procs={} (< 1)",
             self.n_procs
         );
-        self.n_procs - 1
+        self.n_procs
     }
 
     /// Pull from the single inbound handle. Called from

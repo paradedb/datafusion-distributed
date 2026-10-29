@@ -1,4 +1,4 @@
-#[cfg(all(feature = "tpch", test))]
+#[cfg(all(feature = "integration", feature = "tpch", test))]
 mod tests {
     use datafusion::physical_plan::execute_stream;
     use datafusion::prelude::SessionContext;
@@ -206,15 +206,15 @@ mod tests {
     static INIT_TEST_TPCH_TABLES: OnceCell<()> = OnceCell::const_new();
 
     pub async fn ensure_tpch_data(sf: f64, parts: usize) -> std::path::PathBuf {
-        let data_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("testdata/tpch/correctness_sf{sf}"));
+        let data_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("testdata/tpch/sorted_correctness_sf{sf}"));
         INIT_TEST_TPCH_TABLES
             .get_or_init(|| async {
                 if !fs::exists(&data_dir).unwrap() {
                     let output = DatasetOutput::new(data_dir.to_str().unwrap())
                         .await
                         .unwrap();
-                    tpch::generate_data(&output, sf, parts, false)
+                    tpch::generate_data(&output, sf, parts, true)
                         .await
                         .expect("Failed to generate TPC-H data");
                 }

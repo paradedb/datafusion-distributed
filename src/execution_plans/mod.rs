@@ -8,9 +8,7 @@ mod network_coalesce;
 mod network_shuffle;
 mod sampler;
 
-// The benchmark fixtures spin up real gRPC workers (`tonic` servers, Flight channels), so they
-// only exist when that transport is compiled in.
-#[cfg(all(feature = "grpc", any(test, feature = "integration")))]
+#[cfg(any(test, feature = "integration"))]
 pub mod benchmarks;
 
 pub use broadcast::BroadcastExec;
@@ -19,5 +17,7 @@ pub use distributed_leaf::DistributedLeafExec;
 pub(crate) use metrics::MetricsWrapperExec;
 pub use network_broadcast::NetworkBroadcastExec;
 pub use network_coalesce::NetworkCoalesceExec;
-pub use network_shuffle::{NetworkShuffleExec, PRODUCER_SALT_DEFAULT, ShuffleMode};
+#[cfg(any(test, feature = "integration"))]
+pub use network_shuffle::PRODUCER_SALT_DEFAULT;
+pub use network_shuffle::{NetworkShuffleExec, ShuffleMode};
 pub use sampler::SamplerExec;

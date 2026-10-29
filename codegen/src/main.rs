@@ -17,15 +17,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn generate_worker(repo_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let proto_dir = repo_root.join("src/protocol/grpc");
     let proto_file = proto_dir.join("worker.proto");
-    let out_dir = repo_root.join("src/protocol/generated");
+    let out_dir = proto_dir.join("generated");
 
     fs::create_dir_all(&out_dir)?;
 
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .client_mod_attribute(".", "#[cfg(feature = \"grpc\")]")
-        .server_mod_attribute(".", "#[cfg(feature = \"grpc\")]")
         .out_dir(out_dir)
         .extern_path(".worker.FlightData", "::arrow_flight::FlightData")
         .extern_path(
@@ -74,7 +72,7 @@ fn generate_observability(repo_root: &Path) -> Result<(), Box<dyn std::error::Er
         .out_dir(out_dir)
         .extern_path(
             ".observability.TaskKey",
-            "crate::protocol::generated::worker::TaskKey",
+            "crate::protocol::grpc::generated::worker::TaskKey",
         )
         .compile_protos(&[proto_file], &[proto_dir])?;
 

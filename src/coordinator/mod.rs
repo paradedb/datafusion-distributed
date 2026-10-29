@@ -9,4 +9,4 @@ mod store;
 
 pub use distributed::DistributedExec;
 pub(crate) use dynamic_filter_registry::DynamicFilterRegistry;
-pub use store::{MetricsStore, Store};
+pub(crate) use store::Store;

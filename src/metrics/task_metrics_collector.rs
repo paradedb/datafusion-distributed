@@ -19,8 +19,7 @@ pub fn collect_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<Metrics
     Ok(metrics)
 }
 
-// These tests execute over the in-memory gRPC transport, so they need that transport compiled in.
-#[cfg(all(test, feature = "grpc"))]
+#[cfg(test)]
 mod tests {
 
     use super::*;

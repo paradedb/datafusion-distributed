@@ -214,8 +214,7 @@ pub(crate) fn orphan_dynamic_filter_consumers(
         .collect())
 }
 
-// These tests execute over localhost gRPC transport, so they need that transport compiled in.
-#[cfg(all(test, feature = "grpc"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::localhost::start_localhost_context;

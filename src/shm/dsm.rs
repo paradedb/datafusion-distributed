@@ -185,8 +185,8 @@ pub(super) fn compute_dsm_layout(
     queue_bytes: usize,
     plan_len: usize,
 ) -> Result<DsmLayout, &'static str> {
-    if n_procs < 1 {
-        return Err("mpp: n_procs must be >= 1");
+    if n_procs < 2 {
+        return Err("mpp: n_procs must be >= 2 (leader + at least one worker)");
     }
     // MAXALIGN-round-down first (operator-friendly), then round up to the ring's
     // 64-byte alignment requirement. Doing it in this order means each per-inbox
@@ -259,11 +259,6 @@ pub(super) struct ProcAttach {
     /// `outbound_senders[i]` writes to peer `peer_proc_for_index(this_proc, i)`'s inbox.
     /// `peer_proc(i) = i if i < this_proc else i + 1` skips the self-loop entry.
     pub(super) outbound_senders: Vec<DsmMpscSender>,
-    /// Sender to this process's own inbox (`counts_as_data: false`), present in single-process
-    /// mode (`attach_senders && n_procs == 1`) so self-routed data/control frames serialize
-    /// through `DsmMpscRing` without masking remote peer detachment. When `n_procs > 1`, same-proc
-    /// traffic uses the zero-copy in-memory fast path instead.
-    pub(super) self_sender: Option<DsmMpscSender>,
     /// This process's own MPSC inbox receiver. Drained inline by `DrainHandle`.
     pub(super) inbound_receiver: DsmMpscReceiver,
     pub(super) alive: AliveFlag,
@@ -378,7 +373,7 @@ unsafe fn attach_proc(
     wakeup: Arc<dyn Wakeup>,
 ) -> ProcAttach {
     let n_procs = header.n_procs;
-    let peer_count = n_procs.saturating_sub(1) as usize;
+    let peer_count = (n_procs - 1) as usize;
     let mut outbound_senders = Vec::with_capacity(if attach_senders { peer_count } else { 0 });
 
     let (ring_slots, slot_capacity) = ring_dims_for(header.queue_bytes as usize);
@@ -387,7 +382,7 @@ unsafe fn attach_proc(
     let alive = Arc::new(AtomicBool::new(true));
 
     if attach_senders {
-        for peer_idx in 0..n_procs.saturating_sub(1) {
+        for peer_idx in 0..(n_procs - 1) {
             let r = peer_proc_for_index(this_proc, peer_idx);
             let off = header.inbox_offset(r) as usize;
             let inbox_addr = unsafe { base.add(off) };
@@ -405,16 +400,10 @@ unsafe fn attach_proc(
     let own_inbox_addr = unsafe { base.add(own_off) };
     let own_nn = unsafe { mpsc_ring::attach_at(own_inbox_addr, ring_slots, slot_capacity) }
         .expect("DsmMpscRing attach_at: own inbox must validate");
-    let self_sender = if attach_senders && n_procs == 1 {
-        Some(unsafe { DsmMpscSender::new_control(own_nn, Arc::clone(&wakeup), Arc::clone(&alive)) })
-    } else {
-        None
-    };
     let inbound_receiver = unsafe { DsmMpscReceiver::new(own_nn, Arc::clone(&alive)) };
 
     ProcAttach {
         outbound_senders,
-        self_sender,
         inbound_receiver,
         alive,
     }

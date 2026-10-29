@@ -685,9 +685,9 @@ impl DsmMpscSender {
         }
     }
 
-    /// Wrap an already-initialized ring as a control or self-loop sender. Does NOT increment
-    /// `sender_count`, so it doesn't prevent the consumer from detecting when all remote data
-    /// producers drop.
+    /// Wrap an already-initialized ring as a control sender. Does NOT increment `sender_count`,
+    /// so it doesn't prevent the consumer from detecting when all true data producers drop.
+    #[cfg(test)]
     pub(super) unsafe fn new_control(
         ring: NonNull<DsmMpscRingHeader>,
         wakeup: Arc<dyn Wakeup>,

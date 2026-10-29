@@ -75,19 +75,19 @@ pub unsafe fn region_total(base: *const c_void) -> usize {
     unsafe { read_region_total(base) as usize }
 }
 
-/// Wrap each peer-indexed `DsmMpscSender` (plus the optional `self_sender`) into an outbound
-/// `MppSender` keyed by destination proc. The dispatcher `clone_with_header`s these per output
-/// partition before sending, so the placeholder header is never observed on the wire.
+/// Wrap each peer-indexed `DsmMpscSender` into an outbound `MppSender` keyed by destination proc.
+/// The dispatcher `clone_with_header`s these per output partition before sending, so the
+/// placeholder header is never observed on the wire. Slot `this_proc` stays `None` because
+/// local communication routes in-process via `LocalWorkerContext`.
 ///
 /// Returns `(data, cancel)`. `data` is the producer's output senders. `cancel` is a control-plane
-/// sibling onto each inbox, used by [`MppMesh::cancel_stream`]: a consumer reaches its producer
+/// sibling onto each peer inbox, used by [`MppMesh::cancel_stream`]: a consumer reaches its producer
 /// without counting as one of that producer's data senders, so a held `Cancel` sender never masks
 /// the producer-gone `detached` signal.
 fn build_outbound_senders(
     this_proc: u32,
     total_procs: u32,
     peer_senders: Vec<DsmMpscSender>,
-    self_sender: Option<DsmMpscSender>,
 ) -> (Vec<Option<MppSender>>, Vec<Option<MppSender>>) {
     let mut senders: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
     let mut cancel: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
@@ -113,19 +113,6 @@ fn build_outbound_senders(
             shared,
             // Stamp `sender_proc = this_proc` so a stray frame that escapes the dispatcher's
             // `clone_with_header` overwrite still identifies its origin on the drain side.
-            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), this_proc),
-        ));
-    }
-    if let Some(dsm_send) = self_sender {
-        let control: Arc<dyn BatchChannelSender> =
-            Arc::new(DsmInboxSender::new(dsm_send.to_control()));
-        cancel[this_proc as usize] = Some(MppSender::with_header(
-            control,
-            MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), this_proc),
-        ));
-        let shared: Arc<dyn BatchChannelSender> = Arc::new(DsmInboxSender::new(dsm_send));
-        senders[this_proc as usize] = Some(MppSender::with_header(
-            shared,
             MppFrameHeader::batch(MppDataStreamKey::new(0, 0, 0), this_proc),
         ));
     }
@@ -190,11 +177,11 @@ pub unsafe fn leader_setup(
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(
-        DrainHandle::cooperative(vec![MppReceiver::new(Box::new(inbox))]).with_own_proc(0),
-    );
+    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
+        inbox,
+    ))]));
     let (outbound_senders, cancel_senders) =
-        build_outbound_senders(0, n_procs, attach.outbound_senders, attach.self_sender);
+        build_outbound_senders(0, n_procs, attach.outbound_senders);
     let mesh = Arc::new(MppMesh::new(0, n_procs, inbound, interrupt, attach.alive));
     mesh.set_cancel_senders(Arc::new(std::sync::Mutex::new(cancel_senders)));
     let worker = attach_senders.then(|| WorkerSession {
@@ -298,18 +285,13 @@ pub unsafe fn worker_setup(
             .map_err(DataFusionError::Internal)?;
     let total_procs = header.n_procs;
 
-    let (outbound, cancel) = build_outbound_senders(
-        proc_idx,
-        total_procs,
-        attach.outbound_senders,
-        attach.self_sender,
-    );
+    let (outbound, cancel) = build_outbound_senders(proc_idx, total_procs, attach.outbound_senders);
 
     let inbox = DsmInboxReceiver::new(attach.inbound_receiver);
     inbox.set_receiver(receiver_token);
-    let inbound = Arc::new(
-        DrainHandle::cooperative(vec![MppReceiver::new(Box::new(inbox))]).with_own_proc(proc_idx),
-    );
+    let inbound = Arc::new(DrainHandle::cooperative(vec![MppReceiver::new(Box::new(
+        inbox,
+    ))]));
     let mesh = Arc::new(MppMesh::new(
         proc_idx,
         total_procs,
@@ -425,23 +407,24 @@ fn open_partition_sinks(
             )
         })?;
         let stream_key = MppDataStreamKey::new(task.stage_id, task.task_number, q_u32);
-        if let Some(base) = outbound_senders
-            .get(dest_proc as usize)
-            .and_then(|s| s.as_ref())
-        {
+        if dest_proc == mesh.this_proc {
+            sinks.push(mesh.open_local_partition_sink(stream_key));
+        } else {
+            let base = outbound_senders
+                .get(dest_proc as usize)
+                .and_then(|s| s.as_ref())
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "shm transport: outbound_senders[{dest_proc}] is None (unattached); \
+                         stage_id={} task_number={}",
+                        task.stage_id,
+                        task.task_number
+                    )
+                })?;
             sinks.push(Box::new(MppPartitionSink::new(
                 base.clone_with_header(MppFrameHeader::batch(stream_key, mesh.this_proc))
                     .with_cooperative_drain(Arc::clone(mesh) as Arc<dyn CooperativeDrainSet>),
             )));
-        } else if dest_proc == mesh.this_proc {
-            sinks.push(mesh.open_local_partition_sink(stream_key));
-        } else {
-            return Err(internal_datafusion_err!(
-                "shm transport: outbound_senders[{dest_proc}] is None (unattached); \
-                 stage_id={} task_number={}",
-                task.stage_id,
-                task.task_number
-            ));
         }
     }
     Ok(sinks)

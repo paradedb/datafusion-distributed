@@ -159,27 +159,20 @@ impl MppMesh {
         frame: SetPlanFrame,
     ) -> Result<()> {
         let dest_proc = proc_for_task(self.n_workers(), task_number);
+        if dest_proc == self.this_proc {
+            self.inbound_receiver
+                .route_set_plan(stage_id, task_number, frame);
+            return Ok(());
+        }
         let sender = {
             let guard = self.cancel_senders.lock().unwrap();
             let Some(senders) = guard.as_ref() else {
-                if dest_proc == self.this_proc {
-                    self.inbound_receiver
-                        .route_set_plan(stage_id, task_number, frame);
-                    return Ok(());
-                }
                 return internal_err!(
                     "shm mesh: control senders not installed; cannot route SetPlan"
                 );
             };
             let senders = senders.lock().unwrap();
             let Some(Some(base)) = senders.get(dest_proc as usize) else {
-                if dest_proc == self.this_proc {
-                    drop(senders);
-                    drop(guard);
-                    self.inbound_receiver
-                        .route_set_plan(stage_id, task_number, frame);
-                    return Ok(());
-                }
                 return internal_err!("shm mesh: no control sender for proc {dest_proc}");
             };
             base.clone_with_header(MppFrameHeader::set_plan(stage_id, task_number, 0))
@@ -198,35 +191,20 @@ impl MppMesh {
         frame: crate::shm::transport::ExecuteTaskFrame,
     ) -> Result<()> {
         let dest_proc = proc_for_task(self.n_workers(), task_number);
+        if dest_proc == self.this_proc {
+            self.inbound_receiver
+                .route_execute_task(stage_id, task_number, self.this_proc, frame);
+            return Ok(());
+        }
         let sender = {
             let guard = self.cancel_senders.lock().unwrap();
             let Some(senders) = guard.as_ref() else {
-                if dest_proc == self.this_proc {
-                    self.inbound_receiver.route_execute_task(
-                        stage_id,
-                        task_number,
-                        self.this_proc,
-                        frame,
-                    );
-                    return Ok(());
-                }
                 return internal_err!(
                     "shm mesh: control senders not installed; cannot route ExecuteTask"
                 );
             };
             let senders = senders.lock().unwrap();
             let Some(Some(base)) = senders.get(dest_proc as usize) else {
-                if dest_proc == self.this_proc {
-                    drop(senders);
-                    drop(guard);
-                    self.inbound_receiver.route_execute_task(
-                        stage_id,
-                        task_number,
-                        self.this_proc,
-                        frame,
-                    );
-                    return Ok(());
-                }
                 return internal_err!("shm mesh: no control sender for proc {dest_proc}");
             };
             base.clone_with_header(crate::shm::transport::MppFrameHeader::execute_task(
@@ -260,6 +238,7 @@ impl MppMesh {
     pub fn cancel_stream(&self, producer_proc: u32, stream: MppDataStreamKey) {
         if producer_proc == self.this_proc {
             self.inbound_receiver.cancel_local_stream(stream);
+            return;
         }
         let guard = self.cancel_senders.lock().unwrap();
         let Some(senders) = guard.as_ref() else {
@@ -353,8 +332,7 @@ impl MppMesh {
     }
 
     /// Best-effort delivery of a fragment's `TaskMetrics` to the leader (`proc 0`).
-    /// Uses `outbound_senders[0]` when present, or routes in-process when `this_proc == 0`
-    /// and no self-sender is attached.
+    /// Uses `outbound_senders[0]` on worker procs, or routes in-process when `this_proc == 0`.
     pub async fn send_task_metrics_best_effort(
         self: &Arc<Self>,
         outbound_senders: &[Option<MppSender>],
@@ -383,17 +361,18 @@ impl MppMesh {
     }
 
     /// True once all remote producer processes have detached their senders from this proc's
-    /// ring (or when `n_procs <= 1`, where there are no remote producer processes).
+    /// ring.
     pub fn all_remote_producers_detached(&self) -> bool {
-        self.n_procs <= 1 || self.inbound_receiver.is_data_detached()
+        self.inbound_receiver.is_data_detached()
     }
 
     /// Number of participating worker procs (`= n_procs`, since the leader `proc 0` also
     /// participates alongside `1..n_procs`). Used as the modulus in [`proc_for_task`].
     pub fn n_workers(&self) -> u32 {
         debug_assert!(
-            self.n_procs >= 1,
-            "MppMesh::n_workers() called with n_procs={} (< 1)",
+            self.n_procs >= 2,
+            "MppMesh::n_workers() called with n_procs={} (< 2); the embedder must gate on \
+             n_procs >= 2",
             self.n_procs
         );
         self.n_procs

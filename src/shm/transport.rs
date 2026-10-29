@@ -1873,9 +1873,6 @@ pub struct DrainHandle {
     /// that stream cleanly, so a consumer that stopped reading early doesn't leave it spinning to
     /// the statement timeout.
     cancelled_streams: Mutex<HashSet<MppDataStreamKey>>,
-    /// This process's `proc_idx` when known. Frames whose `sender_proc` matches `own_proc`
-    /// are routed into `channel_buffers.local` so self-loop streams survive remote peer detachment.
-    own_proc: Option<u32>,
 }
 
 #[derive(Default)]
@@ -1976,13 +1973,7 @@ impl DrainHandle {
             set_plan_registry: Mutex::new(SetPlanRegistry::default()),
             execute_task_registry: Mutex::new(ExecuteTaskRegistry::default()),
             cancelled_streams: Mutex::new(HashSet::default()),
-            own_proc: None,
         }
-    }
-
-    pub(super) fn with_own_proc(mut self, own_proc: u32) -> Self {
-        self.own_proc = Some(own_proc);
-        self
     }
 
     /// Record a `Cancel` frame: the consumer abandoned this data stream, so this proc's producer
@@ -1998,9 +1989,8 @@ impl DrainHandle {
     }
 
     /// Cancel a stream buffer for a local channel where both producer and consumer reside
-    /// on this proc.
+    /// on this proc, bypassing DSM.
     pub(super) fn cancel_local_stream(&self, stream: MppDataStreamKey) {
-        self.note_cancel(stream);
         let guard = self
             .channel_buffers
             .lock()
@@ -2429,19 +2419,13 @@ impl DrainHandle {
             for _ in 0..MAX_BATCHES_PER_SOURCE_PER_PASS {
                 match rx.try_recv_batch() {
                     RecvBatchOutcome::Batch { header, batch } => {
-                        let buf = if self.own_proc == Some(header.sender_proc()) {
-                            self.register_local_channel(header.data_stream())
-                        } else {
-                            self.register_data_channel(header.sender_proc(), header.data_stream())
-                        };
+                        let buf =
+                            self.register_data_channel(header.sender_proc(), header.data_stream());
                         buf.push_batch(batch);
                     }
                     RecvBatchOutcome::Eof { header } => {
-                        let buf = if self.own_proc == Some(header.sender_proc()) {
-                            self.register_local_channel(header.data_stream())
-                        } else {
-                            self.register_data_channel(header.sender_proc(), header.data_stream())
-                        };
+                        let buf =
+                            self.register_data_channel(header.sender_proc(), header.data_stream());
                         buf.notify_source_done();
                         // Other channels may still flow on this queue, so the receiver slot
                         // stays live.

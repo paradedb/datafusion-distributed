@@ -241,12 +241,18 @@ mod tests {
         AfterBuffering,
     }
 
-    #[test_case(DropWhen::BeforeSetup; "before_setup")]
-    #[test_case(DropWhen::AfterSetup; "after_setup")]
-    #[test_case(DropWhen::AfterBuffering; "after_buffering")]
+    #[test_case(DropWhen::BeforeSetup, true; "before_setup_lazy")]
+    #[test_case(DropWhen::AfterSetup, true; "after_setup_lazy")]
+    #[test_case(DropWhen::AfterBuffering, true; "after_buffering_lazy")]
+    #[test_case(DropWhen::BeforeSetup, false; "before_setup_eager")]
+    #[test_case(DropWhen::AfterSetup, false; "after_setup_eager")]
+    #[test_case(DropWhen::AfterBuffering, false; "after_buffering_eager")]
     #[tokio::test]
-    async fn abandoned_probe_does_not_block_sibling(when: DropWhen) -> Result<()> {
-        let fixture = Fixture::new().await?;
+    async fn abandoned_probe_does_not_block_sibling(
+        when: DropWhen,
+        remote_dynamic_filters: bool,
+    ) -> Result<()> {
+        let fixture = Fixture::new_with_remote_dynamic_filters(remote_dynamic_filters).await?;
         let idle = fixture.stream(0)?;
         let mut active = Box::pin(fixture.stream(1)?.try_collect::<Vec<_>>());
         match when {
@@ -320,6 +326,10 @@ mod tests {
 
     impl Fixture {
         async fn new() -> Result<Self> {
+            Self::new_with_remote_dynamic_filters(true).await
+        }
+
+        async fn new_with_remote_dynamic_filters(remote_dynamic_filters: bool) -> Result<Self> {
             let batch = RecordBatch::try_from_iter([(
                 "id",
                 Arc::new(Int32Array::from_iter_values(0..1024)) as _,
@@ -336,6 +346,7 @@ mod tests {
             let ctx = SessionContext::new()
                 .with_distributed_option_extension(DistributedConfig::default())
                 .with_distributed_channel_resolver(DefaultChannelResolver::default())
+                .with_distributed_remote_dynamic_filters(remote_dynamic_filters)?
                 .with_distributed_worker_connection_buffer_budget_bytes(128)?
                 .task_ctx();
             let stage = RemoteStage {

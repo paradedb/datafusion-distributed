@@ -1,7 +1,7 @@
 use super::errors::{datafusion_error_to_tonic_status, map_status_to_datafusion_error};
+use super::generated::worker as pb;
+use super::metrics_proto::df_metrics_set_to_proto;
 use super::spawn_select_all::spawn_select_all;
-use crate::protocol::generated::worker as pb;
-use crate::protocol::metrics_proto::df_metrics_set_to_proto;
 
 use crate::common::{deserialize_uuid, now_ns};
 use crate::protocol::grpc::{ObservabilityServiceImpl, ObservabilityServiceServer};
@@ -477,6 +477,15 @@ fn build_flight_data_stream(
 fn garbage_collect_arrays(
     batch: RecordBatch,
 ) -> datafusion::common::Result<RecordBatch, DataFusionError> {
+    let needs_gc = batch.columns().iter().any(|array| {
+        array.as_any_dictionary_opt().is_some()
+            || array.as_string_view_opt().is_some()
+            || array.as_binary_view_opt().is_some()
+    });
+    if !needs_gc {
+        return Ok(batch);
+    }
+
     let (schema, arrays, row_count) = batch.into_parts();
 
     let arrays = arrays

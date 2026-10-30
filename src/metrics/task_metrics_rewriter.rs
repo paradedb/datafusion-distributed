@@ -322,8 +322,7 @@ pub fn stage_metrics_rewriter(
         .map(|v| v.data)
 }
 
-// These tests execute over the in-memory gRPC transport, so they need that transport compiled in.
-#[cfg(all(test, feature = "grpc"))]
+#[cfg(test)]
 mod tests {
     use crate::DistributedExt;
     use crate::metrics::DISTRIBUTED_DATAFUSION_TASK_ID_LABEL;

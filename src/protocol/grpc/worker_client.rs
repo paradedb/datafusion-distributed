@@ -1,17 +1,17 @@
 use super::channel_resolver::BoxCloneSyncChannel;
 use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
+use super::generated::worker as pb;
+use super::metrics_proto::metrics_set_proto_to_df;
 use crate::common::{RetryOutcome, on_drop_stream, serialize_uuid};
 use crate::grpc::errors::tonic_status_to_datafusion_error;
-use crate::protocol::generated::worker as pb;
-use crate::protocol::generated::worker::FlightAppMetadata;
-use crate::protocol::metrics_proto::decode_task_metrics;
+use crate::grpc::generated::worker::FlightAppMetadata;
 use crate::{
     BytesMetricExt, CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL,
     DistributedConfig, ExecuteTaskRequest, FirstLatencyMetric, GetWorkerInfoRequest,
     GetWorkerInfoResponse, LatencyMetricExt, LoadInfo, MaxLatencyMetric, MaybeEncoded,
     MinLatencyMetric, P50LatencyMetric, P95LatencyMetric, ProducedDynamicFilter, ProducerHead,
-    SetPlanRequest, TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, WorkUnitBatch,
-    WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
+    SetPlanRequest, TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics,
+    WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
 };
 use arrow_flight::FlightData;
 use arrow_flight::decode::FlightRecordBatchStream;
@@ -149,6 +149,12 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
     ) -> Result<Vec<BoxStream<'static, Result<RecordBatch>>>> {
         let d_cfg = DistributedConfig::from_session_config(ctx.session_config())?;
         let buffer_budget_bytes = d_cfg.worker_connection_buffer_budget_bytes;
+        // Defer starting the remote task until the first poll when remote dynamic filtering
+        // or dynamic task-count sampling is enabled, so build-side filters and sampling gates
+        // can complete before probe stages execute. When both are disabled, start pulling into
+        // the bounded connection buffer immediately to overlap upstream stage execution with
+        // downstream build-side work.
+        let wait_for_first_poll = d_cfg.remote_dynamic_filters || d_cfg.dynamic_task_count;
 
         // We are retaining record batches in memory until they are consumed, so we need to account
         // for them in the memory pool.
@@ -214,21 +220,23 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
         // fan them out to the appropriate `per_partition_rx` based on the "partition" declared
         // in each individual record batch flight metadata.
         let task = SpawnedTask::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    // If all SendableRecordBatchStreams canceled before any poll, we need to
-                    // anyway trigger the task execution and cancel it immediately so that the
-                    // cancellation is propagated also in the remote worker. Otherwise, it might
-                    // hang forever waiting for someone to execute it.
-                    let _ = self_clone.execute_task(Request::from_parts(
-                        metadata_for_task,
-                        Extensions::default(),
-                        request_for_task,
-                    )).await;
-                    return
-                },
-                _ = first_poll_notify_for_task.notified() => {}
+            if wait_for_first_poll {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        // If all SendableRecordBatchStreams canceled before any poll, we need to
+                        // anyway trigger the task execution and cancel it immediately so that the
+                        // cancellation is propagated also in the remote worker. Otherwise, it might
+                        // hang forever waiting for someone to execute it.
+                        let _ = self_clone.execute_task(Request::from_parts(
+                            metadata_for_task,
+                            Extensions::default(),
+                            request_for_task,
+                        )).await;
+                        return
+                    },
+                    _ = first_poll_notify_for_task.notified() => {}
+                }
             }
 
             let request = Request::from_parts(
@@ -632,6 +640,21 @@ fn decode_task_completed_dynamic_filters(
                 expression: MaybeEncoded::Encoded(filter.expression_proto),
             })
             .collect(),
+    })
+}
+
+fn decode_task_metrics(task_metrics: pb::TaskMetrics) -> Result<TaskMetrics> {
+    Ok(TaskMetrics {
+        pre_order_plan_metrics: task_metrics
+            .pre_order_plan_metrics
+            .into_iter()
+            .map(metrics_set_proto_to_df)
+            .collect::<Result<_>>()?,
+        task_metrics: metrics_set_proto_to_df(
+            task_metrics
+                .task_metrics
+                .ok_or_else(|| missing("task_metrics"))?,
+        )?,
     })
 }
 

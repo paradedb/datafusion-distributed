@@ -477,6 +477,15 @@ fn build_flight_data_stream(
 fn garbage_collect_arrays(
     batch: RecordBatch,
 ) -> datafusion::common::Result<RecordBatch, DataFusionError> {
+    let needs_gc = batch.columns().iter().any(|array| {
+        array.as_any_dictionary_opt().is_some()
+            || array.as_string_view_opt().is_some()
+            || array.as_binary_view_opt().is_some()
+    });
+    if !needs_gc {
+        return Ok(batch);
+    }
+
     let (schema, arrays, row_count) = batch.into_parts();
 
     let arrays = arrays

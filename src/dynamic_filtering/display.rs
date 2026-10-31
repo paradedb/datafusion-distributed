@@ -153,15 +153,37 @@ pub(crate) fn sever_dynamic_filter_relationships_in_plan_for_display(
             return Ok(Transformed::no(node));
         };
 
+        let mut any_changed = false;
         let variants = leaf
             .variants()
             .iter()
             .map(|variant| {
-                let variant = roundtrip_pb(Arc::clone(variant), task_ctx)?;
+                // Only proto-roundtrip variants that actually contain dynamic filter consumers;
+                // leaf variants without dynamic filter consumers have no shared
+                // DynamicFilterPhysicalExpr state to sever and can be kept as-is, avoiding
+                // unnecessary extension-node roundtrips.
+                let has_consumers = !discover_dynamic_filter_consumers(variant)?
+                    .consumers
+                    .is_empty();
+                let variant = if has_consumers {
+                    any_changed = true;
+                    roundtrip_pb(Arc::clone(variant), task_ctx)?
+                } else {
+                    Arc::clone(variant)
+                };
                 // The variant can have a SortExec
-                isolate_sort_dynamic_filters_for_display(variant, task_ctx)
+                let isolated =
+                    isolate_sort_dynamic_filters_for_display(Arc::clone(&variant), task_ctx)?;
+                if !Arc::ptr_eq(&isolated, &variant) {
+                    any_changed = true;
+                }
+                Ok(isolated)
             })
             .collect::<Result<Vec<_>>>()?;
+
+        if !any_changed {
+            return Ok(Transformed::no(node));
+        }
 
         Ok(Transformed::yes(Arc::new(DistributedLeafExec::try_new(
             Arc::clone(leaf.original()),

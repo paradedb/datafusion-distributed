@@ -70,8 +70,8 @@ impl Worker {
         let (dynamic_filters_error_tx, dynamic_filters_error_rx) = channel(1);
         let (w2c_stream_tx, w2c_stream_rx) = oneshot::channel();
 
-        let mut cfg = self
-            .base_session_state
+        let base_session_state = self.base_session_state();
+        let mut cfg = base_session_state
             .config()
             .clone()
             .with_extension(Arc::new(remote_work_unit_feed_registry.receivers))
@@ -96,7 +96,7 @@ impl Worker {
         let session_state = self
             .session_builder
             .build_session_state(WorkerQueryContext {
-                builder: SessionStateBuilder::new_from_existing(self.base_session_state.clone())
+                builder: SessionStateBuilder::new_from_existing(base_session_state.clone())
                     .with_config(cfg)
                     .with_runtime_env(Arc::clone(&self.runtime)),
                 headers,

@@ -35,7 +35,9 @@ pub struct Worker {
     pub(super) runtime: Arc<RuntimeEnv>,
     /// Pre-built base [SessionState] cloned per task via [SessionStateBuilder::new_from_existing]
     /// so default functions and registries are not re-allocated on every task setup.
-    pub(super) base_session_state: SessionState,
+    /// When `None`, lazily falls back to [DEFAULT_BASE_SESSION_STATE] so callers that supply
+    /// a custom state via [Self::with_base_session_state] never pay to initialize the default one.
+    pub(super) base_session_state: Option<SessionState>,
     /// Shares task state across partition requests. Coordinator-channel termination releases
     /// the stored task resources; time-to-idle eviction provides fallback cleanup for entries
     /// left by abandoned setup requests.
@@ -52,7 +54,7 @@ impl Default for Worker {
         let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
         Self {
             runtime: Arc::new(RuntimeEnv::default()),
-            base_session_state: DEFAULT_BASE_SESSION_STATE.clone(),
+            base_session_state: None,
             task_data_entries: Arc::new(cache),
             session_builder: Arc::new(DefaultSessionBuilder),
             max_message_size: Some(usize::MAX),
@@ -81,8 +83,14 @@ impl Worker {
     /// Pre-registering static UDFs, UDAFs, UDWFs, and config extensions on `base_session_state`
     /// avoids re-building them on every task setup.
     pub fn with_base_session_state(mut self, base_session_state: SessionState) -> Self {
-        self.base_session_state = base_session_state;
+        self.base_session_state = Some(base_session_state);
         self
+    }
+
+    pub(super) fn base_session_state(&self) -> &SessionState {
+        self.base_session_state
+            .as_ref()
+            .unwrap_or(&DEFAULT_BASE_SESSION_STATE)
     }
 
     /// Sets a [RuntimeEnv] to be used in all the queries this [Worker] will handle during

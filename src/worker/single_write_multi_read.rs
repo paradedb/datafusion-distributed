@@ -13,7 +13,16 @@ use tokio::sync::watch;
 pub struct SingleWriteMultiRead<T: Clone> {
     tx: watch::Sender<Option<T>>,
     rx: watch::Receiver<Option<T>>,
-    read_started: Mutex<bool>,
+    state: Mutex<SingleWriteMultiReadState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WriteGeneration(u64);
+
+#[derive(Default)]
+struct SingleWriteMultiReadState {
+    read_started: bool,
+    latest_reserved_generation: WriteGeneration,
 }
 
 impl<T: Clone> Default for SingleWriteMultiRead<T> {
@@ -47,17 +56,37 @@ impl<T: Clone> SingleWriteMultiRead<T> {
         Self {
             tx,
             rx,
-            read_started: Mutex::new(false),
+            state: Mutex::new(SingleWriteMultiReadState::default()),
         }
     }
 
-    /// Write the value. A written but unconsumed value may be replaced. Once a reader has begun
-    /// consuming the value, further writes fail.
-    pub(crate) fn write(&self, item: T) -> Result<(), SingleWriteMultiReadError> {
-        let read_started = self.read_started.lock().unwrap();
+    /// Reserves a monotonically increasing write generation before asynchronous setup begins.
+    ///
+    /// If a retry on the same worker starts before an earlier setup task finishes, the newer
+    /// attempt reserves a higher generation so the stale setup task will not overwrite it.
+    pub(crate) fn reserve_write(&self) -> WriteGeneration {
+        let mut state = self.state.lock().unwrap();
+        state.latest_reserved_generation = WriteGeneration(state.latest_reserved_generation.0 + 1);
+        state.latest_reserved_generation
+    }
+
+    /// Writes `item` if `generation` is still the latest reserved generation.
+    ///
+    /// Returns `Ok(true)` if the value was written, `Ok(false)` if a newer writer has already
+    /// reserved a later generation, or `Err(AlreadyWritten)` if a reader has already begun
+    /// consuming a previously written value.
+    pub(crate) fn write_generation(
+        &self,
+        generation: WriteGeneration,
+        item: T,
+    ) -> Result<bool, SingleWriteMultiReadError> {
+        let state = self.state.lock().unwrap();
+        if generation < state.latest_reserved_generation {
+            return Ok(false);
+        }
         let mut already_written = false;
         self.tx.send_modify(|v| {
-            if v.is_none() || !*read_started {
+            if v.is_none() || !state.read_started {
                 *v = Some(item);
             } else {
                 already_written = true;
@@ -66,24 +95,32 @@ impl<T: Clone> SingleWriteMultiRead<T> {
         if already_written {
             return Err(SingleWriteMultiReadError::AlreadyWritten);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Write the value. A written but unconsumed value may be replaced. Once a reader has begun
+    /// consuming the value, further writes fail.
+    #[cfg(any(feature = "integration", test))]
+    pub(crate) fn write(&self, item: T) -> Result<(), SingleWriteMultiReadError> {
+        let generation = self.reserve_write();
+        self.write_generation(generation, item).map(|_| ())
     }
 
     /// Seals the slot with `item` if `predicate` accepts its current value, preventing further writes.
     /// Returns `true` on replacement, or `false` if empty or the predicate rejects the value.
     /// The displaced value is dropped after releasing the slot's locks.
     pub(crate) fn seal_with_value_if(&self, predicate: impl FnOnce(&T) -> bool, item: T) -> bool {
-        let mut read_started = self.read_started.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let mut previous = None;
         let sealed = self.tx.send_if_modified(|value| {
             if !value.as_ref().is_some_and(predicate) {
                 return false;
             }
-            *read_started = true;
+            state.read_started = true;
             previous = value.replace(item);
             true
         });
-        drop(read_started);
+        drop(state);
         drop(previous);
         sealed
     }
@@ -91,7 +128,7 @@ impl<T: Clone> SingleWriteMultiRead<T> {
     /// Reads the current value, if any, not waiting for it to be set by a writer.
     #[cfg(feature = "grpc")]
     pub(crate) fn read_now(&self) -> Option<T> {
-        *self.read_started.lock().unwrap() = true;
+        self.state.lock().unwrap().read_started = true;
         self.rx.borrow().clone()
     }
 
@@ -100,7 +137,7 @@ impl<T: Clone> SingleWriteMultiRead<T> {
         &self,
         timeout_duration: Duration,
     ) -> Result<T, SingleWriteMultiReadError> {
-        *self.read_started.lock().unwrap() = true;
+        self.state.lock().unwrap().read_started = true;
         let mut rx = self.rx.clone();
         let result = tokio::time::timeout(timeout_duration, rx.wait_for(|v| v.is_some()))
             .await
@@ -218,5 +255,17 @@ mod tests {
         for handle in handles {
             assert_eq!(handle.await.unwrap(), 7);
         }
+    }
+
+    #[tokio::test]
+    async fn older_reserved_generation_does_not_overwrite_newer_generation() {
+        let swmr = SingleWriteMultiRead::new();
+        let gen1 = swmr.reserve_write();
+        let gen2 = swmr.reserve_write();
+
+        // Even if the newer attempt finishes first (or second), the older attempt must be ignored.
+        assert!(swmr.write_generation(gen2, 200).unwrap());
+        assert!(!swmr.write_generation(gen1, 100).unwrap());
+        assert_eq!(swmr.read(TIMEOUT).await.unwrap(), 200);
     }
 }

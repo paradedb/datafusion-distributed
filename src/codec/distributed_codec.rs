@@ -15,6 +15,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{Result, internal_datafusion_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use datafusion::physical_expr::equivalence::{EquivalenceClass, EquivalenceGroup};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -46,10 +47,35 @@ pub struct DistributedCodec;
 
 impl DistributedCodec {
     pub fn new_combined_with_user(cfg: &SessionConfig) -> ComposedPhysicalExtensionCodec {
-        let mut codecs: Vec<Arc<dyn PhysicalExtensionCodec>> = vec![Arc::new(DistributedCodec {})];
-        codecs.extend(get_distributed_user_codecs(cfg));
+        let user_codecs = get_distributed_user_codecs(cfg);
+        let mut codecs: Vec<Arc<dyn PhysicalExtensionCodec>> =
+            Vec::with_capacity(1 + user_codecs.len());
+        codecs.push(Arc::new(DistributedCodecWithUserCodecs {
+            user_codecs: user_codecs.clone(),
+        }));
+        codecs.extend(user_codecs);
         ComposedPhysicalExtensionCodec::new(codecs)
     }
+}
+
+/// Wraps [DistributedCodec] at index 0 of [ComposedPhysicalExtensionCodec] while delegating
+/// UDF, UDAF, and UDWF encoding/decoding to the registered user codecs.
+///
+/// This is necessary for three reasons in DataFusion's `ComposedPhysicalExtensionCodec`:
+/// 1. `PhysicalExtensionCodec::try_encode_udf` (and `udaf` / `udwf`) defaults to returning
+///    `Ok(())` with 0 bytes written. Because `ComposedPhysicalExtensionCodec` stops at the first
+///    codec returning `Ok(())`, a codec at index 0 that uses the default implementation prevents
+///    user codecs at indices `1..` from ever being called.
+/// 2. When a UDF/UDAF/UDWF is not in the worker's `FunctionRegistry` and has an empty payload
+///    (`fun_definition = None`), DataFusion's `from_proto` calls `codec.try_decode_udf(name, &[])`
+///    with an empty byte slice, which `DataEncoderTuple::decode` routes to `encoder_position = 0`.
+/// 3. When encoding or decoding expressions nested inside `NetworkShuffleExec`,
+///    `NetworkCoalesceExec`, or `NetworkBroadcastExec` (`partitioning`, `ordering`,
+///    `equivalence_classes`, `dynamic_filter_anchors`), passing `self` ensures user codecs are
+///    available for any custom UDFs inside those expressions.
+#[derive(Debug)]
+struct DistributedCodecWithUserCodecs {
+    user_codecs: Vec<Arc<dyn PhysicalExtensionCodec>>,
 }
 
 impl PhysicalExtensionCodec for DistributedCodec {
@@ -58,6 +84,132 @@ impl PhysicalExtensionCodec for DistributedCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        Self::try_decode_with_codec(buf, inputs, ctx, self, proto_converter)
+    }
+
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
+        Self::try_encode_with_codec(node, buf, self, proto_converter)
+    }
+}
+
+impl PhysicalExtensionCodec for DistributedCodecWithUserCodecs {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[Arc<dyn ExecutionPlan>],
+        ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        DistributedCodec::try_decode_with_codec(buf, inputs, ctx, self, proto_converter)
+    }
+
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
+        DistributedCodec::try_encode_with_codec(node, buf, self, proto_converter)
+    }
+
+    fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+        let mut last_err = None;
+        for codec in &self.user_codecs {
+            match codec.try_decode_udf(name, buf) {
+                Ok(udf) => return Ok(udf),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            DataFusionError::NotImplemented(format!(
+                "ScalarUDF '{name}' is not supported by any registered user PhysicalExtensionCodec"
+            ))
+        }))
+    }
+
+    fn try_encode_udf(&self, node: &ScalarUDF, buf: &mut Vec<u8>) -> Result<()> {
+        for codec in &self.user_codecs {
+            let start_len = buf.len();
+            match codec.try_encode_udf(node, buf) {
+                Ok(()) if buf.len() > start_len => return Ok(()),
+                Ok(()) | Err(DataFusionError::NotImplemented(_)) => buf.truncate(start_len),
+                Err(err) => return Err(err),
+            }
+        }
+        // Leave `buf` empty when no user codec encodes `node`; at `encoder_position = 0`,
+        // `DataEncoderTuple { encoder_position: 0, blob: [] }` encodes to 0 bytes so
+        // `fun_definition` remains `None` and built-in functions resolve by name on the worker.
+        Ok(())
+    }
+
+    fn try_decode_udaf(&self, name: &str, buf: &[u8]) -> Result<Arc<AggregateUDF>> {
+        let mut last_err = None;
+        for codec in &self.user_codecs {
+            match codec.try_decode_udaf(name, buf) {
+                Ok(udaf) => return Ok(udaf),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            DataFusionError::NotImplemented(format!(
+                "AggregateUDF '{name}' is not supported by any registered user PhysicalExtensionCodec"
+            ))
+        }))
+    }
+
+    fn try_encode_udaf(&self, node: &AggregateUDF, buf: &mut Vec<u8>) -> Result<()> {
+        for codec in &self.user_codecs {
+            let start_len = buf.len();
+            match codec.try_encode_udaf(node, buf) {
+                Ok(()) if buf.len() > start_len => return Ok(()),
+                Ok(()) | Err(DataFusionError::NotImplemented(_)) => buf.truncate(start_len),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn try_decode_udwf(&self, name: &str, buf: &[u8]) -> Result<Arc<WindowUDF>> {
+        let mut last_err = None;
+        for codec in &self.user_codecs {
+            match codec.try_decode_udwf(name, buf) {
+                Ok(udwf) => return Ok(udwf),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            DataFusionError::NotImplemented(format!(
+                "WindowUDF '{name}' is not supported by any registered user PhysicalExtensionCodec"
+            ))
+        }))
+    }
+
+    fn try_encode_udwf(&self, node: &WindowUDF, buf: &mut Vec<u8>) -> Result<()> {
+        for codec in &self.user_codecs {
+            let start_len = buf.len();
+            match codec.try_encode_udwf(node, buf) {
+                Ok(()) if buf.len() > start_len => return Ok(()),
+                Ok(()) | Err(DataFusionError::NotImplemented(_)) => buf.truncate(start_len),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DistributedCodec {
+    fn try_decode_with_codec(
+        buf: &[u8],
+        inputs: &[Arc<dyn ExecutionPlan>],
+        ctx: &TaskContext,
+        codec: &dyn PhysicalExtensionCodec,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let DistributedExecProto {
@@ -126,7 +278,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     .map(|s| s.try_into())
                     .ok_or(proto_error("NetworkShuffleExec is missing schema"))??;
 
-                let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self);
+                let decode_ctx = PhysicalPlanDecodeContext::new(ctx, codec);
                 let partitioning = parse_protobuf_partitioning(
                     partitioning.as_ref(),
                     &decode_ctx,
@@ -183,7 +335,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     .map(|s| s.try_into())
                     .ok_or(proto_error("NetworkCoalesceExec is missing schema"))??;
 
-                let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self);
+                let decode_ctx = PhysicalPlanDecodeContext::new(ctx, codec);
                 let partitioning = parse_protobuf_partitioning(
                     partitioning.as_ref(),
                     &decode_ctx,
@@ -231,7 +383,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     .map(|s| s.try_into())
                     .ok_or(proto_error("NetworkBroadcastExec is missing schema"))??;
 
-                let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self);
+                let decode_ctx = PhysicalPlanDecodeContext::new(ctx, codec);
                 let partitioning = parse_protobuf_partitioning(
                     partitioning.as_ref(),
                     &decode_ctx,
@@ -328,15 +480,15 @@ impl PhysicalExtensionCodec for DistributedCodec {
         }
     }
 
-    fn try_encode(
-        &self,
+    fn try_encode_with_codec(
         node: Arc<dyn ExecutionPlan>,
         buf: &mut Vec<u8>,
+        codec: &dyn PhysicalExtensionCodec,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
         fn encode_stage_proto(
             stage: &Stage,
-            codec: &DistributedCodec,
+            codec: &dyn PhysicalExtensionCodec,
             proto_converter: &dyn PhysicalProtoConverterExtension,
         ) -> Result<StageProto, DataFusionError> {
             let dynamic_filter_anchors = stage
@@ -377,7 +529,7 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 .properties()
                 .output_ordering()
                 .map(|ordering| {
-                    serialize_physical_sort_exprs(ordering.iter().cloned(), self, proto_converter)
+                    serialize_physical_sort_exprs(ordering.iter().cloned(), codec, proto_converter)
                 })
                 .transpose()?
                 .unwrap_or_default();
@@ -385,17 +537,17 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 schema: Some(node.schema().try_into()?),
                 partitioning: Some(serialize_partitioning(
                     &node.producer_partitioning,
-                    self,
+                    codec,
                     proto_converter,
                 )?),
                 input_stage: Some(encode_stage_proto(
                     node.input_stage(),
-                    self,
+                    codec,
                     proto_converter,
                 )?),
                 equivalence_classes: serialize_equivalence_group(
                     node.properties().equivalence_properties(),
-                    self,
+                    codec,
                     proto_converter,
                 )?,
                 two_phase,
@@ -413,17 +565,17 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 schema: Some(node.schema().try_into()?),
                 partitioning: Some(serialize_partitioning(
                     node.properties().output_partitioning(),
-                    self,
+                    codec,
                     proto_converter,
                 )?),
                 input_stage: Some(encode_stage_proto(
                     node.input_stage(),
-                    self,
+                    codec,
                     proto_converter,
                 )?),
                 equivalence_classes: serialize_equivalence_group(
                     node.properties().equivalence_properties(),
-                    self,
+                    codec,
                     proto_converter,
                 )?,
                 consumer_tasks: node.consumer_tasks as u64,
@@ -439,17 +591,17 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 schema: Some(node.schema().try_into()?),
                 partitioning: Some(serialize_partitioning(
                     node.properties().output_partitioning(),
-                    self,
+                    codec,
                     proto_converter,
                 )?),
                 input_stage: Some(encode_stage_proto(
                     node.input_stage(),
-                    self,
+                    codec,
                     proto_converter,
                 )?),
                 equivalence_classes: serialize_equivalence_group(
                     node.properties().equivalence_properties(),
-                    self,
+                    codec,
                     proto_converter,
                 )?,
             };
@@ -1361,6 +1513,244 @@ mod tests {
             3,
             "producer_partitioning partition count was not preserved through encode/decode"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_user_codec_udf_and_udaf_roundtrip() -> datafusion::common::Result<()> {
+        use crate::DistributedExt;
+        use datafusion::common::not_impl_err;
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+        use datafusion::logical_expr::{
+            Accumulator, ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl,
+            Signature, Volatility,
+        };
+        use datafusion::physical_expr::ScalarFunctionExpr;
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct ParameterizedScalarUdf {
+            signature: Signature,
+            tag: String,
+        }
+
+        impl ParameterizedScalarUdf {
+            fn new(tag: impl Into<String>) -> Self {
+                Self {
+                    signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+                    tag: tag.into(),
+                }
+            }
+        }
+
+        impl ScalarUDFImpl for ParameterizedScalarUdf {
+            fn name(&self) -> &str {
+                "parameterized_udf"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Boolean)
+            }
+            fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+                unreachable!()
+            }
+            fn documentation(&self) -> Option<&Documentation> {
+                None
+            }
+        }
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct StatelessUserUdf {
+            signature: Signature,
+        }
+
+        impl StatelessUserUdf {
+            fn new() -> Self {
+                Self {
+                    signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+                }
+            }
+        }
+
+        impl ScalarUDFImpl for StatelessUserUdf {
+            fn name(&self) -> &str {
+                "stateless_user_udf"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Int32)
+            }
+            fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+                unreachable!()
+            }
+            fn documentation(&self) -> Option<&Documentation> {
+                None
+            }
+        }
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct ParameterizedUdaf {
+            signature: Signature,
+            tag: String,
+        }
+
+        impl ParameterizedUdaf {
+            fn new(tag: impl Into<String>) -> Self {
+                Self {
+                    signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+                    tag: tag.into(),
+                }
+            }
+        }
+
+        impl datafusion::logical_expr::AggregateUDFImpl for ParameterizedUdaf {
+            fn name(&self) -> &str {
+                "parameterized_udaf"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Int64)
+            }
+            fn state_fields(&self, _args: StateFieldsArgs) -> Result<Vec<Arc<Field>>> {
+                Ok(vec![Arc::new(Field::new("s", DataType::Int64, true))])
+            }
+            fn accumulator(&self, _acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+                unreachable!()
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestUserFunctionCodec;
+
+        impl PhysicalExtensionCodec for TestUserFunctionCodec {
+            fn try_decode(
+                &self,
+                _buf: &[u8],
+                _inputs: &[Arc<dyn ExecutionPlan>],
+                _ctx: &TaskContext,
+                _proto_converter: &dyn PhysicalProtoConverterExtension,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                not_impl_err!("no custom execution plan")
+            }
+
+            fn try_encode(
+                &self,
+                _node: Arc<dyn ExecutionPlan>,
+                _buf: &mut Vec<u8>,
+                _proto_converter: &dyn PhysicalProtoConverterExtension,
+            ) -> Result<()> {
+                not_impl_err!("no custom execution plan")
+            }
+
+            fn try_encode_udf(&self, node: &ScalarUDF, buf: &mut Vec<u8>) -> Result<()> {
+                if let Some(udf) = node.inner().downcast_ref::<ParameterizedScalarUdf>() {
+                    buf.extend_from_slice(udf.tag.as_bytes());
+                }
+                Ok(())
+            }
+
+            fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+                match name {
+                    "parameterized_udf" => {
+                        let tag = std::str::from_utf8(buf).unwrap();
+                        Ok(Arc::new(ScalarUDF::from(ParameterizedScalarUdf::new(tag))))
+                    }
+                    "stateless_user_udf" => {
+                        assert!(buf.is_empty());
+                        Ok(Arc::new(ScalarUDF::from(StatelessUserUdf::new())))
+                    }
+                    _ => not_impl_err!("unknown udf {name}"),
+                }
+            }
+
+            fn try_encode_udaf(&self, node: &AggregateUDF, buf: &mut Vec<u8>) -> Result<()> {
+                if let Some(udaf) = node.inner().downcast_ref::<ParameterizedUdaf>() {
+                    buf.extend_from_slice(udaf.tag.as_bytes());
+                }
+                Ok(())
+            }
+
+            fn try_decode_udaf(&self, name: &str, buf: &[u8]) -> Result<Arc<AggregateUDF>> {
+                if name == "parameterized_udaf" {
+                    let tag = std::str::from_utf8(buf).unwrap();
+                    Ok(Arc::new(AggregateUDF::from(ParameterizedUdaf::new(tag))))
+                } else {
+                    not_impl_err!("unknown udaf {name}")
+                }
+            }
+        }
+
+        // Build a worker TaskContext that only has the user codec registered (without pre-registering
+        // the custom UDFs/UDAFs in its FunctionRegistry).
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_distributed_user_codec(TestUserFunctionCodec)
+            .build();
+        let ctx = state.task_ctx();
+
+        let schema = schema_i32("a");
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let stateless_udf_expr: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "stateless_user_udf",
+            Arc::new(ScalarUDF::from(StatelessUserUdf::new())),
+            vec![Arc::clone(&col_a)],
+            Arc::new(Field::new("r", DataType::Int32, false)),
+            Arc::new(Default::default()),
+        ));
+        let parameterized_udf_expr: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "parameterized_udf",
+            Arc::new(ScalarUDF::from(ParameterizedScalarUdf::new(
+                "custom-payload",
+            ))),
+            vec![Arc::clone(&stateless_udf_expr)],
+            Arc::new(Field::new("p", DataType::Boolean, false)),
+            Arc::new(Default::default()),
+        ));
+
+        // Put `stateless_udf_expr` inside `NetworkShuffleExec`'s partitioning to verify that
+        // `DistributedCodecWithUserCodecs` passes itself when encoding/decoding Network*Exec.
+        let shuffle: Arc<dyn ExecutionPlan> = Arc::new(new_network_hash_shuffle_exec(
+            Partitioning::Hash(vec![stateless_udf_expr], 4),
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            dummy_stage(),
+            DEFAULT_MODE,
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(parameterized_udf_expr, shuffle)?);
+
+        let decoded = roundtrip_pb(Arc::clone(&filter), &ctx)?;
+        assert_eq!(repr(&filter), repr(&decoded));
+
+        let decoded_filter = decoded.downcast_ref::<FilterExec>().unwrap();
+        let decoded_scalar_expr = decoded_filter
+            .predicate()
+            .downcast_ref::<ScalarFunctionExpr>()
+            .unwrap();
+        let decoded_udf = decoded_scalar_expr
+            .fun()
+            .inner()
+            .downcast_ref::<ParameterizedScalarUdf>()
+            .unwrap();
+        assert_eq!(decoded_udf.tag, "custom-payload");
+
+        // Also verify UDAF encode/decode through the combined codec.
+        let combined_codec = DistributedCodec::new_combined_with_user(ctx.session_config());
+        let udaf = AggregateUDF::from(ParameterizedUdaf::new("agg-payload"));
+        let mut udaf_buf = Vec::new();
+        combined_codec.try_encode_udaf(&udaf, &mut udaf_buf)?;
+        let decoded_udaf = combined_codec.try_decode_udaf("parameterized_udaf", &udaf_buf)?;
+        let decoded_udaf_inner = decoded_udaf
+            .inner()
+            .downcast_ref::<ParameterizedUdaf>()
+            .unwrap();
+        assert_eq!(decoded_udaf_inner.tag, "agg-payload");
 
         Ok(())
     }

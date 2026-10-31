@@ -3,15 +3,29 @@ use crate::worker::{SingleWriteMultiRead, WorkerSessionBuilder};
 use crate::{DefaultSessionBuilder, TaskData, TaskKey};
 use datafusion::common::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::{SessionState, SessionStateBuilder};
 use moka::future::Cache;
 use std::borrow::Cow;
-use std::sync::Arc;
 #[cfg(feature = "integration")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use url::Url;
 
 const TASK_CACHE_TTI: Duration = Duration::from_mins(10);
+
+// Workers only decode and execute physical plans, so analyzer, logical optimizer, and physical
+// optimizer rules are never used on the worker and can be omitted from the default base
+// SessionState. Caching this process-wide avoids re-allocating default function registries
+// whenever a Worker is constructed via Worker::default() or Worker::from_session_builder().
+static DEFAULT_BASE_SESSION_STATE: LazyLock<SessionState> = LazyLock::new(|| {
+    SessionStateBuilder::new()
+        .with_default_features()
+        .with_analyzer_rules(vec![])
+        .with_optimizer_rules(vec![])
+        .with_physical_optimizer_rules(vec![])
+        .build()
+});
 
 pub(crate) type ResultTaskData = Result<TaskData, Arc<DataFusionError>>;
 pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<ResultTaskData>>>;
@@ -19,6 +33,9 @@ pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<Result
 #[derive(Clone)]
 pub struct Worker {
     pub(super) runtime: Arc<RuntimeEnv>,
+    /// Pre-built base [SessionState] cloned per task via [SessionStateBuilder::new_from_existing]
+    /// so default functions and registries are not re-allocated on every task setup.
+    pub(super) base_session_state: SessionState,
     /// Shares task state across partition requests. Coordinator-channel termination releases
     /// the stored task resources; time-to-idle eviction provides fallback cleanup for entries
     /// left by abandoned setup requests.
@@ -35,6 +52,7 @@ impl Default for Worker {
         let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
         Self {
             runtime: Arc::new(RuntimeEnv::default()),
+            base_session_state: DEFAULT_BASE_SESSION_STATE.clone(),
             task_data_entries: Arc::new(cache),
             session_builder: Arc::new(DefaultSessionBuilder),
             max_message_size: Some(usize::MAX),
@@ -55,6 +73,16 @@ impl Worker {
             session_builder: Arc::new(session_builder),
             ..Default::default()
         }
+    }
+
+    /// Sets the base [SessionState] cloned as the starting point for every task's
+    /// [WorkerQueryContext::builder].
+    ///
+    /// Pre-registering static UDFs, UDAFs, UDWFs, and config extensions on `base_session_state`
+    /// avoids re-building them on every task setup.
+    pub fn with_base_session_state(mut self, base_session_state: SessionState) -> Self {
+        self.base_session_state = base_session_state;
+        self
     }
 
     /// Sets a [RuntimeEnv] to be used in all the queries this [Worker] will handle during

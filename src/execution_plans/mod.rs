@@ -17,7 +17,5 @@ pub use distributed_leaf::DistributedLeafExec;
 pub(crate) use metrics::MetricsWrapperExec;
 pub use network_broadcast::NetworkBroadcastExec;
 pub use network_coalesce::NetworkCoalesceExec;
-#[cfg(any(test, feature = "integration"))]
-pub use network_shuffle::PRODUCER_SALT_DEFAULT;
-pub use network_shuffle::{NetworkShuffleExec, ShuffleMode};
+pub use network_shuffle::{NetworkShuffleExec, PRODUCER_SALT_DEFAULT, ShuffleMode};
 pub use sampler::SamplerExec;

@@ -8,7 +8,6 @@ use crate::coordinator::spawner::Spawner;
 use crate::dynamic_filtering::{
     dynamic_filter_remote_producer_ids, is_local_dynamic_filtering_enabled,
     is_remote_dynamic_filtering_enabled,
-    maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships,
 };
 use crate::events::{
     RouteTaskEvent, RouteTaskEventResponse, RouteTaskHandlers, new_coordinator_to_worker_dialer,
@@ -38,7 +37,7 @@ use datafusion::prelude::SessionConfig;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -103,6 +102,7 @@ impl QueryCoordinator {
             completed_dynamic_filter_store: &self.completed_dynamic_filter_store,
             dynamic_filter_registry: &self.dynamic_filter_registry,
             spawner: &self.spawner,
+            shared_encoded_plan: Arc::new(OnceLock::new()),
         }
     }
 
@@ -132,6 +132,9 @@ pub(super) struct StageCoordinator<'a> {
     completed_dynamic_filter_store: &'a Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: &'a Arc<DynamicFilterRegistry>,
     spawner: &'a Spawner,
+    /// Cached protobuf encoding of the stage plan when `!depends_on_task_index`, shared across
+    /// all remote tasks of the stage so we encode the plan once instead of `task_count` times.
+    shared_encoded_plan: Arc<OnceLock<Vec<u8>>>,
 }
 
 impl<'a> StageCoordinator<'a> {
@@ -153,6 +156,7 @@ impl<'a> StageCoordinator<'a> {
 
         let TaskSpecializedPlan {
             plan,
+            depends_on_task_index,
             work_unit_feed_declarations,
             dynamic_filter_remote_producer_ids,
         } = self.task_specialized_plan(task_i)?;
@@ -177,6 +181,7 @@ impl<'a> StageCoordinator<'a> {
         // connection with the remote worker. If dialing a remote worker fails, and it's retried,
         // this will hold the channel belonging to the last retry
         let coordinator_to_worker_tx_slot = Mutex::new(None);
+        let shared_encoded_plan = Arc::clone(&self.shared_encoded_plan);
 
         let dialer = new_coordinator_to_worker_dialer(|url| {
             let (coordinator_to_worker_tx, coordinator_to_worker_rx) = unbounded_channel();
@@ -199,32 +204,59 @@ impl<'a> StageCoordinator<'a> {
                     .take_until(self.spawner.query_finished().cancelled_owned())
                     .boxed();
 
-            let set_plan_request = SetPlanRequest {
-                task_key,
-                task_count: self.task_count,
-                plan: MaybeEncoded::Decoded(Arc::clone(&plan)),
-                dynamic_filter_remote_producer_ids: dynamic_filter_remote_producer_ids.clone(),
-                work_unit_feed_declarations: work_unit_feed_declarations.clone(),
-                target_worker_url: url.clone(),
-                query_start_time_ns: self.metrics.instantiation_time,
-            };
+            let specialized_for_dial = Arc::clone(&plan);
+            let shared_encoded_plan = Arc::clone(&shared_encoded_plan);
+            let dynamic_filter_remote_producer_ids = dynamic_filter_remote_producer_ids.clone();
+            let work_unit_feed_declarations = work_unit_feed_declarations.clone();
+            let task_count = self.task_count;
+            let query_start_time_ns = self.metrics.instantiation_time;
             let task_ctx = Arc::clone(self.task_ctx);
             let headers = headers.clone();
             let metrics = metrics.clone();
             let metrics_set = metrics_set.clone();
 
             async move {
-                let mut client = match LocalWorkerContext::from_ctx(&task_ctx) {
+                let (mut client, plan) = match LocalWorkerContext::from_ctx(&task_ctx) {
                     Some(lw) if lw.self_url == url => {
                         metrics.local_coordinator_channels.add(1);
-                        Ok(lw.to_worker_channel())
+                        (
+                            lw.to_worker_channel(),
+                            MaybeEncoded::Decoded(specialized_for_dial),
+                        )
                     }
                     _ => {
                         metrics.remote_coordinator_channels.add(1);
+                        // `encode` is synchronous and `init_bidirectional_stream` futures are
+                        // polled on a single task via `try_join_all`, so the first remote task
+                        // populates `shared_encoded_plan` before any `.await`.
+                        let plan = if depends_on_task_index {
+                            MaybeEncoded::Decoded(specialized_for_dial)
+                        } else {
+                            let bytes = match shared_encoded_plan.get() {
+                                Some(bytes) => bytes.clone(),
+                                None => {
+                                    let bytes = MaybeEncoded::Decoded(specialized_for_dial)
+                                        .encode(&task_ctx)?;
+                                    let _ = shared_encoded_plan.set(bytes.clone());
+                                    bytes
+                                }
+                            };
+                            MaybeEncoded::Encoded(bytes)
+                        };
                         let ch_resolver = get_distributed_channel_resolver(task_ctx.as_ref());
-                        ch_resolver.get_worker_client_for_url(&url).await
+                        let client = ch_resolver.get_worker_client_for_url(&url).await?;
+                        (client, plan)
                     }
-                }?;
+                };
+                let set_plan_request = SetPlanRequest {
+                    task_key,
+                    task_count,
+                    plan,
+                    dynamic_filter_remote_producer_ids,
+                    work_unit_feed_declarations,
+                    target_worker_url: url.clone(),
+                    query_start_time_ns,
+                };
                 let worker_to_coordinator_stream = client
                     .coordinator_channel(
                         headers,
@@ -430,6 +462,7 @@ impl<'a> StageCoordinator<'a> {
         let remote_dynamic_filtering_enabled = is_remote_dynamic_filtering_enabled(session_config)?;
 
         let mut work_unit_feed_declarations = vec![];
+        let mut depends_on_task_index = false;
         let d_ctx = DistributedTaskContext {
             task_index: task_i,
             task_count: self.task_count,
@@ -438,6 +471,7 @@ impl<'a> StageCoordinator<'a> {
         let plan = Arc::clone(self.plan);
         let transformed = plan.transform_down_with_dt_ctx(d_ctx, |plan, d_ctx| {
             if let Some(wuf) = wuf_registry.get_work_unit_feed(&plan) {
+                depends_on_task_index = true;
                 work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
                     id: wuf.id(),
                     partitions: plan.properties().partitioning.partition_count(),
@@ -454,11 +488,13 @@ impl<'a> StageCoordinator<'a> {
             };
 
             if let Some(ciu) = plan.downcast_ref::<ChildrenIsolatorUnionExec>() {
+                depends_on_task_index = true;
                 let ciu = ciu.to_task_specialized(d_ctx.task_index);
                 return Ok(Transformed::yes(Arc::new(ciu)));
             };
 
             if let Some(dle) = plan.downcast_ref::<DistributedLeafExec>() {
+                depends_on_task_index = true;
                 let specialized = dle.to_task_specialized(d_ctx.task_index);
                 return Ok(Transformed::yes(specialized));
             }
@@ -477,14 +513,7 @@ impl<'a> StageCoordinator<'a> {
             // we are explicitly not retransforming the entire plan. if other operators cause shared state errors they will error out.
             Ok(Transformed::no(plan))
         })?;
-        let plan = if dynamic_filtering_enabled {
-            maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
-                Arc::clone(&transformed.data),
-                self.task_ctx,
-            )?
-        } else {
-            transformed.data
-        };
+        let plan = transformed.data;
         let dynamic_filter_remote_producer_ids =
             if dynamic_filtering_enabled && remote_dynamic_filtering_enabled {
                 dynamic_filter_remote_producer_ids(&plan)?
@@ -493,6 +522,7 @@ impl<'a> StageCoordinator<'a> {
             };
         Ok(TaskSpecializedPlan {
             plan,
+            depends_on_task_index,
             work_unit_feed_declarations,
             dynamic_filter_remote_producer_ids,
         })
@@ -501,6 +531,7 @@ impl<'a> StageCoordinator<'a> {
 
 struct TaskSpecializedPlan {
     plan: Arc<dyn ExecutionPlan>,
+    depends_on_task_index: bool,
     work_unit_feed_declarations: Vec<WorkUnitFeedDeclaration>,
     dynamic_filter_remote_producer_ids: Vec<u64>,
 }

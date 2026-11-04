@@ -4,17 +4,22 @@ use crate::common::on_drop_stream;
 use crate::dynamic_filtering::{
     apply_dynamic_filter_update, discover_dynamic_filter_consumers,
     discover_dynamic_filter_producers,
+    maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships,
 };
 use crate::events::{WorkerPlanRewriteEvent, WorkerPlanRewriteHandlers};
 use crate::execution_plans::SamplerExec;
 use crate::protocol::LocalWorkerContext;
 use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
+use crate::worker::single_write_multi_read::{
+    SingleWriteMultiRead, SingleWriteMultiReadError, WriteGeneration,
+};
 use crate::worker::task_data::TaskDataMetrics;
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, DistributedExt, DistributedTaskContext,
     MaybeEncoded, ProducedDynamicFilter, SetPlanRequest, TaskCompletedDynamicFilters, TaskData,
     TaskDynamicFilter, TaskMetrics, Worker, WorkerQueryContext, WorkerToCoordinatorMsg,
 };
+use datafusion::catalog::MemoryCatalogProviderList;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{
     DataFusionError, HashMap, HashSet, Result, exec_datafusion_err, internal_datafusion_err,
@@ -23,7 +28,6 @@ use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionConfig;
 use futures::stream::{BoxStream, FuturesUnordered, select_all};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use http::HeaderMap;
@@ -45,6 +49,33 @@ pub struct CoordinatorChannelResult {
     pub stream: BoxStream<'static, Result<WorkerToCoordinatorMsg>>,
 }
 
+struct PendingWriteGuard<T: Clone> {
+    entry: Arc<SingleWriteMultiRead<T>>,
+    generation: Option<WriteGeneration>,
+}
+
+impl<T: Clone> PendingWriteGuard<T> {
+    fn new(entry: Arc<SingleWriteMultiRead<T>>, generation: WriteGeneration) -> Self {
+        Self {
+            entry,
+            generation: Some(generation),
+        }
+    }
+
+    fn write(&mut self, item: T) -> std::result::Result<bool, SingleWriteMultiReadError> {
+        let generation = self.generation.take().expect("write called once");
+        self.entry.write_generation(generation, item)
+    }
+}
+
+impl<T: Clone> Drop for PendingWriteGuard<T> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            self.entry.abandon_generation(generation);
+        }
+    }
+}
+
 impl Worker {
     pub async fn coordinator_channel(
         &self,
@@ -58,6 +89,8 @@ impl Worker {
             .task_data_entries
             .get_with(key, async { Default::default() })
             .await;
+        let write_gen = entry.reserve_write();
+        let mut write_guard = PendingWriteGuard::new(Arc::clone(&entry), write_gen);
 
         let mut remote_work_unit_feed_registry = RemoteWorkUnitFeedRegistry::default();
         for decl in request.work_unit_feed_declarations {
@@ -67,17 +100,23 @@ impl Worker {
         let (metrics_tx, metrics_rx) = oneshot::channel();
         let (dynamic_filters_tx, dynamic_filters_rx) = oneshot::channel();
         let (dynamic_filters_error_tx, dynamic_filters_error_rx) = channel(1);
+        let (w2c_stream_tx, w2c_stream_rx) = oneshot::channel();
 
-        let task_data = || async {
-            let mut cfg = SessionConfig::default()
-                .with_extension(Arc::new(remote_work_unit_feed_registry.receivers))
+        let receivers = remote_work_unit_feed_registry.receivers;
+        let target_worker_url = request.target_worker_url;
+        let session_setup: Result<_> = async {
+            let base_session_state = self.base_session_state();
+            let mut cfg = base_session_state
+                .config()
+                .clone()
+                .with_extension(Arc::new(receivers))
                 .with_extension(Arc::new(DistributedTaskContext {
                     task_index: request.task_key.task_number,
                     task_count: request.task_count,
                 }))
                 .with_extension(Arc::new(LocalWorkerContext {
                     local_worker: self.clone(),
-                    self_url: request.target_worker_url,
+                    self_url: target_worker_url,
                 }))
                 .with_distributed_option_extension_from_headers::<DistributedConfig>(&headers)?;
 
@@ -92,73 +131,40 @@ impl Worker {
             let session_state = self
                 .session_builder
                 .build_session_state(WorkerQueryContext {
-                    builder: SessionStateBuilder::new()
-                        .with_default_features()
+                    builder: SessionStateBuilder::new_from_existing(base_session_state.clone())
+                        .with_catalog_list(Arc::new(MemoryCatalogProviderList::new()))
                         .with_config(cfg)
                         .with_runtime_env(Arc::clone(&self.runtime)),
                     headers,
                 })
                 .await?;
 
-            let task_ctx = session_state.task_ctx();
-            let plan = request.plan.decode(&task_ctx)?;
+            Ok((session_state, collect_metrics, collect_dynamic_filters))
+        }
+        .await;
 
-            let ev = WorkerPlanRewriteEvent {
-                plan,
-                session_config: session_state.config(),
-            };
-            let plan = WorkerPlanRewriteHandlers::handle(ev).await?.plan;
-
-            // Initialize partition count to the number of partitions in the stage
-            Ok::<_, DataFusionError>(TaskData {
-                base_plan: plan,
-                final_plan: Arc::new(OnceLock::new()),
-                task_ctx,
-                metrics_tx: match collect_metrics {
-                    true => Arc::new(std::sync::Mutex::new(Some(metrics_tx))),
-                    false => Arc::new(std::sync::Mutex::new(None)),
-                },
-                completed_dynamic_filters_tx: match collect_dynamic_filters {
-                    true => Arc::new(std::sync::Mutex::new(Some(dynamic_filters_tx))),
-                    false => Arc::new(std::sync::Mutex::new(None)),
-                },
-                task_data_metrics: Arc::new(TaskDataMetrics::new(request.query_start_time_ns)),
-            })
+        let (session_state, collect_metrics, collect_dynamic_filters) = match session_setup {
+            Ok(v) => v,
+            Err(err) => {
+                let err_arc = Arc::new(err);
+                let _ = write_guard.write(Err(Arc::clone(&err_arc)));
+                return Err(DataFusionError::Shared(err_arc));
+            }
         };
 
-        let task_data_result = task_data().await.map_err(Arc::new);
+        let task_ctx = session_state.task_ctx();
+        let result_task_ctx = Arc::clone(&task_ctx);
+        let session_config = session_state.config().clone();
+        drop(session_state);
 
-        entry
-            .write(task_data_result.clone())
-            .map_err(|e| exec_datafusion_err!("{e}"))?;
-
-        let task_data = task_data_result.map_err(DataFusionError::Shared)?;
-        let mut sampler_gate = SamplerExec::gate_for_first_sampler(
-            Arc::clone(&task_data.base_plan),
-            Arc::clone(&task_data.task_ctx),
-        )?;
-        let load_info_rxs = sampler_gate.take_receivers();
-
-        let dynamic_filter_remote_producer_ids: HashSet<_> = request
-            .dynamic_filter_remote_producer_ids
-            .iter()
-            .copied()
-            .collect();
-        let producer_filters = discover_dynamic_filter_producers(&task_data.base_plan)?
-            .into_iter()
-            .filter(|producer| dynamic_filter_remote_producer_ids.contains(&producer.id));
-        let dynamic_filter_consumers: HashMap<_, _> =
-            discover_dynamic_filter_consumers(&task_data.base_plan)?
-                .consumers
-                .into_iter()
-                .map(|consumer| (consumer.id, consumer))
-                .collect();
-        let (producer_cancel_tx, producer_cancel_rx) = watch::channel(false);
-
-        // Continue reading remaining messages (work unit feed data) in the background.
+        // Continue plan decoding, worker plan rewrite hooks, and reading remaining coordinator
+        // messages (work unit feed data, sampling kick-off, dynamic filter updates) in the
+        // background so `coordinator_channel` can return the response headers immediately and
+        // allow the coordinator to proceed to `execute_task` in parallel with plan setup.
+        // `Worker::execute_task` synchronizes on `entry.read(...)` until `entry.write_generation`
+        // completes below.
         let mut work_unit_senders = Some(remote_work_unit_feed_registry.senders);
         let task_data_entries = Arc::clone(&self.task_data_entries);
-        let dynamic_filter_task_ctx = Arc::clone(&task_data.task_ctx);
 
         // This tokio task takes ownership of the final-report senders that keep the
         // worker->coordinator stream alive. As soon as this task ends, the runtime metrics and
@@ -175,6 +181,179 @@ impl Worker {
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let mut stream = stream.map_ok(set_work_unit_received_time);
+
+            let setup_result: Result<TaskData> = async {
+                let plan = match request.plan {
+                    MaybeEncoded::Decoded(plan) => {
+                        maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
+                            plan, &task_ctx,
+                        )?
+                    }
+                    encoded @ MaybeEncoded::Encoded(_) => encoded.decode(&task_ctx)?,
+                };
+
+                let ev = WorkerPlanRewriteEvent {
+                    plan,
+                    session_config: &session_config,
+                };
+                let plan = WorkerPlanRewriteHandlers::handle(ev).await?.plan;
+
+                // Initialize partition count to the number of partitions in the stage
+                Ok(TaskData {
+                    base_plan: plan,
+                    final_plan: Arc::new(OnceLock::new()),
+                    task_ctx,
+                    metrics_tx: match collect_metrics {
+                        true => Arc::new(std::sync::Mutex::new(Some(metrics_tx))),
+                        false => Arc::new(std::sync::Mutex::new(None)),
+                    },
+                    completed_dynamic_filters_tx: match collect_dynamic_filters {
+                        true => Arc::new(std::sync::Mutex::new(Some(dynamic_filters_tx))),
+                        false => Arc::new(std::sync::Mutex::new(None)),
+                    },
+                    task_data_metrics: Arc::new(TaskDataMetrics::new(request.query_start_time_ns)),
+                })
+            }
+            .await;
+
+            let task_data_result = setup_result.map_err(Arc::new);
+            match write_guard.write(task_data_result.clone()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A newer retry on the same worker for the same TaskKey has superseded this setup.
+                    return;
+                }
+                Err(err) => {
+                    let _ = w2c_stream_tx.send(Err(exec_datafusion_err!("{err}")));
+                    return;
+                }
+            }
+
+            let task_data = match task_data_result {
+                Ok(task_data) => task_data,
+                Err(err_arc) => {
+                    let _ = w2c_stream_tx.send(Err(DataFusionError::Shared(Arc::clone(&err_arc))));
+                    while stream.next().await.is_some() {}
+                    if entry.seal_with_value_if(
+                        |current| {
+                            matches!(current, Err(current_err) if Arc::ptr_eq(current_err, &err_arc))
+                        },
+                        Err(Arc::new(exec_datafusion_err!(
+                            "Coordinator channel closed for task {key:?}"
+                        ))),
+                    ) {
+                        task_data_entries.invalidate(&key).await;
+                    }
+                    return;
+                }
+            };
+
+            let post_setup: Result<_> = (|| {
+                let mut sampler_gate = SamplerExec::gate_for_first_sampler(
+                    Arc::clone(&task_data.base_plan),
+                    Arc::clone(&task_data.task_ctx),
+                )?;
+                let load_info_rxs = sampler_gate.take_receivers();
+
+                let dynamic_filter_remote_producer_ids: HashSet<_> = request
+                    .dynamic_filter_remote_producer_ids
+                    .iter()
+                    .copied()
+                    .collect();
+                let producer_filters = discover_dynamic_filter_producers(&task_data.base_plan)?
+                    .into_iter()
+                    .filter(|producer| dynamic_filter_remote_producer_ids.contains(&producer.id))
+                    .collect::<Vec<_>>();
+                let dynamic_filter_consumers: HashMap<_, _> =
+                    discover_dynamic_filter_consumers(&task_data.base_plan)?
+                        .consumers
+                        .into_iter()
+                        .map(|consumer| (consumer.id, consumer))
+                        .collect();
+                Ok((
+                    sampler_gate,
+                    load_info_rxs,
+                    producer_filters,
+                    dynamic_filter_consumers,
+                ))
+            })();
+
+            let (sampler_gate, load_info_rxs, producer_filters, dynamic_filter_consumers) =
+                match post_setup {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = w2c_stream_tx.send(Err(err));
+                        while stream.next().await.is_some() {}
+                        if entry.seal_with_value_if(
+                            |current| {
+                                current.as_ref().is_ok_and(|current| {
+                                    Arc::ptr_eq(&current.final_plan, &task_data.final_plan)
+                                })
+                            },
+                            Err(Arc::new(exec_datafusion_err!(
+                                "Coordinator channel closed for task {key:?}"
+                            ))),
+                        ) {
+                            task_data_entries.invalidate(&key).await;
+                        }
+                        return;
+                    }
+                };
+
+            let (producer_cancel_tx, producer_cancel_rx) = watch::channel(false);
+            let dynamic_filter_task_ctx = Arc::clone(&task_data.task_ctx);
+
+            let load_info_stream = FuturesUnordered::from_iter(load_info_rxs)
+                .filter_map(async |load_info_or_channel_dropped| {
+                    // This error can only happen if the LoadInfo sender was dropped, which is fine.
+                    let load_info = load_info_or_channel_dropped.ok()?;
+                    Some(WorkerToCoordinatorMsg::LoadInfo(load_info))
+                })
+                .chain(futures::stream::once(async move {
+                    WorkerToCoordinatorMsg::LoadInfoEos
+                }));
+
+            // Stream back metrics when the coordinator channel reaches EOS. At that point the
+            // coordinator has closed the query-scoped request stream, so any remaining task state can
+            // be finalized even if some partition streams were not dropped through the normal path.
+            let metrics_stream = metrics_rx.into_stream();
+            let metrics_stream =
+                metrics_stream.filter_map(async |task_metrics_or_channel_dropped| {
+                    let task_metrics = task_metrics_or_channel_dropped.ok()?;
+                    Some(WorkerToCoordinatorMsg::TaskMetrics(task_metrics))
+                });
+
+            let dynamic_filters_stream = dynamic_filters_rx.into_stream().filter_map(
+                async |dynamic_filters_or_channel_dropped| {
+                    let dynamic_filters = dynamic_filters_or_channel_dropped.ok()?;
+                    Some(WorkerToCoordinatorMsg::TaskCompletedDynamicFilters(
+                        dynamic_filters,
+                    ))
+                },
+            );
+
+            let produced_dynamic_filters_stream =
+                select_all(producer_filters.into_iter().map(|producer| {
+                    produced_dynamic_filter_stream(
+                        producer.id,
+                        producer.expression,
+                        producer_cancel_rx.clone(),
+                    )
+                }));
+
+            let dynamic_filters_error_stream = ReceiverStream::new(dynamic_filters_error_rx);
+
+            let w2c_inner_stream = select_all([
+                produced_dynamic_filters_stream.map(Ok).boxed(),
+                load_info_stream.map(Ok).boxed(),
+                metrics_stream.map(Ok).boxed(),
+                dynamic_filters_stream.map(Ok).boxed(),
+                dynamic_filters_error_stream.map(Err).boxed(),
+            ])
+            .boxed();
+
+            let _ = w2c_stream_tx.send(Ok(w2c_inner_stream));
+
             while let Some(Ok(msg)) = stream.next().await {
                 match msg {
                     CoordinatorToWorkerMsg::WorkUnitBatch(work_unit_batch) => {
@@ -283,59 +462,26 @@ impl Worker {
             }
         });
 
-        let load_info_stream = FuturesUnordered::from_iter(load_info_rxs)
-            .filter_map(async |load_info_or_channel_dropped| {
-                // This error can only happen if the LoadInfo sender was dropped, which is fine.
-                let load_info = load_info_or_channel_dropped.ok()?;
-                Some(WorkerToCoordinatorMsg::LoadInfo(load_info))
-            })
-            .chain(futures::stream::once(async move {
-                WorkerToCoordinatorMsg::LoadInfoEos
-            }));
-
-        // Stream back metrics when the coordinator channel reaches EOS. At that point the
-        // coordinator has closed the query-scoped request stream, so any remaining task state can
-        // be finalized even if some partition streams were not dropped through the normal path.
-        let metrics_stream = metrics_rx.into_stream();
-        let metrics_stream = metrics_stream.filter_map(async |task_metrics_or_channel_dropped| {
-            let task_metrics = task_metrics_or_channel_dropped.ok()?;
-            Some(WorkerToCoordinatorMsg::TaskMetrics(task_metrics))
-        });
-
-        let dynamic_filters_stream = dynamic_filters_rx.into_stream().filter_map(
-            async |dynamic_filters_or_channel_dropped| {
-                let dynamic_filters = dynamic_filters_or_channel_dropped.ok()?;
-                Some(WorkerToCoordinatorMsg::TaskCompletedDynamicFilters(
-                    dynamic_filters,
-                ))
-            },
-        );
-
-        let produced_dynamic_filters_stream =
-            select_all(producer_filters.into_iter().map(|producer| {
-                produced_dynamic_filter_stream(
-                    producer.id,
-                    producer.expression,
-                    producer_cancel_rx.clone(),
-                )
-            }));
-
-        let dynamic_filters_error_stream = ReceiverStream::new(dynamic_filters_error_rx);
-
-        let stream = select_all([
-            produced_dynamic_filters_stream.map(Ok).boxed(),
-            load_info_stream.map(Ok).boxed(),
-            metrics_stream.map(Ok).boxed(),
-            dynamic_filters_stream.map(Ok).boxed(),
-            dynamic_filters_error_stream.map(Err).boxed(),
-        ])
-        .boxed();
+        let stream = w2c_stream_rx
+            .into_stream()
+            .map(
+                |res: std::result::Result<
+                    Result<BoxStream<'static, Result<WorkerToCoordinatorMsg>>>,
+                    oneshot::error::RecvError,
+                >| match res {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(err)) => futures::stream::once(async move { Err(err) }).boxed(),
+                    Err(_) => futures::stream::empty().boxed(),
+                },
+            )
+            .flatten()
+            .boxed();
 
         #[cfg(feature = "integration")]
         let stream = self.track_worker_to_coordinator_stream(stream);
 
         Ok(CoordinatorChannelResult {
-            task_ctx: Arc::clone(&task_data.task_ctx),
+            task_ctx: result_task_ctx,
             stream,
         })
     }
@@ -483,5 +629,58 @@ mod tests {
         })
         .await
         .expect("completed task retained its context without cache maintenance")
+    }
+
+    #[tokio::test]
+    async fn session_builder_error_is_latched_for_execute_task() {
+        let worker = Worker::from_session_builder(|_ctx: WorkerQueryContext| async move {
+            Err(exec_datafusion_err!("custom session builder failure"))
+        });
+        let task_key = TaskKey {
+            query_id: Uuid::nil(),
+            stage_id: 0,
+            task_number: 0,
+        };
+        let request = SetPlanRequest {
+            task_key,
+            task_count: 1,
+            plan: MaybeEncoded::Decoded(Arc::new(PlaceholderRowExec::new(Arc::new(
+                Schema::empty(),
+            )))),
+            dynamic_filter_remote_producer_ids: vec![],
+            work_unit_feed_declarations: vec![],
+            target_worker_url: Url::parse("http://worker.test").unwrap(),
+            query_start_time_ns: 0,
+        };
+        let (_control, incoming) = channel(1);
+        let err = worker
+            .coordinator_channel(
+                HeaderMap::new(),
+                request,
+                ReceiverStream::new(incoming).boxed(),
+            )
+            .await
+            .err()
+            .expect("expected coordinator_channel to fail");
+        assert!(err.to_string().contains("custom session builder failure"));
+
+        let exec_err = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.execute_task(crate::ExecuteTaskRequest {
+                task_key,
+                target_partition_start: 0,
+                target_partition_end: 1,
+                producer_head: crate::distributed_planner::ProducerHead::None,
+            }),
+        )
+        .await
+        .expect("execute_task should not wait for WAIT_PLAN_TIMEOUT_SECS")
+        .err()
+        .expect("expected execute_task to fail with the latched builder error");
+        assert!(
+            exec_err
+                .to_string()
+                .contains("custom session builder failure")
+        );
     }
 }

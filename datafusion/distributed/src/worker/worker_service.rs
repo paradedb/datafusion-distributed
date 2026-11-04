@@ -3,15 +3,32 @@ use crate::worker::{SingleWriteMultiRead, WorkerSessionBuilder};
 use crate::{DefaultSessionBuilder, TaskData, TaskKey};
 use datafusion::common::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::prelude::SessionConfig;
 use moka::future::Cache;
 use std::borrow::Cow;
-use std::sync::Arc;
 #[cfg(feature = "integration")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use url::Url;
 
 const TASK_CACHE_TTI: Duration = Duration::from_mins(10);
+
+// Workers only decode and execute physical plans, so analyzer, logical optimizer, physical
+// optimizer rules, and the default catalog/schema are never used by default on the worker and can
+// be omitted from the default base SessionState. Caching this process-wide avoids re-allocating
+// default function registries whenever a Worker is constructed via Worker::default() or
+// Worker::from_session_builder().
+static DEFAULT_BASE_SESSION_STATE: LazyLock<SessionState> = LazyLock::new(|| {
+    SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(SessionConfig::new().with_create_default_catalog_and_schema(false))
+        .with_analyzer_rules(vec![])
+        .with_optimizer_rules(vec![])
+        .with_physical_optimizer_rules(vec![])
+        .build()
+});
 
 pub(crate) type ResultTaskData = Result<TaskData, Arc<DataFusionError>>;
 pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<ResultTaskData>>>;
@@ -19,6 +36,11 @@ pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<Result
 #[derive(Clone)]
 pub struct Worker {
     pub(super) runtime: Arc<RuntimeEnv>,
+    /// Pre-built base [SessionState] cloned per task via [SessionStateBuilder::new_from_existing]
+    /// so default functions and registries are not re-allocated on every task setup.
+    /// When `None`, lazily falls back to [DEFAULT_BASE_SESSION_STATE] so callers that supply
+    /// a custom state via [Self::with_base_session_state] never pay to initialize the default one.
+    pub(super) base_session_state: Option<Arc<SessionState>>,
     /// Shares task state across partition requests. Coordinator-channel termination releases
     /// the stored task resources; time-to-idle eviction provides fallback cleanup for entries
     /// left by abandoned setup requests.
@@ -35,6 +57,7 @@ impl Default for Worker {
         let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
         Self {
             runtime: Arc::new(RuntimeEnv::default()),
+            base_session_state: None,
             task_data_entries: Arc::new(cache),
             session_builder: Arc::new(DefaultSessionBuilder),
             max_message_size: Some(usize::MAX),
@@ -55,6 +78,28 @@ impl Worker {
             session_builder: Arc::new(session_builder),
             ..Default::default()
         }
+    }
+
+    /// Sets the base [SessionState] cloned as the starting point for every task's
+    /// [WorkerQueryContext::builder].
+    ///
+    /// Pre-registering static UDFs, UDAFs, UDWFs, and config extensions on `base_session_state`
+    /// avoids re-building them on every task setup. Note that each task receives a fresh
+    /// `MemoryCatalogProviderList`, so catalogs registered on `base_session_state` do not carry
+    /// over to tasks; register per-task catalogs in [WorkerSessionBuilder::build_session_state]
+    /// instead.
+    ///
+    /// This exists for hosts like ParadeDB where a base [SessionState] with default and extension
+    /// functions is initialized once in the parent process and inherited by worker processes.
+    pub fn with_base_session_state(mut self, base_session_state: SessionState) -> Self {
+        self.base_session_state = Some(Arc::new(base_session_state));
+        self
+    }
+
+    pub(super) fn base_session_state(&self) -> &SessionState {
+        self.base_session_state
+            .as_deref()
+            .unwrap_or(&DEFAULT_BASE_SESSION_STATE)
     }
 
     /// Sets a [RuntimeEnv] to be used in all the queries this [Worker] will handle during

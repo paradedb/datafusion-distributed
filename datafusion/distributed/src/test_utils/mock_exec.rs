@@ -173,9 +173,12 @@ impl ExecutionPlan for MockExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        if !children.is_empty() {
+            return datafusion::common::not_impl_err!("MockExec does not accept children");
+        }
+        Ok(self)
     }
 
     /// Returns a stream which yields data

@@ -3,7 +3,6 @@ use crate::coordinator::DistributedExec;
 use crate::distributed_planner::NetworkBoundaryExt;
 use crate::execution_plans::MetricsWrapperExec;
 use crate::metrics::DISTRIBUTED_DATAFUSION_TASK_ID_LABEL;
-use crate::metrics::collect_plan_metrics;
 use crate::stage::{LocalStage, Stage};
 use crate::{DistributedTaskContext, TaskKey, TaskMetrics};
 use datafusion::common::HashMap;
@@ -53,11 +52,10 @@ pub async fn rewrite_distributed_plan_with_metrics(
         return Ok(plan);
     }
 
-    let head_stage = distributed_exec.head_stage()?;
     let Some(metrics_collection) = distributed_exec.wait_for_metrics().await else {
         return internal_err!("metrics were enabled but the execution was not prepared");
     };
-    let task_metrics = collect_plan_metrics(&head_stage)?;
+    let task_metrics = distributed_exec.head_stage_metrics()?;
 
     // Rewrite the DistributedExec's child plan with metrics.
     let dist_exec_plan_with_metrics = rewrite_local_plan_with_metrics(

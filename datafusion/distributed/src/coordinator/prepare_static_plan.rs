@@ -65,10 +65,7 @@ pub(super) async fn prepare_static_plan(
             },
         ))?))
     });
-    Ok(PreparedPlan {
-        head_stage: prepared.await?.data,
-        // If the plan was statically planned, the base plan is the same one that will be used for
-        // visualization.
-        plan_for_viz: Arc::clone(base_plan),
-    })
+    // If the plan was statically planned, the base plan is the same one that will be used for
+    // visualization.
+    PreparedPlan::try_new(prepared.await?.data, Arc::clone(base_plan))
 }

@@ -156,10 +156,8 @@ pub(super) async fn prepare_dynamic_plan(
     )
     .await?;
 
-    Ok(PreparedPlan {
-        plan_for_viz: plans_for_viz.reconstruct(&head_stage)?,
-        head_stage,
-    })
+    let plan_for_viz = plans_for_viz.reconstruct(&head_stage)?;
+    PreparedPlan::try_new(head_stage, plan_for_viz)
 }
 
 /// Reconstructs the plan dynamically as stages get transitioned to Remote and get sent to the

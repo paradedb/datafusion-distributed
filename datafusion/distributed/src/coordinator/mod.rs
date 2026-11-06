@@ -8,6 +8,7 @@ mod spawner;
 mod store;
 
 pub use distributed::DistributedExec;
+pub(crate) use distributed::isolate_stage_plan_state;
 pub(crate) use dynamic_filter_registry::DynamicFilterRegistry;
 pub(crate) use prepare_dynamic_plan::ESTIMATED_OUTPUT_BYTES_METRIC;
 pub(crate) use store::Store;

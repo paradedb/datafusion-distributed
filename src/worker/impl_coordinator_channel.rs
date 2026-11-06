@@ -1,6 +1,7 @@
 use crate::common::TreeNodeExt;
 #[cfg(feature = "integration")]
 use crate::common::on_drop_stream;
+use crate::coordinator::isolate_stage_plan_state;
 use crate::dynamic_filtering::{
     apply_dynamic_filter_update, discover_dynamic_filter_consumers,
     discover_dynamic_filter_producers,
@@ -185,9 +186,16 @@ impl Worker {
             let setup_result: Result<TaskData> = async {
                 let plan = match request.plan {
                     MaybeEncoded::Decoded(plan) => {
-                        maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
-                            plan, &task_ctx,
-                        )?
+                        let severed =
+                            maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
+                                Arc::clone(&plan),
+                                &task_ctx,
+                            )?;
+                        if Arc::ptr_eq(&plan, &severed) {
+                            isolate_stage_plan_state(plan)?
+                        } else {
+                            severed
+                        }
                     }
                     encoded @ MaybeEncoded::Encoded(_) => encoded.decode(&task_ctx)?,
                 };

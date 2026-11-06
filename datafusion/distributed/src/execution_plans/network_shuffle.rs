@@ -499,7 +499,7 @@ mod tests {
         let err = shuffle.producer_head(4).unwrap_err();
         assert!(
             err.to_string()
-                .contains("Range partitioning partition count 4 exceeds maximum 3")
+                .contains("could not scale 3 range partitions to 4 tasks"),
         );
     }
 

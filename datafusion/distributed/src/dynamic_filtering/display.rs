@@ -7,12 +7,11 @@ use crate::dynamic_filtering::{
 };
 use crate::execution_plans::DistributedLeafExec;
 use crate::stage::{Stage, find_all_stages};
-use crate::{DistributedTaskContext, MaybeEncoded, TaskDynamicFilter, TaskKey};
+use crate::{DistributedTaskContext, TaskDynamicFilter, TaskKey};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{HashMap, Result, internal_err};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
@@ -65,16 +64,8 @@ pub async fn rewrite_distributed_plan_with_dynamic_filters(
         sever_dynamic_filter_relationships_in_plan_for_display(plan_for_viz, task_ctx)?;
 
     // The head stage executes on the coordinator, so its filters have no worker report.
-    // Copy their live values into the isolated display variants before restoring worker stages.
-    let head_filters: Vec<_> = discover_dynamic_filter_consumers(&distributed_exec.head_stage()?)?
-        .consumers
-        .into_iter()
-        .filter(|consumer| consumer.expression.snapshot_generation() > 1)
-        .map(|consumer| TaskDynamicFilter {
-            expression_id: consumer.id,
-            expression: MaybeEncoded::Decoded(consumer.expression),
-        })
-        .collect();
+    // Copy their snapshotted values into the isolated display variants before restoring worker stages.
+    let head_filters = distributed_exec.head_stage_dynamic_filters()?;
     apply_filters_to_distributed_leaves(
         &plan_for_viz,
         DistributedTaskContext {
@@ -142,7 +133,7 @@ pub async fn rewrite_distributed_plan_with_dynamic_filters(
 /// This is done by deep-copying every leaf variant so we don't have to
 /// worry about any shared state.
 ///
-/// [`update()`]: DynamicFilterPhysicalExpr::update()
+/// [`update()`]: datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr::update()
 /// [`maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships()`]: super::maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships()
 pub(crate) fn sever_dynamic_filter_relationships_in_plan_for_display(
     plan: Arc<dyn ExecutionPlan>,

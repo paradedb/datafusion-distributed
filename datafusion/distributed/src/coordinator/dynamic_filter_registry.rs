@@ -114,7 +114,8 @@ impl DynamicFilterRegistry {
             // so we can forward the first completed dynamic filter.
             //
             // TopK and MIN/MAX bounds are independently useful and incremental, so we can use
-            // all updates.
+            // all updates. Single-child custom TopK operators (with `fetch()` set) have the
+            // same incremental intersection semantics as `SortExec`.
             //
             // Any remaining dynamic filter should wait for completion and should be merged
             // at the coordinator before being applied.
@@ -123,7 +124,10 @@ impl DynamicFilterRegistry {
                 .is_some_and(|join| matches!(join.partition_mode(), PartitionMode::CollectLeft))
             {
                 DynamicFilterMergePolicy::ForwardFirstComplete
-            } else if node.is::<SortExec>() || node.is::<AggregateExec>() {
+            } else if node.is::<SortExec>()
+                || node.is::<AggregateExec>()
+                || (node.children().len() == 1 && node.fetch().is_some())
+            {
                 DynamicFilterMergePolicy::IntersectOnUpdate
             } else {
                 DynamicFilterMergePolicy::UnionWhenAllComplete
@@ -411,5 +415,298 @@ fn merge_predicates(
                 operands: predicates,
             }))),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dynamic_filtering::apply_dynamic_filter_update;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, lit};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, PlanProperties, apply_expression_roots,
+    };
+    use tokio::sync::mpsc::unbounded_channel;
+    use uuid::Uuid;
+
+    #[derive(Debug)]
+    struct CustomSingleChildProducerExec {
+        input: Arc<dyn ExecutionPlan>,
+        dynamic_filter: Arc<dyn PhysicalExpr>,
+        fetch: Option<usize>,
+    }
+
+    impl DisplayAs for CustomSingleChildProducerExec {
+        fn fmt_as(
+            &self,
+            _: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "CustomSingleChildProducerExec")
+        }
+    }
+
+    impl ExecutionPlan for CustomSingleChildProducerExec {
+        fn name(&self) -> &str {
+            "CustomSingleChildProducerExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn apply_expressions(
+            &self,
+            f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            apply_expression_roots([&self.dynamic_filter], f)
+        }
+
+        fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+            vec![Arc::clone(&self.dynamic_filter)]
+        }
+
+        fn fetch(&self) -> Option<usize> {
+            self.fetch
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                input: children.swap_remove(0),
+                dynamic_filter: Arc::clone(&self.dynamic_filter),
+                fetch: self.fetch,
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CustomConsumerExec {
+        input: Arc<dyn ExecutionPlan>,
+        dynamic_filter: Arc<dyn PhysicalExpr>,
+    }
+
+    impl DisplayAs for CustomConsumerExec {
+        fn fmt_as(
+            &self,
+            _: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "CustomConsumerExec")
+        }
+    }
+
+    impl ExecutionPlan for CustomConsumerExec {
+        fn name(&self) -> &str {
+            "CustomConsumerExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn apply_expressions(
+            &self,
+            f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            apply_expression_roots([&self.dynamic_filter], f)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                input: children.swap_remove(0),
+                dynamic_filter: Arc::clone(&self.dynamic_filter),
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+    }
+
+    #[test]
+    fn custom_single_child_producer_merge_policy_depends_on_fetch() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let col_k: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
+        let task_ctx = Arc::new(TaskContext::default());
+        let query_id = Uuid::new_v4();
+
+        for (fetch, expect_early_intersect, expected_op) in [
+            (Some(10), true, "k@0 < 20 AND k@0 < 10"),
+            (None, false, "k@0 < 20 OR k@0 < 10"),
+        ] {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let registry = DynamicFilterRegistry::new(&metrics, CancellationToken::new());
+
+            let base_df = Arc::new(DynamicFilterPhysicalExpr::new(
+                vec![Arc::clone(&col_k)],
+                lit(true),
+            ));
+            let expr_id = base_df.expression_id().unwrap();
+
+            // Consumer in stage 1.
+            let consumer_df = Arc::clone(&base_df);
+            let consumer_plan: Arc<dyn ExecutionPlan> = Arc::new(CustomConsumerExec {
+                input: Arc::new(EmptyExec::new(Arc::clone(&schema))),
+                dynamic_filter: Arc::clone(&consumer_df) as Arc<dyn PhysicalExpr>,
+            });
+            let consumer_key = TaskKey {
+                query_id,
+                stage_id: 1,
+                task_number: 0,
+            };
+            let (consumer_tx, mut consumer_rx) = unbounded_channel();
+            registry.register_task(&consumer_plan, consumer_key)?;
+            registry.register_sender(consumer_key, consumer_tx)?;
+            registry.seal_stage(1)?;
+
+            // Two producer tasks in stage 2 with distinct DynamicFilterPhysicalExpr instances
+            // sharing `expr_id` (via proto roundtrip).
+            let mut producer_dfs = Vec::new();
+            for task_number in 0..2 {
+                let producer_df_expr =
+                    MaybeEncoded::Decoded(Arc::clone(&base_df) as Arc<dyn PhysicalExpr>)
+                        .encode(&task_ctx)
+                        .and_then(|bytes| {
+                            crate::codec::decode_physical_expr(
+                                &PhysicalExprNode::decode(bytes.as_slice()).unwrap(),
+                                schema.as_ref(),
+                                &task_ctx,
+                            )
+                        })?;
+                let producer_df = Arc::downcast::<DynamicFilterPhysicalExpr>(producer_df_expr)
+                    .expect("DynamicFilterPhysicalExpr");
+                let producer_plan: Arc<dyn ExecutionPlan> =
+                    Arc::new(CustomSingleChildProducerExec {
+                        input: Arc::new(EmptyExec::new(Arc::clone(&schema))),
+                        dynamic_filter: Arc::clone(&producer_df) as Arc<dyn PhysicalExpr>,
+                        fetch,
+                    });
+                let key = TaskKey {
+                    query_id,
+                    stage_id: 2,
+                    task_number,
+                };
+                let (tx, _rx) = unbounded_channel();
+                registry.register_task(&producer_plan, key)?;
+                registry.register_sender(key, tx)?;
+                producer_dfs.push((key, producer_df));
+            }
+            registry.seal_stage(2)?;
+
+            // Incomplete update from producer 0 (`k < 20`).
+            let p0_bound: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::clone(&col_k),
+                Operator::Lt,
+                lit(20i32),
+            ));
+            producer_dfs[0].1.update(p0_bound)?;
+            registry.record_dynamic_filter_update(
+                producer_dfs[0].0,
+                ProducedDynamicFilter {
+                    expression_id: expr_id,
+                    expression: MaybeEncoded::Decoded(
+                        Arc::clone(&producer_dfs[0].1) as Arc<dyn PhysicalExpr>
+                    ),
+                },
+                &task_ctx,
+            )?;
+
+            if expect_early_intersect {
+                let Some(CoordinatorToWorkerMsg::ApplyDynamicFilter(apply)) =
+                    consumer_rx.try_recv().ok()
+                else {
+                    panic!("expected immediate incremental ApplyDynamicFilter for fetch={fetch:?}");
+                };
+                apply_dynamic_filter_update(
+                    &consumer_df,
+                    &apply.expression,
+                    apply.producer_schema.as_ref(),
+                    &task_ctx,
+                )?;
+                assert_eq!(consumer_df.current()?.to_string(), "k@0 < 20");
+            } else {
+                assert!(
+                    consumer_rx.try_recv().is_err(),
+                    "non-fetch producer must not forward incomplete updates"
+                );
+            }
+
+            // Complete both producers (`k < 20` and `k < 10`) and verify merged predicate.
+            producer_dfs[0].1.mark_complete();
+            registry.record_dynamic_filter_update(
+                producer_dfs[0].0,
+                ProducedDynamicFilter {
+                    expression_id: expr_id,
+                    expression: MaybeEncoded::Decoded(
+                        Arc::clone(&producer_dfs[0].1) as Arc<dyn PhysicalExpr>
+                    ),
+                },
+                &task_ctx,
+            )?;
+
+            let p1_bound: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::clone(&col_k),
+                Operator::Lt,
+                lit(10i32),
+            ));
+            producer_dfs[1].1.update(p1_bound)?;
+            producer_dfs[1].1.mark_complete();
+            registry.record_dynamic_filter_update(
+                producer_dfs[1].0,
+                ProducedDynamicFilter {
+                    expression_id: expr_id,
+                    expression: MaybeEncoded::Decoded(
+                        Arc::clone(&producer_dfs[1].1) as Arc<dyn PhysicalExpr>
+                    ),
+                },
+                &task_ctx,
+            )?;
+
+            let mut last_apply = None;
+            while let Ok(CoordinatorToWorkerMsg::ApplyDynamicFilter(apply)) = consumer_rx.try_recv()
+            {
+                last_apply = Some(apply);
+            }
+            let apply = last_apply.expect("expected final ApplyDynamicFilter");
+            apply_dynamic_filter_update(
+                &consumer_df,
+                &apply.expression,
+                apply.producer_schema.as_ref(),
+                &task_ctx,
+            )?;
+            assert_eq!(consumer_df.current()?.to_string(), expected_op);
+        }
+        Ok(())
     }
 }

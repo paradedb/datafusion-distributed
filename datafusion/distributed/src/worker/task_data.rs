@@ -1,13 +1,15 @@
 use crate::common::OnceLockResult;
 use crate::common::now_ns;
+use crate::dynamic_filtering::ConsumerApplyPhase;
 use crate::{
-    MaxLatencyMetric, ProducerHead, TaskCompletedDynamicFilters, TaskMetrics, TaskOutcome,
+    BytesCounterMetric, MaxLatencyMetric, ProducerHead, TaskCompletedDynamicFilters, TaskMetrics,
+    TaskOutcome,
 };
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::metrics::{Metric, MetricValue, MetricsSet};
+use datafusion::physical_plan::metrics::{Count, Metric, MetricValue, MetricsSet, Time};
 use futures::{Stream, StreamExt, TryStreamExt, future, stream};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,6 +89,31 @@ pub(crate) const PLAN_ADDED_AT_METRIC: &str = "plan_added_at";
 pub(crate) const PLAN_EXECUTED_AT_METRIC: &str = "plan_executed_at";
 pub(crate) const PLAN_FINISHED_AT_METRIC: &str = "plan_finished_at";
 
+/// Whether an incoming `ApplyDynamicFilter` arrived while task partitions were still running or
+/// after all partitions of the task had already finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DynamicFilterArrival {
+    ActiveExecution,
+    AfterExecutionComplete,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DynamicFilterProducerTaskMetrics {
+    count: Count,
+    bytes: BytesCounterMetric,
+    encode_time: Time,
+    last_at: MaxLatencyMetric,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DynamicFilterConsumerTaskMetrics {
+    count: Count,
+    bytes: BytesCounterMetric,
+    late_count: Count,
+    phase_times: [Time; 3],
+    last_at: MaxLatencyMetric,
+}
+
 #[derive(Debug)]
 pub(super) struct TaskDataMetrics {
     pub(super) query_start_time_ns: usize,
@@ -96,6 +123,8 @@ pub(super) struct TaskDataMetrics {
     pub(super) plan_executed_at: MaxLatencyMetric,
     /// When the execution stream finished.
     pub(super) plan_finished_at: MaxLatencyMetric,
+    pub(super) df_producer: DynamicFilterProducerTaskMetrics,
+    pub(super) df_consumer: DynamicFilterConsumerTaskMetrics,
 }
 
 impl TaskDataMetrics {
@@ -109,21 +138,56 @@ impl TaskDataMetrics {
             plan_added_at,
             plan_finished_at: MaxLatencyMetric::default(),
             plan_executed_at: MaxLatencyMetric::default(),
+            df_producer: DynamicFilterProducerTaskMetrics::default(),
+            df_consumer: DynamicFilterConsumerTaskMetrics::default(),
         }
+    }
+
+    fn elapsed_since_query_start(&self) -> Duration {
+        Duration::from_nanos(now_ns::<u64>().saturating_sub(self.query_start_time_ns as u64))
     }
 
     pub(super) fn mark_execution_started_once(&self) {
         if self.plan_executed_at.value() == 0 {
-            self.plan_executed_at.add_duration(Duration::from_nanos(
-                now_ns::<u64>().saturating_sub(self.query_start_time_ns as u64),
-            ))
+            self.plan_executed_at
+                .add_duration(self.elapsed_since_query_start())
         }
     }
 
     pub(super) fn mark_execution_finished(&self) {
-        self.plan_finished_at.add_duration(Duration::from_nanos(
-            now_ns::<u64>().saturating_sub(self.query_start_time_ns as u64),
-        ))
+        self.plan_finished_at
+            .add_duration(self.elapsed_since_query_start())
+    }
+
+    pub(super) fn record_df_produced(&self, encoded_bytes: usize, encode_elapsed: Duration) {
+        self.df_producer.count.add(1);
+        self.df_producer.bytes.add_bytes(encoded_bytes);
+        self.df_producer.encode_time.add_duration(encode_elapsed);
+        self.df_producer
+            .last_at
+            .add_duration(self.elapsed_since_query_start());
+    }
+
+    pub(super) fn record_df_consumed_arrival(
+        &self,
+        encoded_bytes: usize,
+        arrival: DynamicFilterArrival,
+    ) {
+        self.df_consumer.count.add(1);
+        self.df_consumer.bytes.add_bytes(encoded_bytes);
+        if arrival == DynamicFilterArrival::AfterExecutionComplete {
+            self.df_consumer.late_count.add(1);
+        }
+    }
+
+    pub(super) fn record_df_consumed_phase(&self, phase: ConsumerApplyPhase, elapsed: Duration) {
+        self.df_consumer.phase_times[phase as usize].add_duration(elapsed);
+    }
+
+    pub(super) fn mark_df_consumed_finished(&self) {
+        self.df_consumer
+            .last_at
+            .add_duration(self.elapsed_since_query_start());
     }
 
     pub(super) fn to_metrics_set(&self) -> MetricsSet {
@@ -140,9 +204,75 @@ impl TaskDataMetrics {
             PLAN_FINISHED_AT_METRIC,
             &self.plan_finished_at,
         ));
+        if self.df_producer.count.value() > 0 {
+            metrics_set.push(count_metric("df_prod_count", &self.df_producer.count));
+            metrics_set.push(BytesCounterMetric::new_metric(
+                "df_prod_bytes",
+                self.df_producer.bytes.value(),
+            ));
+            metrics_set.push(time_metric(
+                "df_prod_encode_time",
+                &self.df_producer.encode_time,
+            ));
+            metrics_set.push(max_latency_metric(
+                "df_prod_last_at",
+                &self.df_producer.last_at,
+            ));
+        }
+        if self.df_consumer.count.value() > 0 {
+            metrics_set.push(count_metric("df_cons_count", &self.df_consumer.count));
+            metrics_set.push(count_metric(
+                "df_cons_late_count",
+                &self.df_consumer.late_count,
+            ));
+            metrics_set.push(BytesCounterMetric::new_metric(
+                "df_cons_bytes",
+                self.df_consumer.bytes.value(),
+            ));
+            metrics_set.push(time_metric(
+                "df_cons_proto_decode_time",
+                &self.df_consumer.phase_times[ConsumerApplyPhase::ProtoDecode as usize],
+            ));
+            metrics_set.push(time_metric(
+                "df_cons_expr_build_time",
+                &self.df_consumer.phase_times[ConsumerApplyPhase::ExprBuild as usize],
+            ));
+            metrics_set.push(time_metric(
+                "df_cons_remap_update_time",
+                &self.df_consumer.phase_times[ConsumerApplyPhase::RemapUpdate as usize],
+            ));
+            metrics_set.push(max_latency_metric(
+                "df_cons_last_at",
+                &self.df_consumer.last_at,
+            ));
+        }
 
         metrics_set
     }
+}
+
+fn count_metric(name: &'static str, count: &Count) -> Arc<Metric> {
+    let cloned = Count::new();
+    cloned.add(count.value());
+    Arc::new(Metric::new(
+        MetricValue::Count {
+            name: Cow::Borrowed(name),
+            count: cloned,
+        },
+        None,
+    ))
+}
+
+fn time_metric(name: &'static str, time: &Time) -> Arc<Metric> {
+    let cloned = Time::new();
+    cloned.add_duration(Duration::from_nanos(time.value() as u64));
+    Arc::new(Metric::new(
+        MetricValue::Time {
+            name: Cow::Borrowed(name),
+            time: cloned,
+        },
+        None,
+    ))
 }
 
 fn max_latency_metric(name: &'static str, value: &MaxLatencyMetric) -> Arc<Metric> {
@@ -167,5 +297,18 @@ impl TaskData {
             Ok(plan) => Ok(Arc::clone(plan)),
             Err(err) => Err(DataFusionError::Shared(Arc::clone(err))),
         }
+    }
+
+    /// Returns whether all output partitions of this task have already terminated.
+    pub(super) fn is_execution_complete(&self) -> bool {
+        let Some(Ok(plan)) = self.final_plan.get() else {
+            return false;
+        };
+        let partition_count = plan.properties().partitioning.partition_count();
+        partition_count > 0
+            && !matches!(
+                self.outcome_tracker.outcome(partition_count),
+                TaskOutcome::Incomplete
+            )
     }
 }

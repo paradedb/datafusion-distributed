@@ -10,13 +10,14 @@ mod tests {
     use datafusion::error::DataFusionError;
     use datafusion::execution::{SessionState, SessionStateBuilder};
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::metrics::MetricsSet;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_distributed::test_utils::in_memory_channel_resolver::start_configured_in_memory_context;
     use datafusion_distributed::test_utils::session_context::register_temp_parquet_table;
     use datafusion_distributed::{
-        DistributedExt, MappedWorkerSessionBuilderExt, WorkerPlanRewriteEvent,
-        WorkerPlanRewriteEventResponse, WorkerPlanRewriteHandler, WorkerQueryContext,
-        assert_snapshot,
+        DistributedExt, MappedWorkerSessionBuilderExt, TaskFinishedEvent,
+        TaskFinishedEventResponse, WorkerPlanRewriteEvent, WorkerPlanRewriteEventResponse,
+        WorkerPlanRewriteHandler, WorkerQueryContext, assert_snapshot,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -51,6 +52,7 @@ mod tests {
             move |mut builder| {
                 add_first_hook(&mut builder, Arc::clone(&hook_calls));
                 add_second_hook(&mut builder, Arc::clone(&hook_calls));
+                add_finished_hook(&mut builder, Arc::clone(&hook_calls));
                 Ok(builder.build())
             }
         });
@@ -73,6 +75,7 @@ mod tests {
         let hook_calls = hook_calls.lock().unwrap();
         assert!(hook_calls.first > 0);
         assert_eq!(hook_calls.first, hook_calls.second);
+        assert_eq!(hook_calls.first, hook_calls.finished);
         assert!(hook_calls.pending_plan_ids.is_empty());
 
         Ok(())
@@ -115,11 +118,14 @@ mod tests {
         pending_plan_ids: HashSet<usize>,
         first: usize,
         second: usize,
+        finished: usize,
     }
 
     struct SecondPlanHook {
         calls: Arc<Mutex<HookCalls>>,
     }
+
+    const REWRITTEN_LABEL: &str = "rewritten-by-first-hook";
 
     #[async_trait]
     impl WorkerPlanRewriteHandler for SecondPlanHook {
@@ -128,7 +134,7 @@ mod tests {
             event: WorkerPlanRewriteEvent<'_>,
         ) -> Result<WorkerPlanRewriteEventResponse> {
             let options = plan_hook_options(event.session_config)?;
-            if options.label != HOOK_LABEL {
+            if options.label != REWRITTEN_LABEL {
                 return internal_err!("unexpected plan hook label {}", options.label);
             }
 
@@ -150,16 +156,38 @@ mod tests {
                     return internal_err!("unexpected plan hook label {}", options.label);
                 }
 
+                let mut updated_cfg = event.session_config.clone();
+                if let Some(opts) = updated_cfg
+                    .options_mut()
+                    .extensions
+                    .get_mut::<PlanHookOptions>()
+                {
+                    opts.label = REWRITTEN_LABEL.to_string();
+                }
+
                 let mut calls = calls.lock().unwrap();
                 calls.pending_plan_ids.insert(plan_identity(&event.plan));
                 calls.first += 1;
-                Ok(WorkerPlanRewriteEventResponse::new(event.plan))
+                Ok(
+                    WorkerPlanRewriteEventResponse::new(event.plan)
+                        .with_session_config(updated_cfg),
+                )
             },
         )
     }
 
     fn add_second_hook(builder: &mut SessionStateBuilder, calls: Arc<Mutex<HookCalls>>) {
         builder.set_distributed_worker_plan_rewrite_handler(SecondPlanHook { calls });
+    }
+
+    fn add_finished_hook(builder: &mut SessionStateBuilder, calls: Arc<Mutex<HookCalls>>) {
+        builder.set_distributed_task_finished_handler(move |event: TaskFinishedEvent<'_>| {
+            let options = plan_hook_options(event.session_config)
+                .expect("TaskContext should carry PlanHookOptions");
+            assert_eq!(options.label, REWRITTEN_LABEL);
+            calls.lock().unwrap().finished += 1;
+            Ok(TaskFinishedEventResponse::new(MetricsSet::new()))
+        });
     }
 
     fn plan_identity(plan: &Arc<dyn ExecutionPlan>) -> usize {

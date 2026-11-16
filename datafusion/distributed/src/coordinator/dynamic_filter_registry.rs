@@ -1,8 +1,10 @@
 use crate::dynamic_filtering::{discover_dynamic_filter_consumers, dynamic_filter_producer_schema};
 use crate::{
-    ApplyDynamicFilter, CoordinatorToWorkerMsg, MaybeEncoded, ProducedDynamicFilter, TaskKey,
+    ApplyDynamicFilter, BytesCounterMetric, BytesMetricExt, CoordinatorToWorkerMsg, MaybeEncoded,
+    ProducedDynamicFilter, TaskKey,
 };
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::instant::Instant;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{HashMap, HashSet, Result, exec_err, internal_err};
 use datafusion::execution::TaskContext;
@@ -11,13 +13,14 @@ use datafusion::physical_expr_common::metrics::{ExecutionPlanMetricsSet, MetricB
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion::physical_plan::metrics::Count;
+use datafusion::physical_plan::metrics::{Count, MetricValue, Time};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion_proto::protobuf::physical_expr_node::ExprType;
 use datafusion_proto::protobuf::{
     PhysicalBinaryExprNode, PhysicalDynamicFilterNode, PhysicalExprNode,
 };
 use prost::Message;
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +75,33 @@ pub(super) struct DynamicFilterRegistryState {
     delivered: HashSet<(u64, TaskKey)>,
 }
 
+struct LeaderRxMetrics {
+    updates_received: Count,
+    rx_bytes: BytesCounterMetric,
+    decode_time: Time,
+    updates_ignored: Count,
+}
+
+struct LeaderMergeMetrics {
+    count: Count,
+    time: Time,
+    bytes: BytesCounterMetric,
+}
+
+struct LeaderTxMetrics {
+    count: Count,
+    bytes: BytesCounterMetric,
+}
+
+fn build_global_time_metric(metrics: &ExecutionPlanMetricsSet, name: &'static str) -> Time {
+    let time = Time::new();
+    MetricBuilder::new(metrics).build(MetricValue::Time {
+        name: Cow::Borrowed(name),
+        time: time.clone(),
+    });
+    time
+}
+
 /// Query-scoped hub for distributed dynamic filtering.
 ///
 /// It stores the locations of dynamic filters and their runtime state. Informs the coordinator
@@ -80,7 +110,9 @@ pub(super) struct DynamicFilterRegistryState {
 /// - where dynamic filter updates should be forwarded
 pub(crate) struct DynamicFilterRegistry {
     pub(super) state: Mutex<DynamicFilterRegistryState>,
-    dynamic_filter_updates_received: Count,
+    rx_metrics: LeaderRxMetrics,
+    merge_metrics: LeaderMergeMetrics,
+    tx_metrics: LeaderTxMetrics,
     query_finished: CancellationToken,
 }
 
@@ -91,14 +123,29 @@ impl DynamicFilterRegistry {
     ) -> Self {
         Self {
             state: Mutex::new(DynamicFilterRegistryState::default()),
-            dynamic_filter_updates_received: MetricBuilder::new(metrics)
-                .global_counter("dynamic_filter_updates_received"),
+            rx_metrics: LeaderRxMetrics {
+                updates_received: MetricBuilder::new(metrics)
+                    .global_counter("dynamic_filter_updates_received"),
+                rx_bytes: MetricBuilder::new(metrics).bytes_counter("df_leader_rx_bytes"),
+                decode_time: build_global_time_metric(metrics, "df_leader_decode_time"),
+                updates_ignored: MetricBuilder::new(metrics)
+                    .global_counter("df_leader_updates_ignored"),
+            },
+            merge_metrics: LeaderMergeMetrics {
+                count: MetricBuilder::new(metrics).global_counter("df_leader_merge_count"),
+                time: build_global_time_metric(metrics, "df_leader_merge_time"),
+                bytes: MetricBuilder::new(metrics).bytes_counter("df_leader_merged_bytes"),
+            },
+            tx_metrics: LeaderTxMetrics {
+                count: MetricBuilder::new(metrics).global_counter("df_leader_tx_count"),
+                bytes: MetricBuilder::new(metrics).bytes_counter("df_leader_tx_bytes"),
+            },
             query_finished,
         }
     }
 
     pub(crate) fn record_update_received(&self) {
-        self.dynamic_filter_updates_received.add(1);
+        self.rx_metrics.updates_received.add(1);
     }
 
     /// Adds any dynamic filter producers and consumers found in `plan` to the registry.
@@ -214,7 +261,7 @@ impl DynamicFilterRegistry {
         state.sealed_stages.insert(stage_id);
         let ids = state.filters.keys().copied().collect::<Vec<_>>();
         for id in ids {
-            if Self::merge(&mut state, id) {
+            if self.merge(&mut state, id) {
                 self.dispatch(&mut state, id)?;
             }
         }
@@ -229,7 +276,45 @@ impl DynamicFilterRegistry {
         task_ctx: &TaskContext,
     ) -> Result<()> {
         self.record_update_received();
+        if let MaybeEncoded::Encoded(bytes) = &report.expression {
+            self.rx_metrics.rx_bytes.add_bytes(bytes.len());
+        }
+
+        // Fast-reject updates for already-completed producers or already-completed merged filters
+        // (e.g. subsequent `CollectLeft` workers under `ForwardFirstComplete`) before decoding a
+        // potentially large protobuf payload on the coordinator thread.
+        {
+            let state = self.state.lock().expect("dynamic filter registry poisoned");
+            let Some(filter) = state.filters.get(&report.expression_id) else {
+                return exec_err!(
+                    "Received update for unregistered dynamic filter {} from task {task_key:?}",
+                    report.expression_id
+                );
+            };
+            let Some(previous) = filter.producers.get(&task_key) else {
+                return exec_err!(
+                    "Task {task_key:?} is not a registered producer of dynamic filter {}",
+                    report.expression_id
+                );
+            };
+            if filter
+                .merged
+                .as_ref()
+                .is_some_and(|merged| merged.is_complete)
+                || previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.is_complete)
+            {
+                self.rx_metrics.updates_ignored.add(1);
+                return Ok(());
+            }
+        }
+
+        let decode_start = Instant::now();
         let expression = report.expression.to_proto(task_ctx)?;
+        self.rx_metrics
+            .decode_time
+            .add_duration(decode_start.elapsed());
         if expression.expr_id != Some(report.expression_id) {
             return exec_err!(
                 "Dynamic filter {} from task {task_key:?} has mismatched expression ID {:?}",
@@ -257,6 +342,14 @@ impl DynamicFilterRegistry {
                 report.expression_id
             );
         };
+        if filter
+            .merged
+            .as_ref()
+            .is_some_and(|merged| merged.is_complete)
+        {
+            self.rx_metrics.updates_ignored.add(1);
+            return Ok(());
+        }
         let Some(previous) = filter.producers.get_mut(&task_key) else {
             return exec_err!(
                 "Task {task_key:?} is not a registered producer of dynamic filter {}",
@@ -269,10 +362,11 @@ impl DynamicFilterRegistry {
                 .as_ref()
                 .is_some_and(|previous| previous.is_complete || previous == dynamic_filter.as_ref())
         {
+            self.rx_metrics.updates_ignored.add(1);
             return Ok(());
         }
         *previous = Some(*dynamic_filter);
-        if Self::merge(&mut state, report.expression_id) {
+        if self.merge(&mut state, report.expression_id) {
             self.dispatch(&mut state, report.expression_id)?;
         }
         Ok(())
@@ -280,12 +374,15 @@ impl DynamicFilterRegistry {
 
     /// Merges partial dynamic filters together for the provided dynamic filter
     /// id only if there are enough updates present.
-    fn merge(state: &mut DynamicFilterRegistryState, id: u64) -> bool {
+    fn merge(&self, state: &mut DynamicFilterRegistryState, id: u64) -> bool {
         let Some(filter) = state.filters.get_mut(&id) else {
             return false;
         };
-        let previous = filter.merged.as_ref();
-        if previous.is_some_and(|filter| filter.is_complete) {
+        if filter
+            .merged
+            .as_ref()
+            .is_some_and(|filter| filter.is_complete)
+        {
             return false;
         }
         let Some(mode) = filter.merge_mode else {
@@ -300,46 +397,66 @@ impl DynamicFilterRegistry {
             return false;
         }
 
+        let merge_start = Instant::now();
+        let is_complete = mode == DynamicFilterMergePolicy::ForwardFirstComplete || all_complete;
         let mut reports: Vec<_> = filter
             .producers
-            .iter()
-            .filter_map(|(task, report)| report.as_ref().map(|report| (task, report)))
+            .iter_mut()
+            .filter_map(|(task, report)| report.as_mut().map(|report| (*task, report)))
             .collect();
         reports.sort_unstable_by_key(|(key, _)| (key.stage_id, key.task_number));
         if mode == DynamicFilterMergePolicy::ForwardFirstComplete {
             reports.truncate(1);
         }
-        let Some((_, template)) = reports.first() else {
+        let Some((_, first_report)) = reports.first() else {
             return false;
         };
-        let inner_expr = merge_predicates(
+        let template_children = first_report.children.clone();
+        let template_remapped_children = first_report.remapped_children.clone();
+        // Once the merged filter is complete (`ForwardFirstComplete` or `all_complete`), no
+        // subsequent merge will ever run for this filter ID, so move `inner_expr` out of each
+        // producer report instead of deep-cloning every producer's AST.
+        let predicates: Vec<PhysicalExprNode> = if is_complete {
             reports
-                .iter()
+                .into_iter()
+                .filter_map(|(_, report)| report.inner_expr.take().map(|expr| *expr))
+                .collect()
+        } else {
+            reports
+                .into_iter()
                 .filter_map(|(_, report)| report.inner_expr.as_deref().cloned())
-                .collect(),
-            mode,
-        )
-        .map(Box::new);
-        let is_complete = mode == DynamicFilterMergePolicy::ForwardFirstComplete || all_complete;
+                .collect()
+        };
+        let inner_expr = merge_predicates(predicates, mode).map(Box::new);
+        let previous = filter.merged.as_ref();
         if previous.is_some_and(|previous| {
             previous.inner_expr == inner_expr && previous.is_complete == is_complete
         }) {
             return false;
         }
-        let mut merged = (*template).clone();
-        merged.inner_expr = inner_expr;
-        merged.is_complete = is_complete;
-        // Use a synthetic generation number for the merged filter. Each partial update has it's own generation
-        // is not useful here.
-        merged.generation = previous.map_or(0, |previous| previous.generation + 1);
-        filter.merged_bytes = Some(
-            PhysicalExprNode {
-                expr_id: Some(id),
-                expr_type: Some(ExprType::DynamicFilter(Box::new(merged.clone()))),
-            }
-            .encode_to_vec(),
-        );
-        filter.merged = Some(merged);
+        // Use a synthetic generation number for the merged filter. Each partial update has its own
+        // generation which is not useful here.
+        let generation = previous.map_or(0, |previous| previous.generation + 1);
+        let merged = PhysicalDynamicFilterNode {
+            children: template_children,
+            remapped_children: template_remapped_children,
+            generation,
+            inner_expr,
+            is_complete,
+        };
+        let node = PhysicalExprNode {
+            expr_id: Some(id),
+            expr_type: Some(ExprType::DynamicFilter(Box::new(merged))),
+        };
+        let encoded = node.encode_to_vec();
+        let Some(ExprType::DynamicFilter(merged)) = node.expr_type else {
+            unreachable!("just constructed ExprType::DynamicFilter");
+        };
+        self.merge_metrics.count.add(1);
+        self.merge_metrics.time.add_duration(merge_start.elapsed());
+        self.merge_metrics.bytes.add_bytes(encoded.len());
+        filter.merged_bytes = Some(encoded);
+        filter.merged = Some(*merged);
         state
             .delivered
             .retain(|(expression_id, _)| *expression_id != id);
@@ -372,6 +489,7 @@ impl DynamicFilterRegistry {
             let Some(sender) = state.task_senders.get(&task_key) else {
                 continue;
             };
+            let encoded_len = expression.len();
             let update = CoordinatorToWorkerMsg::ApplyDynamicFilter(Box::new(ApplyDynamicFilter {
                 expression_id: id,
                 expression: MaybeEncoded::Encoded(expression.clone()),
@@ -386,6 +504,8 @@ impl DynamicFilterRegistry {
                 }
                 return Ok(());
             }
+            self.tx_metrics.count.add(1);
+            self.tx_metrics.bytes.add_bytes(encoded_len);
             state.delivered.insert((id, task_key));
         }
         Ok(())

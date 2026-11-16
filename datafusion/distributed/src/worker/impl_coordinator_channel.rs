@@ -3,7 +3,7 @@ use crate::common::TreeNodeExt;
 use crate::common::on_drop_stream;
 use crate::coordinator::isolate_stage_plan_state;
 use crate::dynamic_filtering::{
-    apply_dynamic_filter_update, discover_dynamic_filter_consumers,
+    apply_dynamic_filter_update_observed, discover_dynamic_filter_consumers,
     discover_dynamic_filter_producers,
     maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships,
 };
@@ -14,13 +14,14 @@ use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_t
 use crate::worker::single_write_multi_read::{
     SingleWriteMultiRead, SingleWriteMultiReadError, WriteGeneration,
 };
-use crate::worker::task_data::TaskDataMetrics;
+use crate::worker::task_data::{DynamicFilterArrival, TaskDataMetrics};
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, DistributedExt, DistributedTaskContext,
     MaybeEncoded, ProducedDynamicFilter, SetPlanRequest, TaskCompletedDynamicFilters, TaskData,
     TaskDynamicFilter, TaskMetrics, Worker, WorkerQueryContext, WorkerToCoordinatorMsg,
 };
 use datafusion::catalog::MemoryCatalogProviderList;
+use datafusion::common::instant::Instant;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{
     DataFusionError, HashMap, HashSet, Result, exec_datafusion_err, internal_datafusion_err,
@@ -207,7 +208,21 @@ impl Worker {
                     plan,
                     session_config: &session_config,
                 };
-                let plan = WorkerPlanRewriteHandlers::handle(ev).await?.plan;
+                let rewrite = WorkerPlanRewriteHandlers::handle(ev).await?;
+                let plan = rewrite.plan;
+                let task_ctx = match rewrite.session_config {
+                    Some(updated_cfg) => Arc::new(TaskContext::new(
+                        task_ctx.task_id(),
+                        task_ctx.session_id(),
+                        updated_cfg,
+                        task_ctx.scalar_functions().clone(),
+                        task_ctx.higher_order_functions().clone(),
+                        task_ctx.aggregate_functions().clone(),
+                        task_ctx.window_functions().clone(),
+                        task_ctx.runtime_env(),
+                    )),
+                    None => task_ctx,
+                };
 
                 // Initialize partition count to the number of partitions in the stage
                 Ok(TaskData {
@@ -349,6 +364,8 @@ impl Worker {
                     produced_dynamic_filter_stream(
                         producer.id,
                         producer.expression,
+                        Arc::clone(&dynamic_filter_task_ctx),
+                        Arc::clone(&task_data.task_data_metrics),
                         producer_cancel_rx.clone(),
                     )
                 }));
@@ -356,7 +373,7 @@ impl Worker {
             let dynamic_filters_error_stream = ReceiverStream::new(dynamic_filters_error_rx);
 
             let w2c_inner_stream = select_all([
-                produced_dynamic_filters_stream.map(Ok).boxed(),
+                produced_dynamic_filters_stream.boxed(),
                 load_info_stream.map(Ok).boxed(),
                 metrics_stream.map(Ok).boxed(),
                 dynamic_filters_stream.map(Ok).boxed(),
@@ -400,22 +417,48 @@ impl Worker {
                         sampler_gate.kick_off();
                     }
                     CoordinatorToWorkerMsg::ApplyDynamicFilter(filter) => {
-                        let result = dynamic_filter_consumers
-                            .get(&filter.expression_id)
-                            .ok_or_else(|| {
-                                internal_datafusion_err!(
-                                    "received dynamic filter update for unknown consumer {}",
-                                    filter.expression_id
-                                )
-                            })
-                            .and_then(|consumer| {
-                                apply_dynamic_filter_update(
-                                    &consumer.expression,
-                                    &filter.expression,
-                                    filter.producer_schema.as_ref(),
-                                    &dynamic_filter_task_ctx,
-                                )
-                            });
+                        let encoded_bytes = match &filter.expression {
+                            MaybeEncoded::Encoded(bytes) => bytes.len(),
+                            MaybeEncoded::Decoded(_) => 0,
+                        };
+                        let arrival = if task_data.is_execution_complete() {
+                            DynamicFilterArrival::AfterExecutionComplete
+                        } else {
+                            DynamicFilterArrival::ActiveExecution
+                        };
+                        task_data
+                            .task_data_metrics
+                            .record_df_consumed_arrival(encoded_bytes, arrival);
+                        let Some(consumer) = dynamic_filter_consumers.get(&filter.expression_id)
+                        else {
+                            let _ = dynamic_filters_error_tx.try_send(internal_datafusion_err!(
+                                "received dynamic filter update for unknown consumer {}",
+                                filter.expression_id
+                            ));
+                            continue;
+                        };
+                        // Once every partition of this task has finished executing, applying a
+                        // dynamic filter cannot affect execution. Skip decoding and applying it
+                        // unless `collect_dynamic_filters` is enabled for post-execution plan
+                        // visualization.
+                        if !collect_dynamic_filters
+                            && matches!(arrival, DynamicFilterArrival::AfterExecutionComplete)
+                        {
+                            task_data.task_data_metrics.mark_df_consumed_finished();
+                            continue;
+                        }
+                        let result = apply_dynamic_filter_update_observed(
+                            &consumer.expression,
+                            &filter.expression,
+                            filter.producer_schema.as_ref(),
+                            &dynamic_filter_task_ctx,
+                            |phase, elapsed| {
+                                task_data
+                                    .task_data_metrics
+                                    .record_df_consumed_phase(phase, elapsed);
+                            },
+                        );
+                        task_data.task_data_metrics.mark_df_consumed_finished();
                         if let Err(error) = result {
                             let _ = dynamic_filters_error_tx.try_send(error);
                             // Continue to read messages. Let the coordinator handle the error
@@ -544,31 +587,55 @@ impl Worker {
 fn produced_dynamic_filter_stream(
     expression_id: u64,
     expression: Arc<dyn PhysicalExpr>,
+    task_ctx: Arc<TaskContext>,
+    metrics: Arc<TaskDataMetrics>,
     cancel_rx: watch::Receiver<bool>,
-) -> BoxStream<'static, WorkerToCoordinatorMsg> {
-    futures::stream::unfold(Some((expression, cancel_rx)), move |state| async move {
-        let (expression, mut cancel_rx) = state?;
-        let dynamic_filter = expression
-            .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .expect("producer discovery returns DynamicFilterPhysicalExpr");
+) -> BoxStream<'static, Result<WorkerToCoordinatorMsg>> {
+    futures::stream::unfold(
+        Some((expression, task_ctx, metrics, cancel_rx)),
+        move |state| async move {
+            let (expression, task_ctx, metrics, mut cancel_rx) = state?;
+            let dynamic_filter = expression
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .expect("producer discovery returns DynamicFilterPhysicalExpr");
 
-        // `wait_update()` uses a Tokio watch channel, so multiple generations can
-        // are natively "deduped" into just one update. This helps avoid too many
-        // update messages. If this becomes an issue, we can introduce an artificial
-        // backoff.
-        let completed = tokio::select! {
-            _ = dynamic_filter.wait_update() => false,
-            _ = dynamic_filter.wait_complete() => true,
-            _ = cancel_rx.wait_for(|cancelled| *cancelled) => return None,
-        };
-        let message =
-            WorkerToCoordinatorMsg::ProducedDynamicFilter(Box::new(ProducedDynamicFilter {
-                expression_id,
-                expression: MaybeEncoded::Decoded(Arc::clone(&expression)),
-            }));
-        let next = (!completed).then_some((expression, cancel_rx));
-        Some((message, next))
-    })
+            // `wait_update()` uses a Tokio watch channel, so multiple generations can
+            // are natively "deduped" into just one update. This helps avoid too many
+            // update messages. If this becomes an issue, we can introduce an artificial
+            // backoff.
+            // Poll `wait_complete()` first (`biased`) and re-check completion synchronously via
+            // `now_or_never()` when `wait_update()` resolves first: producers such as
+            // `HashJoinExec`'s `SharedBuildAccumulator` call `update(...)` and immediately
+            // `mark_complete()`. Checking completion *before* `encode` avoids a second redundant
+            // encode/send while guaranteeing the encoded snapshot carries `is_complete = true`
+            // whenever we terminate the stream.
+            let completed = tokio::select! {
+                biased;
+                _ = dynamic_filter.wait_complete() => true,
+                _ = dynamic_filter.wait_update() => {
+                    futures::FutureExt::now_or_never(dynamic_filter.wait_complete()).is_some()
+                }
+                _ = cancel_rx.wait_for(|cancelled| *cancelled) => return None,
+            };
+            let encode_start = Instant::now();
+            let encoded = MaybeEncoded::Decoded(Arc::clone(&expression)).encode(&task_ctx);
+            let encode_elapsed = encode_start.elapsed();
+            match encoded {
+                Ok(bytes) => {
+                    metrics.record_df_produced(bytes.len(), encode_elapsed);
+                    let message = Ok(WorkerToCoordinatorMsg::ProducedDynamicFilter(Box::new(
+                        ProducedDynamicFilter {
+                            expression_id,
+                            expression: MaybeEncoded::Encoded(bytes),
+                        },
+                    )));
+                    let next = (!completed).then_some((expression, task_ctx, metrics, cancel_rx));
+                    Some((message, next))
+                }
+                Err(err) => Some((Err(err), None)),
+            }
+        },
+    )
     .boxed()
 }
 

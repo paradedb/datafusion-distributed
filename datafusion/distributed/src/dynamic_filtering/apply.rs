@@ -1,12 +1,25 @@
 use crate::MaybeEncoded;
 use crate::codec::decode_physical_expr;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::common::instant::Instant;
 use datafusion::common::{Result, internal_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_proto::protobuf::physical_expr_node::ExprType;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Sub-phases of [`apply_dynamic_filter_update_observed`] for instrumentation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ConsumerApplyPhase {
+    /// Decoding serialized protobuf bytes into a [`datafusion_proto::protobuf::PhysicalExprNode`] tree.
+    ProtoDecode = 0,
+    /// Constructing the [`PhysicalExpr`] tree (including `InListExpr` static hash filters).
+    ExprBuild = 1,
+    /// Remapping original children and publishing the updated predicate into `target`.
+    RemapUpdate = 2,
+}
 
 /// Applies a `source` dynamic filter expression to a `target` dynamic filter expression.
 ///
@@ -53,6 +66,16 @@ pub(crate) fn apply_dynamic_filter_update(
     source_schema: &Schema,
     task_ctx: &TaskContext,
 ) -> Result<()> {
+    apply_dynamic_filter_update_observed(target, source, source_schema, task_ctx, |_, _| {})
+}
+
+pub(crate) fn apply_dynamic_filter_update_observed(
+    target: &Arc<DynamicFilterPhysicalExpr>,
+    source: &MaybeEncoded<Arc<dyn PhysicalExpr>>,
+    source_schema: &Schema,
+    task_ctx: &TaskContext,
+    mut observe: impl FnMut(ConsumerApplyPhase, Duration),
+) -> Result<()> {
     // We need two private fields from the source, so we convert to the proto
     // representation as a workaround.
     // 1. `is_complete` (which is public in df56)
@@ -61,7 +84,10 @@ pub(crate) fn apply_dynamic_filter_update(
     //
     // TODO: Avoid needing to encode to proto:
     //  https://github.com/datafusion-contrib/datafusion-distributed/issues/768/
+    let proto_start = Instant::now();
     let source_proto = source.to_proto(task_ctx)?;
+    observe(ConsumerApplyPhase::ProtoDecode, proto_start.elapsed());
+
     if source_proto.expr_id != target.expression_id() {
         return internal_err!("dynamic filter update has a mismatched expression ID");
     }
@@ -71,6 +97,8 @@ pub(crate) fn apply_dynamic_filter_update(
     let Some(source_predicate) = source_dynamic_filter.inner_expr.as_deref() else {
         return internal_err!("dynamic filter update has no predicate");
     };
+
+    let build_start = Instant::now();
     let predicate = decode_physical_expr(source_predicate, source_schema, task_ctx)?;
 
     let source_original_children = source_dynamic_filter
@@ -78,7 +106,9 @@ pub(crate) fn apply_dynamic_filter_update(
         .iter()
         .map(|child| decode_physical_expr(child, source_schema, task_ctx))
         .collect::<Result<Vec<_>>>()?;
+    observe(ConsumerApplyPhase::ExprBuild, build_start.elapsed());
 
+    let update_start = Instant::now();
     let update_target = Arc::clone(target).with_new_children(source_original_children)?;
     let Ok(update_target) = Arc::downcast::<DynamicFilterPhysicalExpr>(update_target) else {
         return internal_err!("expected a dynamic filter update target");
@@ -87,5 +117,6 @@ pub(crate) fn apply_dynamic_filter_update(
     if source_dynamic_filter.is_complete {
         update_target.mark_complete();
     }
+    observe(ConsumerApplyPhase::RemapUpdate, update_start.elapsed());
     Ok(())
 }

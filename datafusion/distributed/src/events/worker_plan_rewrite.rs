@@ -18,12 +18,24 @@ pub struct WorkerPlanRewriteEventResponse {
     /// The original or transformed plan. If transformed, the plan needs to maintain the same
     /// topology.
     pub plan: Arc<dyn ExecutionPlan>,
+    /// Optional updated session configuration for executing this worker task's plan.
+    /// When `None`, the worker's query-level [`SessionConfig`] is used unchanged.
+    pub session_config: Option<SessionConfig>,
 }
 
 impl WorkerPlanRewriteEventResponse {
     /// Returns a response containing the rewritten worker-local plan.
     pub fn new(plan: Arc<dyn ExecutionPlan>) -> Self {
-        Self { plan }
+        Self {
+            plan,
+            session_config: None,
+        }
+    }
+
+    /// Overrides the [`SessionConfig`] used in the task's [`TaskContext`](datafusion::execution::TaskContext).
+    pub fn with_session_config(mut self, session_config: SessionConfig) -> Self {
+        self.session_config = Some(session_config);
+        self
     }
 }
 
@@ -77,17 +89,25 @@ impl WorkerPlanRewriteHandlers {
             mut plan,
             session_config,
         } = ev;
+        let mut updated_config: Option<SessionConfig> = None;
         if let Some(handlers) = session_config.get_extension::<WorkerPlanRewriteHandlers>() {
             for handler in handlers.iter() {
-                plan = handler
+                let current_cfg = updated_config.as_ref().unwrap_or(session_config);
+                let resp = handler
                     .handle(WorkerPlanRewriteEvent {
                         plan,
-                        session_config,
+                        session_config: current_cfg,
                     })
-                    .await?
-                    .plan;
+                    .await?;
+                plan = resp.plan;
+                if let Some(cfg) = resp.session_config {
+                    updated_config = Some(cfg);
+                }
             }
         }
-        Ok(WorkerPlanRewriteEventResponse::new(plan))
+        Ok(WorkerPlanRewriteEventResponse {
+            plan,
+            session_config: updated_config,
+        })
     }
 }
